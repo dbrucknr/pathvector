@@ -1447,7 +1447,7 @@ pub(crate) async fn run_event_loop(
     let mut mrai_timer = tokio::time::interval(MRAI / 2);
     mrai_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    'outer: loop {
+    loop {
         // `std::future::pending()` for the None branch ensures the select arm
         // is compiled in but never resolves, keeping the loop alive on the
         // BGP event path alone.
@@ -1469,7 +1469,9 @@ pub(crate) async fn run_event_loop(
                         // RFC 4486 §4 — max-prefix idle-hold: if the peer is
                         // still within its post-CEASE idle window, reject the
                         // reconnect attempt immediately with Stop so it retries
-                        // after connect_retry_time elapses.
+                        // after connect_retry_time elapses. Skipping
+                        // `on_established` leaves the session unregistered, so
+                        // `on_route_update` ignores any UPDATE already queued.
                         if s.max_prefix_idle.contains_key(&peer_ip) {
                             tracing::info!(
                                 peer = %peer_ip,
@@ -1567,18 +1569,25 @@ pub(crate) async fn run_event_loop(
                 // we process them all into the pending_decisions buffers first,
                 // then flush_pending emits fewer, larger UPDATE messages.
                 //
+                // The drain loop has two ways out: the channel is empty, or a
+                // coalesced UPDATE needs a NOTIFICATION. Both fall through to
+                // the code after the loop, so what the batch owes is sent from
+                // one place. Leave the loop only with `break`: skipping that
+                // code drops commands the batch has already promised.
+                //
                 // Peers that reconnected during a max-prefix idle-hold window;
                 // their Stop is sent after the drain loop alongside stalled peers
                 // to avoid dropping and re-acquiring the write lock mid-iteration.
                 let mut idle_hold_rejected: Vec<IpAddr> = Vec::new();
-                // Owed by coalesced `Terminated` events; sent once the write
-                // lock is released, on both ways out of this loop (GH #148).
+                // Owed by coalesced `Terminated` events.
                 let mut capability_refreshes: Vec<CapabilityRefresh> = Vec::new();
+                // Set when a coalesced UPDATE ends the batch early.
+                let mut notification: Option<(IpAddr, NotificationMessage)> = None;
 
                 // PR-1: the drain loop has no cap, so batch size is the main
                 // driver of `event_batch` lock-hold time. Counted here
                 // (primary event + each coalesced one) and recorded once the
-                // channel is empty; the early-exit error paths skip it.
+                // channel is empty; the NOTIFICATION paths skip it.
                 let mut batch_events: u32 = 1;
 
                 while let Ok((extra_ip, extra_event)) = event_rx.try_recv() {
@@ -1633,30 +1642,20 @@ pub(crate) async fn run_event_loop(
                                 .unwrap_or(0);
                             crate::metrics::on_route_update(extra_ip, adj_in);
                             if let Some(err) = notify_err {
-                                s.flush_pending();
-                                let notify_stalled = s.take_stalled_peers();
-                                drop(s);
-                                for refresh in capability_refreshes {
-                                    refresh.send().await;
-                                }
-                                let tx = stop_senders.lock().unwrap().get(&extra_ip).cloned();
-                                if let Some(tx) = tx {
-                                    let _ = tx.send(SessionCommand::Notification(err)).await;
-                                }
-                                for peer in notify_stalled {
-                                    let tx = stop_senders.lock().unwrap().get(&peer).cloned();
-                                    if let Some(tx) = tx {
-                                        let _ = tx.send(SessionCommand::Stop).await;
-                                    }
-                                }
-                                continue 'outer;
+                                notification = Some((extra_ip, err));
+                                break;
                             }
                         }
                     }
                 }
-                metrics::histogram!("pathvectord_event_loop_batch_events")
-                    .record(f64::from(batch_events));
-                // Channel is empty — flush all accumulated outbound decisions.
+                // After an early exit the channel may not be empty, so the
+                // batch size is not recorded.
+                if notification.is_none() {
+                    metrics::histogram!("pathvectord_event_loop_batch_events")
+                        .record(f64::from(batch_events));
+                }
+                // Flush all accumulated outbound decisions. On the early exit
+                // this keeps other peers from starving behind the teardown.
                 s.flush_pending();
                 crate::metrics::update_rib_sizes(
                     s.rib.loc_rib.len(),
@@ -1672,6 +1671,15 @@ pub(crate) async fn run_event_loop(
                 // the new set for its next OPEN.
                 for refresh in capability_refreshes {
                     refresh.send().await;
+                }
+
+                // Before the Stops, so a session that is also stalled still
+                // reports why it is being reset.
+                if let Some((peer, err)) = notification {
+                    let tx = stop_senders.lock().unwrap().get(&peer).cloned();
+                    if let Some(tx) = tx {
+                        let _ = tx.send(SessionCommand::Notification(err)).await;
+                    }
                 }
 
                 for peer in stalled {
@@ -9519,6 +9527,16 @@ mod tests {
         // let-else guard fires; must not panic and RIB stays empty.
         let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let (mut state, _) = make_state(65001, &[(peer_ip, 65002)]);
+        // Registered, so the UPDATE gets past the unregistered-session guard.
+        state.on_established(
+            peer_ip,
+            Ipv4Addr::new(10, 0, 0, 2),
+            PeerType::External,
+            65002,
+            90,
+            &[],
+            None,
+        );
         state.adj_ribs_in.remove(&peer_ip);
 
         state.on_route_update(
@@ -9815,8 +9833,8 @@ mod tests {
         assert!(!state.rib.peer_types.contains_key(&IpAddr::V4(peer_a)));
     }
 
-    /// Calling `on_route_update` with an unknown peer IP logs an error and
-    /// returns without panicking.
+    /// Calling `on_route_update` with an unknown peer IP does nothing: not even
+    /// an End-of-RIB marker is recorded.
     #[test]
     fn test_on_route_update_unknown_peer_is_noop() {
         let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
@@ -9832,6 +9850,7 @@ mod tests {
             },
         );
         assert_eq!(state.rib.loc_rib.len(), 0);
+        assert!(!state.rib.eor_received.contains(&IpAddr::V4(unknown)));
     }
 
     /// When `on_route_update` propagates to established peers, a ghost peer
@@ -13339,6 +13358,426 @@ mod event_loop_tests {
             Some(0.0),
             "Loc-RIB size gauge must be refreshed after a teardown"
         );
+    }
+
+    // ── Drain-loop early exit ─────────────────────────────────────────────────
+
+    const DRAIN_PEER_A: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+    const DRAIN_PEER_B: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
+
+    /// Gives `peer` a command channel whose receiving end the test keeps.
+    fn capture_commands(
+        stop_senders: &Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>,
+        peer: IpAddr,
+    ) -> mpsc::Receiver<SessionCommand> {
+        let (tx, rx) = mpsc::channel(8);
+        stop_senders.lock().unwrap().insert(peer, tx);
+        rx
+    }
+
+    /// An UPDATE that resets its session: attributes, a missing ORIGIN and no
+    /// NLRI (RFC 7606 §5.2).
+    fn session_reset_update(peer_as: u32) -> SessionEvent {
+        SessionEvent::RouteUpdate(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![PathAttribute::AsPath(AsPath::from_sequence(vec![
+                Asn::new(peer_as),
+            ]))],
+            announced: vec![],
+        })
+    }
+
+    fn drain_commands(rx: &mut mpsc::Receiver<SessionCommand>) -> Vec<SessionCommand> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// A peer that reconnects while its max-prefix idle-hold is running is
+    /// owed a `Stop`, also when a later event in the same batch makes the
+    /// drain loop leave early to send a NOTIFICATION. The idle-hold itself is
+    /// local policy: RFC 4486 §4 requires only the Cease.
+    #[tokio::test]
+    async fn idle_hold_reconnect_is_stopped_when_batch_ends_in_notification() {
+        let (state, _rxs, stop_senders) =
+            make_state(&[(DRAIN_PEER_A, 65002), (DRAIN_PEER_B, 65003)], 64);
+        let mut a = capture_commands(&stop_senders, DRAIN_PEER_A);
+        let mut b = capture_commands(&stop_senders, DRAIN_PEER_B);
+        {
+            let mut s = state.write().await;
+            s.peer_max_prefixes_v4.insert(DRAIN_PEER_A, 1);
+            s.peer_max_prefixes_restart.insert(DRAIN_PEER_A, 300);
+            s.on_established(
+                DRAIN_PEER_A,
+                Ipv4Addr::new(10, 0, 0, 2),
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
+        }
+        let mut over_limit = update_for(Ipv4Addr::new(10, 0, 0, 2), 65002, "10.1.0.0/16");
+        over_limit.announced.push(nlri("10.2.0.0/16"));
+
+        let (event_tx, event_rx) = mpsc::channel(16);
+        for event in [
+            // Each of these two is handled on its own: the first leaves
+            // through the first-event NOTIFICATION path and arms the hold.
+            (DRAIN_PEER_A, SessionEvent::RouteUpdate(over_limit)),
+            (
+                DRAIN_PEER_A,
+                SessionEvent::Terminated(TerminationReason::OperatorStop),
+            ),
+            // One batch: B starts it, the other two are drained behind it.
+            (
+                DRAIN_PEER_B,
+                SessionEvent::Established(established_info(65003)),
+            ),
+            (
+                DRAIN_PEER_A,
+                SessionEvent::Established(established_info(65002)),
+            ),
+            (DRAIN_PEER_B, session_reset_update(65003)),
+        ] {
+            event_tx.send(event).await.unwrap();
+        }
+        drop(event_tx);
+
+        run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+
+        let b_commands = drain_commands(&mut b);
+        assert!(
+            matches!(b_commands.as_slice(), [SessionCommand::Notification(_)]),
+            "precondition: the batch must end on the NOTIFICATION path, got {b_commands:?}"
+        );
+        assert!(
+            !state
+                .read()
+                .await
+                .rib
+                .peer_types
+                .contains_key(&DRAIN_PEER_A),
+            "the held-off peer must not be established"
+        );
+        let a_commands = drain_commands(&mut a);
+        assert!(
+            matches!(
+                a_commands.as_slice(),
+                [
+                    SessionCommand::Notification(_),
+                    SessionCommand::SetCapabilities(_),
+                    SessionCommand::Stop
+                ]
+            ),
+            "expected the Cease, the post-teardown refresh, then Stop for the \
+             rejected reconnect, got {a_commands:?}"
+        );
+    }
+
+    /// The `Stop` owed on the early exit is sent after the state write lock is
+    /// released, so a session slow to take commands does not stall the lock.
+    #[tokio::test]
+    async fn early_exit_idle_hold_stop_is_sent_without_the_state_lock() {
+        let (state, _rxs, stop_senders) =
+            make_state(&[(DRAIN_PEER_A, 65002), (DRAIN_PEER_B, 65003)], 64);
+        let mut a = capture_commands(&stop_senders, DRAIN_PEER_A);
+        let _b = capture_commands(&stop_senders, DRAIN_PEER_B);
+        // Fill A's channel with a command that cannot be mistaken for Stop.
+        let a_sender = stop_senders.lock().unwrap()[&DRAIN_PEER_A].clone();
+        while a_sender
+            .try_send(SessionCommand::SetCapabilities(vec![]))
+            .is_ok()
+        {}
+        state.write().await.max_prefix_idle.insert(
+            DRAIN_PEER_A,
+            Instant::now() + std::time::Duration::from_secs(300),
+        );
+
+        let (event_tx, event_rx) = mpsc::channel(8);
+        for event in [
+            (
+                DRAIN_PEER_B,
+                SessionEvent::Established(established_info(65003)),
+            ),
+            (
+                DRAIN_PEER_A,
+                SessionEvent::Established(established_info(65002)),
+            ),
+            (DRAIN_PEER_B, session_reset_update(65003)),
+        ] {
+            event_tx.send(event).await.unwrap();
+        }
+
+        tokio::spawn(run_event_loop(
+            event_rx,
+            Arc::clone(&state),
+            stop_senders,
+            None,
+        ));
+
+        // The Stop cannot be delivered until A's channel is drained, yet the
+        // lock must become free once the batch has been applied.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::task::yield_now().await;
+                if let Ok(s) = state.try_write()
+                    && s.rib.peer_types.contains_key(&DRAIN_PEER_B)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("state lock still held while the Stop is blocked");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !matches!(a.recv().await, Some(SessionCommand::Stop)) {}
+        })
+        .await
+        .expect("the rejected reconnect was never sent Stop");
+    }
+
+    /// Events coalesced ahead of the one that needs a NOTIFICATION have
+    /// already changed the RIB, so the early exit must refresh the size gauges
+    /// like the normal exit does (GH #105).
+    #[tokio::test]
+    async fn drain_loop_early_exit_refreshes_loc_rib_gauge() {
+        let (state, _rxs, stop_senders) =
+            make_state(&[(DRAIN_PEER_A, 65002), (DRAIN_PEER_B, 65003)], 64);
+        {
+            let mut s = state.write().await;
+            s.on_established(
+                DRAIN_PEER_A,
+                Ipv4Addr::new(10, 0, 0, 2),
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
+            s.on_route_update(
+                DRAIN_PEER_A,
+                update_for(Ipv4Addr::new(10, 0, 0, 2), 65002, "10.1.0.0/16"),
+            );
+            assert_eq!(s.rib.loc_rib.len(), 1, "precondition: route installed");
+        }
+
+        let (event_tx, event_rx) = mpsc::channel(8);
+        for event in [
+            // Sets the gauge to 1, then A's routes are flushed behind it.
+            (
+                DRAIN_PEER_B,
+                SessionEvent::Established(established_info(65003)),
+            ),
+            (
+                DRAIN_PEER_A,
+                SessionEvent::Terminated(TerminationReason::OperatorStop),
+            ),
+            (DRAIN_PEER_B, session_reset_update(65003)),
+        ] {
+            event_tx.send(event).await.unwrap();
+        }
+        drop(event_tx);
+
+        let snap = capture_metrics(async {
+            run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+        })
+        .await;
+
+        assert_eq!(state.read().await.rib.loc_rib.len(), 0, "routes flushed");
+        assert_eq!(
+            gauge(
+                &snap,
+                "pathvectord_bgp_loc_rib_prefixes",
+                vec![("afi".to_string(), "ipv4".to_string())]
+            ),
+            Some(0.0),
+            "Loc-RIB size gauge must be refreshed when the drain loop leaves early"
+        );
+    }
+
+    // ── UPDATEs from a session the daemon did not register ────────────────────
+
+    // A reconnect during the max-prefix idle-hold is refused: the daemon never
+    // runs `on_established` for it. Its UPDATEs can already be queued behind
+    // the `Established` and must change nothing: to the daemon that session is
+    // not established, and RFC 4271 §9 says "An UPDATE message may be received
+    // only in the Established state". The hold-off itself is local policy.
+
+    /// A and B configured, A inside its idle-hold window.
+    fn idle_held_state() -> StateBundle {
+        let (state, rxs, stop_senders) =
+            make_state(&[(DRAIN_PEER_A, 65002), (DRAIN_PEER_B, 65003)], 64);
+        state.try_write().unwrap().max_prefix_idle.insert(
+            DRAIN_PEER_A,
+            Instant::now() + std::time::Duration::from_secs(300),
+        );
+        (state, rxs, stop_senders)
+    }
+
+    fn rejected_update() -> SessionEvent {
+        SessionEvent::RouteUpdate(update_for(Ipv4Addr::new(10, 0, 0, 2), 65002, "10.1.0.0/16"))
+    }
+
+    /// Runs the loop over `events`, all queued before it starts, so that
+    /// everything behind the first event is eligible for coalescing.
+    async fn run_queued(
+        events: Vec<(IpAddr, SessionEvent)>,
+        state: &Arc<RwLock<DaemonState>>,
+        stop_senders: Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
+    ) {
+        let (event_tx, event_rx) = mpsc::channel(events.len());
+        for event in events {
+            event_tx.send(event).await.unwrap();
+        }
+        drop(event_tx);
+        run_event_loop(event_rx, Arc::clone(state), stop_senders, None).await;
+    }
+
+    fn assert_nothing_installed_from_a(s: &DaemonState) {
+        assert_eq!(s.rib.loc_rib.len(), 0, "Loc-RIB must stay empty");
+        assert_eq!(
+            s.adj_ribs_in[&DRAIN_PEER_A].routes().count(),
+            0,
+            "Adj-RIB-In must stay empty"
+        );
+        assert!(
+            !s.rib.prefixes_received.contains_key(&DRAIN_PEER_A),
+            "no received-prefix count for an unregistered session"
+        );
+    }
+
+    /// First-event path: the rejected `Established` ends its own iteration, so
+    /// the UPDATE behind it starts the next one.
+    #[tokio::test]
+    async fn update_behind_rejected_established_is_ignored() {
+        let (state, _rxs, stop_senders) = idle_held_state();
+        let mut a = capture_commands(&stop_senders, DRAIN_PEER_A);
+
+        run_queued(
+            vec![
+                (
+                    DRAIN_PEER_A,
+                    SessionEvent::Established(established_info(65002)),
+                ),
+                (DRAIN_PEER_A, rejected_update()),
+            ],
+            &state,
+            stop_senders,
+        )
+        .await;
+
+        assert_nothing_installed_from_a(&*state.read().await);
+        let commands = drain_commands(&mut a);
+        assert!(
+            matches!(commands.as_slice(), [SessionCommand::Stop]),
+            "got {commands:?}"
+        );
+    }
+
+    /// Drain-loop path: both the rejected `Established` and its UPDATE are
+    /// coalesced behind another peer's event. Nothing may be installed, and
+    /// the established peer must not be sent the prefix.
+    #[tokio::test]
+    async fn coalesced_update_behind_rejected_established_is_ignored() {
+        let (state, mut rxs, stop_senders) = idle_held_state();
+        let mut a = capture_commands(&stop_senders, DRAIN_PEER_A);
+
+        run_queued(
+            vec![
+                (
+                    DRAIN_PEER_B,
+                    SessionEvent::Established(established_info(65003)),
+                ),
+                (
+                    DRAIN_PEER_A,
+                    SessionEvent::Established(established_info(65002)),
+                ),
+                (DRAIN_PEER_A, rejected_update()),
+            ],
+            &state,
+            stop_senders,
+        )
+        .await;
+
+        assert_nothing_installed_from_a(&*state.read().await);
+        let b_updates = rxs.get_mut(&DRAIN_PEER_B).unwrap();
+        while let Ok(msg) = b_updates.try_recv() {
+            assert!(
+                msg.announced.is_empty(),
+                "the refused route was advertised to an established peer: {msg:?}"
+            );
+        }
+        let commands = drain_commands(&mut a);
+        assert!(
+            matches!(commands.as_slice(), [SessionCommand::Stop]),
+            "got {commands:?}"
+        );
+    }
+
+    /// An over-limit UPDATE from a refused session must not send a second
+    /// Cease or push the idle-hold deadline out.
+    #[tokio::test]
+    async fn update_from_rejected_session_does_not_rearm_idle_hold() {
+        let (state, _rxs, stop_senders) = idle_held_state();
+        let mut a = capture_commands(&stop_senders, DRAIN_PEER_A);
+        let deadline = {
+            let mut s = state.write().await;
+            s.peer_max_prefixes_v4.insert(DRAIN_PEER_A, 1);
+            s.peer_max_prefixes_restart.insert(DRAIN_PEER_A, 600);
+            s.max_prefix_idle[&DRAIN_PEER_A]
+        };
+        let mut over_limit = update_for(Ipv4Addr::new(10, 0, 0, 2), 65002, "10.1.0.0/16");
+        over_limit.announced.push(nlri("10.2.0.0/16"));
+
+        run_queued(
+            vec![
+                (
+                    DRAIN_PEER_A,
+                    SessionEvent::Established(established_info(65002)),
+                ),
+                (DRAIN_PEER_A, SessionEvent::RouteUpdate(over_limit)),
+            ],
+            &state,
+            stop_senders,
+        )
+        .await;
+
+        assert_eq!(state.read().await.max_prefix_idle[&DRAIN_PEER_A], deadline);
+        let commands = drain_commands(&mut a);
+        assert!(
+            matches!(commands.as_slice(), [SessionCommand::Stop]),
+            "got {commands:?}"
+        );
+    }
+
+    /// The rule is registration, not the idle-hold: no session the daemon has
+    /// not established may change state, End-of-RIB markers included
+    /// (RFC 4724 §2), nor draw a NOTIFICATION.
+    #[test]
+    fn update_from_unregistered_session_is_ignored() {
+        let (state, _rxs, _stop_senders) = make_state(&[(DRAIN_PEER_A, 65002)], 64);
+        let mut s = state.try_write().unwrap();
+
+        let notification = s.on_route_update(
+            DRAIN_PEER_A,
+            update_for(Ipv4Addr::new(10, 0, 0, 2), 65002, "10.1.0.0/16"),
+        );
+        assert!(notification.is_none());
+        let SessionEvent::RouteUpdate(reset) = session_reset_update(65002) else {
+            unreachable!()
+        };
+        assert!(s.on_route_update(DRAIN_PEER_A, reset).is_none());
+        s.on_route_update(
+            DRAIN_PEER_A,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![],
+                announced: vec![],
+            },
+        );
+
+        assert_nothing_installed_from_a(&s);
+        assert!(!s.rib.eor_received.contains(&DRAIN_PEER_A));
     }
 
     // ── Terminated dispatch ───────────────────────────────────────────────────

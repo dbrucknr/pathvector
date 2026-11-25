@@ -20,6 +20,50 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-25 (pathvectord: UPDATEs from a refused reconnect no longer reach the RIB)
+
+When a peer reconnected during its max-prefix idle-hold, `run_event_loop` skipped
+`on_established` and sent `SessionCommand::Stop`, but an UPDATE already queued behind the
+`Established` still went through `on_route_update`. Its routes were installed in Adj-RIB-In and
+Loc-RIB and advertised to other peers. If it again exceeded the prefix limit, it also pushed the
+idle-hold deadline out and drew a second Cease.
+
+- `on_route_update` now ignores every UPDATE from a session that is not registered (no
+  `rib.peer_types` entry), whatever the reason: no table changes, no End-of-RIB handling, no
+  NOTIFICATION. RFC 4271 §9: "An UPDATE message may be received only in the Established state."
+  The idle-hold itself is local policy.
+- The guard covers both the first-event and drain-loop paths. The received-UPDATE counter still
+  counts the ignored message.
+- Tests: `update_behind_rejected_established_is_ignored`,
+  `coalesced_update_behind_rejected_established_is_ignored`,
+  `update_from_rejected_session_does_not_rearm_idle_hold`,
+  `update_from_unregistered_session_is_ignored`. All four failed on the old code.
+- `test_on_route_update_missing_adj_rib_in_logs_and_returns` now establishes its peer first, so it
+  still reaches the guard it tests.
+
+---
+
+## 2026-11-25 (pathvectord: a batch that ends in a NOTIFICATION no longer drops the idle-hold Stop)
+
+`run_event_loop`'s drain loop had two exits with two hand-written send sequences. When a coalesced
+UPDATE needed a NOTIFICATION, the early exit never sent the `SessionCommand::Stop` owed to a peer
+that had reconnected during its max-prefix idle-hold in the same batch. The daemon had not
+registered that session, but nothing told it to close.
+
+- The early exit now leaves the drain loop with `break` and shares the code after it, so both exits
+  send capability refreshes, the NOTIFICATION, stalled-peer Stops and idle-hold Stops after the
+  state write lock is released.
+- The early exit also skipped `update_rib_sizes`, so the Loc-RIB and Adj-RIB-Out gauges missed
+  changes made by events coalesced ahead of the failing UPDATE until a later batch refreshed them.
+  It now refreshes them. `pathvectord_event_loop_batch_events` is still not recorded on that exit.
+- Tests: `idle_hold_reconnect_is_stopped_when_batch_ends_in_notification`,
+  `early_exit_idle_hold_stop_is_sent_without_the_state_lock`,
+  `drain_loop_early_exit_refreshes_loc_rib_gauge`. All three failed on the old code.
+- The idle-hold is local policy. RFC 4271 §6.7 and RFC 4486 §4 require the Cease NOTIFICATION when
+  a prefix limit is exceeded; neither defines a hold-off before the peer may reconnect.
+
+---
+
 ## 2026-11-25 (AS-number rules on the wire: RFC 6793 AS4_PATH, RFC 7607 AS 0, RFC 9774 AS_SET — issues #109, #110, #111)
 
 ### Behavior changes (read before upgrading)
