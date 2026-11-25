@@ -1,0 +1,442 @@
+// daemon/session_retire_tests.rs — `RemovePeer` must complete from any
+// session state, and must leave no session or forwarding task behind.
+//
+// RFC 4271 §8.2.2: on a ManualStop (Event 2), a session that has sent its OPEN
+// "sends the NOTIFICATION with a Cease"; in Connect and Active it drops the
+// connection without one. Only a session that was Established has routes to
+// delete, so only it reports a termination. A removal cannot depend on that
+// report.
+//
+// These tests run real session tasks over loopback TCP. Each handle is wrapped
+// to observe the two things a removal must end: the session task (its event
+// stream closes) and the daemon's forwarding task (which owns the handle and
+// drops it on exit).
+
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures::StreamExt;
+use pathvector_session::message::{
+    BgpMessage, Capability, CeaseError, NotificationError, RouteRefreshMessage, UpdateMessage,
+};
+use pathvector_session::transport::{
+    self, SessionCommand, SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle,
+    TerminationReason,
+    listener::ListenerKeys,
+    tcp_md5::{KernelTcpMd5, Md5Enforcement},
+};
+use tokio::net::TcpListener;
+use tokio::sync::{RwLock, broadcast, mpsc, watch};
+
+use super::session_restart_tests::PeerConn;
+use super::{
+    DaemonCommand, DaemonState, SpawnConfig, build_daemon, run_command_processor, run_event_loop,
+};
+use crate::{config, proto};
+
+const PEER_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What has ended for one spawned session.
+#[derive(Clone, Copy, Default)]
+struct Lifetime {
+    /// The session task has exited: its event stream closed.
+    session_ended: bool,
+    /// The forwarding task has exited: it dropped the handle it owned.
+    handle_dropped: bool,
+}
+
+/// A real session handle that reports when its tasks end.
+struct Tracked {
+    inner: SpawnedSessionHandle,
+    life: watch::Sender<Lifetime>,
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        self.life.send_modify(|l| l.handle_dropped = true);
+    }
+}
+
+impl SessionHandle for Tracked {
+    async fn start(&self) {
+        self.inner.start().await;
+    }
+    async fn next_event(&mut self) -> Option<SessionEvent> {
+        let event = self.inner.next_event().await;
+        if event.is_none() {
+            self.life.send_modify(|l| l.session_ended = true);
+        }
+        event
+    }
+    fn update_sender(&self) -> mpsc::Sender<UpdateMessage> {
+        self.inner.update_sender()
+    }
+    fn stop_sender(&self) -> mpsc::Sender<SessionCommand> {
+        self.inner.stop_sender()
+    }
+    fn incoming_sender(&self) -> mpsc::Sender<SessionCommand> {
+        self.inner.incoming_sender()
+    }
+    async fn send_route_refresh(&self, rr: RouteRefreshMessage) {
+        self.inner.send_route_refresh(rr).await;
+    }
+    async fn set_capabilities(&self, caps: Vec<Capability>) {
+        self.inner.set_capabilities(caps).await;
+    }
+}
+
+type Lives = Arc<Mutex<Vec<watch::Receiver<Lifetime>>>>;
+
+fn peer_config(port: u16) -> config::PeerConfig {
+    config::PeerConfig {
+        address: PEER_IP,
+        port,
+        remote_as: 65002,
+        import_default: Some(config::ImportDefault::Accept),
+        export_default: Some(config::ExportDefault::Accept),
+        import_default_v6: None,
+        md5_password: None,
+        is_rr_client: false,
+        next_hop_self: false,
+        hold_time: None,
+        shutdown_message: None,
+        connect_retry_time: Some(1),
+        max_prefixes_v4: None,
+        max_prefixes_v6: None,
+        max_prefixes_restart: None,
+        role: None,
+        confederation_member: false,
+        blackhole_authorized_prefixes: None,
+    }
+}
+
+async fn wait_until(state: &RwLock<DaemonState>, done: impl Fn(&DaemonState) -> bool) {
+    tokio::time::timeout(TIMEOUT, async {
+        while !done(&*state.read().await) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for the daemon state");
+}
+
+fn spawn_config() -> SpawnConfig {
+    SpawnConfig {
+        local_as: 65001,
+        local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+        hold_time: 90,
+        graceful_restart_time: 0,
+        configured_restarting: false,
+        confederation_id: None,
+        startup_instant: std::time::Instant::now(),
+        md5_enforcement: Md5Enforcement::Required,
+    }
+}
+
+/// The daemon's startup wiring, command processor and event loop, spawning
+/// real sessions.
+struct Daemon {
+    state: Arc<RwLock<DaemonState>>,
+    commands: mpsc::Sender<DaemonCommand>,
+    lives: Lives,
+    peer_events: broadcast::Receiver<proto::PeerEvent>,
+}
+
+impl Daemon {
+    async fn start(static_peers: Vec<config::PeerConfig>) -> Self {
+        let lives: Lives = Arc::default();
+        let spawned = Arc::clone(&lives);
+        let spawn_fn = move |cfg: SessionConfig| {
+            let (life, observed) = watch::channel(Lifetime::default());
+            spawned.lock().unwrap().push(observed);
+            Tracked {
+                inner: transport::spawn(cfg),
+                life,
+            }
+        };
+        let cfg = config::Config {
+            daemon: config::DaemonConfig {
+                local_as: 65001,
+                bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+                hold_time: 90,
+                grpc_port: 0,
+                bgp_port: 0,
+                metrics_port: None,
+                local_ipv6: None,
+                cluster_id: None,
+                confederation_id: None,
+                fib_table: 254,
+                fib_metric: 20,
+                graceful_restart_time: 0,
+                restarting: false,
+                selection_deferral_time: 0,
+                rpki: None,
+                tcp_md5_enforcement: config::TcpMd5EnforcementConfig::Required,
+            },
+            peers: static_peers,
+            sidecar_path: None,
+        };
+        let (state, event_rx, event_tx, stop_senders, incoming_senders, keys) =
+            build_daemon(&cfg, spawn_fn.clone()).await;
+        let peer_events = state.read().await.peer_tx.subscribe();
+        let (commands, command_rx) = mpsc::channel(4);
+        tokio::spawn(run_command_processor(
+            command_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            incoming_senders,
+            keys,
+            event_tx,
+            spawn_fn,
+            spawn_config(),
+            None,
+        ));
+        tokio::spawn(run_event_loop(
+            event_rx,
+            Arc::clone(&state),
+            stop_senders,
+            None,
+        ));
+        Self {
+            state,
+            commands,
+            lives,
+            peer_events,
+        }
+    }
+
+    async fn send(&self, command: DaemonCommand) {
+        self.commands.send(command).await.ok().unwrap();
+    }
+
+    async fn add(&self, peer: config::PeerConfig) {
+        self.send(DaemonCommand::AddPeer(peer)).await;
+        wait_until(&self.state, |s| s.adj_ribs_in.contains_key(&PEER_IP)).await;
+    }
+
+    /// `RemovePeer`, waiting for the daemon to forget the peer and to say so.
+    async fn remove(&mut self) {
+        self.send(DaemonCommand::RemovePeer(PEER_IP)).await;
+        wait_until(&self.state, |s| {
+            !s.adj_ribs_in.contains_key(&PEER_IP) && !s.pending_removal.contains(&PEER_IP)
+        })
+        .await;
+        tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let event = self.peer_events.recv().await.unwrap();
+                if event.r#type == proto::PeerEventType::Removed as i32 {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("no Removed event");
+    }
+
+    /// Waits for both tasks of the `index`th session spawned to end.
+    async fn assert_tasks_end(&self, index: usize) {
+        let mut life = self.lives.lock().unwrap()[index].clone();
+        let ended = tokio::time::timeout(TIMEOUT, async {
+            life.wait_for(|l| l.session_ended && l.handle_dropped)
+                .await
+                .is_ok()
+        })
+        .await;
+        let last = *life.borrow();
+        assert!(
+            matches!(ended, Ok(true)),
+            "session {index} outlived its removal: session task ended = {}, \
+             forwarding task ended = {}",
+            last.session_ended,
+            last.handle_dropped,
+        );
+    }
+}
+
+async fn listen() -> (TcpListener, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (listener, port)
+}
+
+async fn accept(listener: &TcpListener) -> tokio::net::TcpStream {
+    let (stream, _): (_, SocketAddr) = tokio::time::timeout(TIMEOUT, listener.accept())
+        .await
+        .expect("the session never dialled the peer")
+        .unwrap();
+    stream
+}
+
+const ADMIN_SHUTDOWN: NotificationError =
+    NotificationError::Cease(CeaseError::AdministrativeShutdown);
+
+#[tokio::test]
+async fn removing_an_established_peer_ends_its_tasks() {
+    let (listener, port) = listen().await;
+    let mut daemon = Daemon::start(vec![peer_config(port)]).await;
+    let mut conn = PeerConn::handshake(accept(&listener).await).await;
+    wait_until(&daemon.state, |s| s.rib.peer_types.contains_key(&PEER_IP)).await;
+
+    daemon.remove().await;
+
+    assert_eq!(conn.notification().await.error, ADMIN_SHUTDOWN);
+    daemon.assert_tasks_end(0).await;
+}
+
+/// The session has sent its OPEN, so the peer is owed a Cease, but it was never
+/// Established, so it reports no termination.
+#[tokio::test]
+async fn removing_a_peer_in_open_sent_completes_and_ends_its_tasks() {
+    let (listener, port) = listen().await;
+    let mut daemon = Daemon::start(vec![]).await;
+    daemon.add(peer_config(port)).await;
+    let stream = accept(&listener).await;
+    let mut conn =
+        tokio_util::codec::FramedRead::new(stream, pathvector_session::framing::BgpCodec::new());
+    assert!(matches!(conn.next().await, Some(Ok(BgpMessage::Open(_)))));
+
+    daemon.remove().await;
+
+    let Some(Ok(BgpMessage::Notification(n))) = conn.next().await else {
+        panic!("no NOTIFICATION before the connection closed");
+    };
+    assert_eq!(n.error, ADMIN_SHUTDOWN);
+    daemon.assert_tasks_end(0).await;
+}
+
+/// Nothing listens, so the session only ever sees failed dials. Repeating the
+/// add and remove must not accumulate tasks.
+#[tokio::test]
+async fn repeatedly_removing_an_unreachable_peer_accumulates_nothing() {
+    let (listener, port) = listen().await;
+    drop(listener);
+    let mut daemon = Daemon::start(vec![]).await;
+
+    for index in 0..3 {
+        daemon.add(peer_config(port)).await;
+        daemon.remove().await;
+        daemon.assert_tasks_end(index).await;
+    }
+    assert_eq!(daemon.lives.lock().unwrap().len(), 3);
+}
+
+/// Removing a peer that was Established but has since dropped and not come
+/// back: its last termination was already handled.
+#[tokio::test]
+async fn removing_a_peer_between_sessions_completes_and_ends_its_tasks() {
+    let (listener, port) = listen().await;
+    let mut daemon = Daemon::start(vec![peer_config(port)]).await;
+    let conn = PeerConn::handshake(accept(&listener).await).await;
+    wait_until(&daemon.state, |s| s.rib.peer_types.contains_key(&PEER_IP)).await;
+    drop(conn);
+    drop(listener);
+    wait_until(&daemon.state, |s| !s.rib.peer_types.contains_key(&PEER_IP)).await;
+
+    daemon.remove().await;
+
+    daemon.assert_tasks_end(0).await;
+}
+
+// ── Orderings real sessions cannot be made to produce on demand ──────────────
+
+fn stop_map(
+    tx: mpsc::Sender<SessionCommand>,
+) -> Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>> {
+    Arc::new(Mutex::new(HashMap::from([(PEER_IP, tx)])))
+}
+
+fn state_with_peer() -> Arc<RwLock<DaemonState>> {
+    let (update_tx, _) = mpsc::channel(1);
+    Arc::new(RwLock::new(DaemonState::new(
+        65001,
+        Ipv4Addr::new(10, 0, 0, 1),
+        None,
+        None,
+        None,
+        &[peer_config(179)],
+        HashMap::from([(PEER_IP, update_tx)]),
+        vec![],
+    )))
+}
+
+/// A termination already queued when `RemovePeer` arrives can complete the
+/// removal, dropping the daemon's sender, before the command processor has
+/// stopped the session. The session must be stopped and retired all the same.
+#[tokio::test]
+async fn removal_completed_by_a_queued_termination_still_retires_the_session() {
+    let state = state_with_peer();
+    let (session_tx, mut session_rx) = mpsc::channel(8);
+    let stop_senders = stop_map(session_tx);
+    let incoming = Arc::new(RwLock::new(HashMap::new()));
+    let (event_tx, event_rx) = mpsc::channel(8);
+    let (commands, command_rx) = mpsc::channel(4);
+    // Holds the command processor just after it has marked the peer.
+    let hold = incoming.write().await;
+    tokio::spawn(run_command_processor::<Tracked, _, KernelTcpMd5>(
+        command_rx,
+        Arc::clone(&state),
+        Arc::clone(&stop_senders),
+        Arc::clone(&incoming),
+        Arc::new(ListenerKeys::default()),
+        event_tx.clone(),
+        |_| unreachable!("no peer is added"),
+        spawn_config(),
+        None,
+    ));
+    tokio::spawn(run_event_loop(
+        event_rx,
+        Arc::clone(&state),
+        Arc::clone(&stop_senders),
+        None,
+    ));
+
+    commands
+        .send(DaemonCommand::RemovePeer(PEER_IP))
+        .await
+        .ok()
+        .unwrap();
+    wait_until(&state, |s| s.pending_removal.contains(&PEER_IP)).await;
+    event_tx
+        .send((
+            PEER_IP,
+            SessionEvent::Terminated(TerminationReason::Unclean),
+        ))
+        .await
+        .unwrap();
+    wait_until(&state, |s| !s.adj_ribs_in.contains_key(&PEER_IP)).await;
+    drop(hold);
+
+    for expected in ["Stop", "Retire"] {
+        let command = tokio::time::timeout(TIMEOUT, session_rx.recv())
+            .await
+            .expect("the session was never told to end")
+            .expect("the command channel closed first");
+        assert_eq!(format!("{command:?}"), expected);
+    }
+}
+
+/// `Retired` from a session whose removal already completed can arrive after
+/// the peer has been added and marked for removal again. The new session has
+/// not ended, so its removal is still outstanding.
+#[tokio::test]
+async fn late_retired_does_not_complete_a_later_removal() {
+    let state = state_with_peer();
+    state.write().await.pending_removal.insert(PEER_IP);
+    let (replacement_tx, _replacement_rx) = mpsc::channel(8);
+    let stop_senders = stop_map(replacement_tx);
+    let (event_tx, event_rx) = mpsc::channel(8);
+    event_tx
+        .send((PEER_IP, SessionEvent::Retired))
+        .await
+        .unwrap();
+    drop(event_tx);
+
+    run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+
+    let s = state.read().await;
+    assert!(s.adj_ribs_in.contains_key(&PEER_IP));
+    assert!(s.pending_removal.contains(&PEER_IP));
+}

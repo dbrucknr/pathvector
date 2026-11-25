@@ -6,7 +6,7 @@
 //! `ConnectRetry` interval. In Idle, "BGP FSM refuses all incoming BGP
 //! connections for this peer."
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -19,7 +19,8 @@ use pathvector_session::message::{
     BgpMessage, Capability, CeaseError, NotificationError, NotificationMessage, OpenMessage,
 };
 use pathvector_session::transport::{
-    SessionCommand, SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle, spawn,
+    SessionCommand, SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle,
+    TerminationReason, spawn,
 };
 
 const CONNECT_RETRY: Duration = Duration::from_millis(100);
@@ -37,10 +38,8 @@ async fn recv(reader: &mut Reader) -> Option<BgpMessage> {
         .map(|m| m.expect("decode error"))
 }
 
-/// A session that has dialled `listener` and reached Established.
-async fn established() -> (SpawnedSessionHandle, TcpListener, Reader, Writer) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut handle = spawn(SessionConfig {
+fn config(peer_addr: SocketAddr) -> SessionConfig {
+    SessionConfig {
         local_as: 65001,
         local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
         hold_time: 90,
@@ -49,11 +48,17 @@ async fn established() -> (SpawnedSessionHandle, TcpListener, Reader, Writer) {
         peer_as: Some(65002),
         confederation_member: false,
         public_as: 65001,
-        peer_addr: listener.local_addr().unwrap(),
+        peer_addr,
         tcp_md5: None,
         connect_retry_time: CONNECT_RETRY,
         send_hold_time: pathvector_session::fsm::SendHoldTime::default(),
-    });
+    }
+}
+
+/// A session that has dialled `listener` and reached Established.
+async fn established() -> (SpawnedSessionHandle, TcpListener, Reader, Writer) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut handle = spawn(config(listener.local_addr().unwrap()));
     handle.start().await;
 
     let (stream, _) = listener.accept().await.unwrap();
@@ -201,4 +206,92 @@ async fn inbound_connection_in_idle_is_closed() {
 
     let mut inbound = deliver_inbound(&handle).await;
     assert_eq!(recv(&mut inbound).await, None);
+}
+
+/// Reads the session's event stream to its end.
+async fn remaining_events(handle: &mut SpawnedSessionHandle) -> Vec<SessionEvent> {
+    tokio::time::timeout(TIMEOUT, async {
+        let mut events = Vec::new();
+        while let Some(event) = handle.next_event().await {
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .expect("the session task never ended")
+}
+
+/// `Retire` ends the task although the handle and a cloned sender are alive,
+/// after the Cease RFC 4271 §8.2.2 requires of `ManualStop`.
+#[tokio::test]
+async fn retired_session_reports_its_termination_and_ends() {
+    let (mut handle, listener, mut reader, _writer) = established().await;
+    let commands = handle.stop_sender();
+    commands.send(SessionCommand::Retire).await.unwrap();
+
+    let Some(BgpMessage::Notification(n)) = recv(&mut reader).await else {
+        panic!("no NOTIFICATION");
+    };
+    assert_eq!(
+        n.error,
+        NotificationError::Cease(CeaseError::AdministrativeShutdown)
+    );
+    assert_eq!(recv(&mut reader).await, None);
+    let events = remaining_events(&mut handle).await;
+    assert!(
+        matches!(
+            events[..],
+            [
+                SessionEvent::Terminated(TerminationReason::OperatorStop),
+                SessionEvent::Retired
+            ]
+        ),
+        "{events:?}"
+    );
+    assert!(commands.is_closed());
+    assert_no_redial(&listener).await;
+}
+
+/// The order `RemovePeer` uses with an RFC 9003 shutdown message: the stop
+/// carries the caller's NOTIFICATION and the retirement adds none.
+#[tokio::test]
+async fn retiring_after_a_notification_sends_only_that_notification() {
+    let (mut handle, _listener, mut reader, _writer) = established().await;
+    let sent = NotificationMessage {
+        error: NotificationError::Cease(CeaseError::AdministrativeShutdown),
+        data: vec![2, b'h', b'i'],
+    };
+    let commands = handle.stop_sender();
+    commands
+        .send(SessionCommand::Notification(sent.clone()))
+        .await
+        .unwrap();
+    commands.send(SessionCommand::Retire).await.unwrap();
+
+    assert_eq!(
+        recv(&mut reader).await,
+        Some(BgpMessage::Notification(sent))
+    );
+    assert_eq!(recv(&mut reader).await, None);
+    let events = remaining_events(&mut handle).await;
+    assert!(
+        matches!(
+            events[..],
+            [SessionEvent::Terminated(_), SessionEvent::Retired]
+        ),
+        "{events:?}"
+    );
+}
+
+/// A session with nothing to terminate still says it has ended.
+#[tokio::test]
+async fn retiring_an_idle_session_reports_only_retired() {
+    let mut handle = spawn(config("127.0.0.1:179".parse().unwrap()));
+    handle
+        .stop_sender()
+        .send(SessionCommand::Retire)
+        .await
+        .unwrap();
+    let events = remaining_events(&mut handle).await;
+    assert!(matches!(events[..], [SessionEvent::Retired]), "{events:?}");
 }

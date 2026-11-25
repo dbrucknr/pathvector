@@ -87,6 +87,10 @@ mod rr_tie_break_tests;
 #[cfg(test)]
 mod session_restart_tests;
 
+// RemovePeer must end the peer's session and forwarding tasks.
+#[cfg(test)]
+mod session_retire_tests;
+
 // Re-exports so that sibling submodules using `use super::*` can call
 // items defined in other sibling submodules.
 use blackhole::{BlackholeBook, BlackholeBooks, BlackholeChange, PeerBlackhole};
@@ -1315,6 +1319,74 @@ where
     )
 }
 
+/// Purges a peer that `RemovePeer` marked: its routes, then every piece of
+/// per-peer state, including the command sender.
+fn complete_removal(
+    s: &mut DaemonState,
+    peer_ip: IpAddr,
+    termination_reason: TerminationReason,
+    stop_senders: &Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>,
+) {
+    // Capture identity fields while they are still in the RIB.  on_terminated
+    // clears session-level state (peer_types, hold_times, etc.); remove_peer
+    // clears everything including peer_remote_as.  Both run below.
+    let removal_identity = s
+        .rib
+        .peer_remote_as
+        .get(&peer_ip)
+        .copied()
+        .map(|remote_as| (remote_as, s.rib.local_as));
+    // While `pending_removal` still names the peer, so that no Graceful Restart
+    // window opens. Suppress the intermediate Changed(None) broadcast — the
+    // explicit Removed event below is the authoritative notification.
+    s.on_terminated(peer_ip, termination_reason, false);
+    s.pending_removal.remove(&peer_ip);
+    // Permanent removal: erase all per-peer state so the peer no longer
+    // appears in gRPC responses and remove the stop sender so no further
+    // commands can be sent to this session.
+    s.remove_peer(peer_ip);
+    stop_senders.lock().unwrap().remove(&peer_ip);
+    // Broadcast a Removed event carrying the last-known remote_as and
+    // local_as so watch_peers subscribers can identify the removed peer
+    // without re-reading a snapshot that no longer contains it.
+    if let Some((remote_as, local_as)) = removal_identity {
+        let _ = s.peer_tx.send(proto::PeerEvent {
+            r#type: proto::PeerEventType::Removed as i32,
+            peer: Some(proto::PeerState {
+                address: peer_ip.to_string(),
+                remote_as,
+                local_as,
+                ..Default::default()
+            }),
+        });
+    }
+}
+
+/// Handles one [`SessionEvent::Retired`], the last event of a session that
+/// `RemovePeer` discarded.
+///
+/// An Established session reports `Terminated` first, which has already
+/// completed the removal. One that was not Established reports nothing else, so
+/// the removal completes here.
+fn handle_session_retired(
+    s: &mut DaemonState,
+    peer_ip: IpAddr,
+    stop_senders: &Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>,
+) {
+    // The peer may have been added again, and even be pending a second
+    // removal. That session's command channel is still open; the retired one's
+    // is closed.
+    let outstanding = s.pending_removal.contains(&peer_ip)
+        && stop_senders
+            .lock()
+            .unwrap()
+            .get(&peer_ip)
+            .is_none_or(mpsc::Sender::is_closed);
+    if outstanding {
+        complete_removal(s, peer_ip, TerminationReason::OperatorStop, stop_senders);
+    }
+}
+
 /// A [`SessionCommand::SetCapabilities`] owed to a session whose teardown has
 /// just been processed.
 ///
@@ -1349,47 +1421,13 @@ fn handle_session_terminated(
     termination_reason: TerminationReason,
     stop_senders: &Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>,
 ) -> Option<CapabilityRefresh> {
-    let is_removed = s.pending_removal.remove(&peer_ip);
-    // Capture identity fields while they are still in the RIB.  on_terminated
-    // clears session-level state (peer_types, hold_times, etc.); remove_peer
-    // clears everything including peer_remote_as.  Both run below.
-    let removal_identity = if is_removed {
-        s.rib
-            .peer_remote_as
-            .get(&peer_ip)
-            .copied()
-            .map(|remote_as| (remote_as, s.rib.local_as))
-    } else {
-        None
-    };
     // Recorded before `on_terminated` consumes the reason.
     crate::metrics::on_session_terminated(peer_ip, &termination_reason);
-    // For removal, suppress the intermediate Changed(None) broadcast — the
-    // explicit Removed event below is the authoritative notification.
-    s.on_terminated(peer_ip, termination_reason, !is_removed);
-
-    if is_removed {
-        // Permanent removal: erase all per-peer state so the peer no longer
-        // appears in gRPC responses and remove the stop sender so no further
-        // commands can be sent to this session.
-        s.remove_peer(peer_ip);
-        stop_senders.lock().unwrap().remove(&peer_ip);
-        // Broadcast a Removed event carrying the last-known remote_as and
-        // local_as so watch_peers subscribers can identify the removed peer
-        // without re-reading a snapshot that no longer contains it.
-        if let Some((remote_as, local_as)) = removal_identity {
-            let _ = s.peer_tx.send(proto::PeerEvent {
-                r#type: proto::PeerEventType::Removed as i32,
-                peer: Some(proto::PeerState {
-                    address: peer_ip.to_string(),
-                    remote_as,
-                    local_as,
-                    ..Default::default()
-                }),
-            });
-        }
+    if s.pending_removal.contains(&peer_ip) {
+        complete_removal(s, peer_ip, termination_reason, stop_senders);
         return None;
     }
+    s.on_terminated(peer_ip, termination_reason, true);
 
     // RFC 4724 §4.2: when re-establishing a session, the Restart State (R) bit
     // "MUST NOT be set unless the Receiving Speaker has restarted". The session
@@ -1532,6 +1570,15 @@ pub(crate) async fn run_event_loop(
                         }
                         continue;
                     }
+                    SessionEvent::Retired => {
+                        handle_session_retired(&mut s, peer_ip, &stop_senders);
+                        crate::metrics::update_rib_sizes(
+                            s.rib.loc_rib.len(),
+                            s.rib.loc_rib_v6.len(),
+                            &s.rib.prefixes_advertised,
+                        );
+                        continue;
+                    }
                     SessionEvent::RouteUpdate(msg) => {
                         let notify_err = s.on_route_update(peer_ip, msg);
                         let adj_in = s.rib.prefixes_received.get(&peer_ip).copied().unwrap_or(0);
@@ -1629,6 +1676,9 @@ pub(crate) async fn run_event_loop(
                                 termination_reason,
                                 &stop_senders,
                             ));
+                        }
+                        SessionEvent::Retired => {
+                            handle_session_retired(&mut s, extra_ip, &stop_senders);
                         }
                         SessionEvent::RouteUpdate(msg) => {
                             // See the primary RouteUpdate arm above: this only
