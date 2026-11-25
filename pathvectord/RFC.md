@@ -534,7 +534,7 @@ carries it, and never advertising it.
 ## RFC 4456 — BGP Route Reflection
 
 **Owns:** Route Reflector configuration, inbound attribute processing (ORIGINATOR_ID,
-CLUSTER_LIST, loop detection), RR-aware iBGP split-horizon in the propagation loop, and
+CLUSTER_LIST, loop detection), RR-aware iBGP split-horizon in the outbound decision, and
 outbound inclusion of reflection attributes in UPDATE messages.  
 **Boundary:** ORIGINATOR_ID / CLUSTER_LIST wire codec lives in `pathvector-session`.
 Route struct fields for carrying the attributes live in `pathvector-rib`.  
@@ -561,6 +561,8 @@ Route struct fields for carrying the attributes live in `pathvector-rib`.
 | adj_ribs_out_v6 reflecting mode preserved after session reconnect | `src/daemon.rs` | ✅ | `test_rr_v6_adj_rib_out_reflecting_restored_after_reconnect` |
 | IPv6 split-horizon: non-client iBGP → non-client iBGP blocked in propagation | `src/daemon.rs` | ✅ | `test_rr_v6_split_horizon_blocks_non_client_to_non_client` |
 | IPv6 split-horizon: non-client iBGP → non-client iBGP blocked in full-table dump | `src/daemon.rs` | ✅ | `test_rr_v6_established_dump_applies_split_horizon` |
+| §6 non-client → non-client exclusion applied on **every** send path (incremental, table dump, session loss, GR stale marking / End-of-RIB prune / deadline expiry, export-policy change), IPv4 and IPv6, including while the source's session is down (routes retained for GR) and for peers on IPv6 transport (issue #168) | `src/outbound.rs` `excluded_by_reflection`, called from `propagate_prefix` / `propagate_prefix_v6` | ✅ | `src/daemon/rr_split_horizon_tests.rs` |
+| RFC 4271 §9.1.3: a destination the §6 rule excludes is sent a withdrawal for what it was previously advertised (a non-client's path replacing a client's as best) | `src/outbound.rs` | ✅ | `rr_split_horizon_tests::{update_taking_over_from_client_withdraws_v4_and_v6, session_loss_withdraws_when_non_client_takes_over_v4, gr_expiry_withdraws_when_non_client_takes_over_v4_and_v6, eor_prune_withdraws_when_non_client_takes_over_v4_and_v6}` |
 
 ---
 

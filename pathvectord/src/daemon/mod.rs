@@ -85,6 +85,10 @@ mod gr_preference_tests;
 #[cfg(test)]
 mod rr_tie_break_tests;
 
+// Issue #168: RFC 4456 §6 non-client split-horizon on every send path.
+#[cfg(test)]
+mod rr_split_horizon_tests;
+
 // Re-exports so that sibling submodules using `use super::*` can call
 // items defined in other sibling submodules.
 use blackhole::{BlackholeBook, BlackholeBooks, BlackholeChange, PeerBlackhole};
@@ -6170,6 +6174,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::Internal,
             65001,
@@ -6200,6 +6205,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::External,
             65001,
@@ -6235,6 +6241,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::External,
             65001,
@@ -6265,6 +6272,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::Internal,
             65001,
@@ -6280,6 +6288,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::Internal,
             65001,
@@ -8569,7 +8578,17 @@ mod tests {
     ) -> bool {
         let peer_ip = aro.peer().ip();
         let decision = propagate_prefix(
-            nlri, rib, aro, policy, peer_type, local_as, local_as, bgp_id, false, false,
+            nlri,
+            rib,
+            aro,
+            &std::collections::HashSet::new(),
+            policy,
+            peer_type,
+            local_as,
+            local_as,
+            bgp_id,
+            false,
+            false,
         );
         flush_updates(peer_ip, vec![decision], MAX_LEN, tx, peer_type, true)
     }
