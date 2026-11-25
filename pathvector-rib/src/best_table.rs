@@ -15,7 +15,6 @@
 
 use ahash::AHashMap;
 use ipnetx::interfaces::IpAddress;
-use pathvector_types::Nlri;
 use routemap::RouteMap;
 
 use crate::{canonical::CanonicalNlri, peer::PeerId};
@@ -94,14 +93,14 @@ impl<A: IpAddress> BestTable<A> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (CanonicalNlri<A>, &PeerId)> {
         self.winners
             .iter()
-            .map(|(prefix, peer)| (CanonicalNlri::new(Nlri::from_prefix(prefix)), peer))
+            .map(|(prefix, peer)| (CanonicalNlri::from_tree_prefix(prefix), peer))
     }
 
     /// The most specific prefix covering `addr`, and its winner.
     pub(crate) fn longest_match_entry(&self, addr: A) -> Option<(CanonicalNlri<A>, &PeerId)> {
         self.winners
             .longest_match_entry(addr)
-            .map(|(prefix, peer)| (CanonicalNlri::new(Nlri::from_prefix(prefix)), peer))
+            .map(|(prefix, peer)| (CanonicalNlri::from_tree_prefix(prefix), peer))
     }
 
     /// Recomputes every peer's win count by scanning the table. O(table).

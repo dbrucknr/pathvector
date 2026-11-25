@@ -11,7 +11,10 @@
 //!
 //! Every RIB converts the caller's NLRI into this type on entry, and its maps
 //! are declared in terms of it, so a non-canonical key cannot be stored. The
-//! field is private to this module: [`CanonicalNlri::new`] is the one way in.
+//! field is private to this module, which offers two ways in:
+//! [`CanonicalNlri::new`] for anything a caller supplied, and
+//! [`CanonicalNlri::from_tree_prefix`] for prefixes read back out of the
+//! best-path tree, which are already masked.
 
 use ipnetx::{interfaces::IpAddress, prefix::IpPrefix};
 use pathvector_types::Nlri;
@@ -31,6 +34,22 @@ impl<A: IpAddress> CanonicalNlri<A> {
     #[inline]
     pub(crate) fn new(nlri: Nlri<A>) -> Self {
         Self(nlri.masked())
+    }
+
+    /// Wraps a prefix read back out of a [`routemap::RouteMap`], without
+    /// masking it a second time.
+    ///
+    /// `RouteMap` masks on insert, and both its iterator and
+    /// `longest_match_entry` return masked prefixes. Masking again costs
+    /// several nanoseconds per entry for IPv6 (`u128` arithmetic) on
+    /// `best_routes` and `longest_match`. Debug builds, which the tests run
+    /// as, assert the precondition.
+    ///
+    /// Not for caller-supplied values: use [`new`](Self::new).
+    #[inline]
+    pub(crate) fn from_tree_prefix(prefix: IpPrefix<A>) -> Self {
+        debug_assert!(prefix == prefix.masked(), "tree returned host bits");
+        Self(Nlri::from_prefix(prefix))
     }
 
     /// The canonical NLRI, for handing back to callers and storing in routes.
@@ -90,6 +109,16 @@ mod tests {
             assert_eq!(u128::from(key.nlri().prefix().ip()), want);
             assert_eq!(key.nlri().prefix_len(), len);
         }
+    }
+
+    /// The precondition of `from_tree_prefix` is checked, not assumed, in the
+    /// builds the tests run as.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "tree returned host bits")]
+    fn from_tree_prefix_rejects_host_bits_in_debug_builds() {
+        let raw = IpPrefix::new(Ipv4Addr::new(10, 1, 2, 3), 8).unwrap();
+        let _ = CanonicalNlri::from_tree_prefix(raw);
     }
 
     proptest! {
