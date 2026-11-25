@@ -238,26 +238,20 @@ impl DaemonState {
         // Collect all Loc-RIB NLRIs; the borrow is dropped after the collect.
         let nlris: Vec<Nlri<Ipv4Addr>> = self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
 
-        let max_len = self
-            .negotiated_max_len
-            .get(&peer_ip)
-            .copied()
-            .unwrap_or(MAX_LEN);
         let local_as = self.rib.local_as;
         // RFC 5065: the AS number prepended for genuinely external peers —
         // the confederation identifier when confederations are configured,
         // or `local_as` again when they are not.
         let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_bgp_id = self.rib.local_bgp_id;
-        let peer_four_byte = self.four_byte_peers.contains(&peer_ip);
         let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
         let v4_deferred = self.selection_deferral.v4_deferred();
         let v6_deferred = self.selection_deferral.v6_deferred();
 
-        if let (Some(export_policy), Some(adj_rib_out), Some(update_tx)) = (
+        if let (Some(export_policy), Some(adj_rib_out), true) = (
             self.export_policies.get(&peer_ip),
             self.adj_ribs_out.get_mut(&peer_ip),
-            self.update_senders.get(&peer_ip),
+            self.update_senders.contains_key(&peer_ip),
         ) {
             let decisions: Vec<PrefixDecision> = nlris
                 .into_iter()
@@ -276,26 +270,17 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates(
-                peer_ip,
-                decisions,
-                max_len,
-                update_tx,
-                peer_type,
-                peer_four_byte,
-            ) {
-                self.stalled_peers.push(peer_ip);
-            }
+            self.send_decisions(peer_ip, decisions);
         }
 
         if self.ipv6_capable_peers.contains(&peer_ip) {
             let nlris_v6: Vec<Nlri<Ipv6Addr>> =
                 self.rib.loc_rib_v6.best_routes().map(|(n, _)| n).collect();
             let local_ipv6 = self.rib.local_ipv6;
-            if let (Some(export_policy_v6), Some(adj_rib_out_v6), Some(update_tx)) = (
+            if let (Some(export_policy_v6), Some(adj_rib_out_v6), true) = (
                 self.export_policies_v6.get(&peer_ip),
                 self.adj_ribs_out_v6.get_mut(&peer_ip),
-                self.update_senders.get(&peer_ip),
+                self.update_senders.contains_key(&peer_ip),
             ) {
                 let decisions_v6: Vec<PrefixDecisionV6> = nlris_v6
                     .into_iter()
@@ -314,16 +299,7 @@ impl DaemonState {
                         )
                     })
                     .collect();
-                if !flush_updates_v6(
-                    peer_ip,
-                    decisions_v6,
-                    max_len,
-                    update_tx,
-                    peer_type,
-                    peer_four_byte,
-                ) {
-                    self.stalled_peers.push(peer_ip);
-                }
+                self.send_decisions_v6(peer_ip, decisions_v6);
             }
         }
 

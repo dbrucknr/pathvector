@@ -302,9 +302,9 @@ impl DaemonState {
         let Some(peer_type) = self.rib.peer_types.get(&peer_ip).copied() else {
             return false;
         };
-        let Some(max_len) = self.negotiated_max_len.get(&peer_ip).copied() else {
+        if !self.negotiated_max_len.contains_key(&peer_ip) {
             return false;
-        };
+        }
         let Some(update_tx) = self.update_senders.get(&peer_ip).cloned() else {
             return false;
         };
@@ -314,7 +314,6 @@ impl DaemonState {
         let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&peer_ip) else {
             return false;
         };
-        let peer_four_byte = self.four_byte_peers.contains(&peer_ip);
 
         let all_nlris: Vec<Nlri<Ipv4Addr>> =
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
@@ -371,19 +370,10 @@ impl DaemonState {
             })
             .collect();
 
-        let mut stalled = !flush_updates(
-            peer_ip,
-            decisions,
-            max_len,
-            &update_tx,
-            peer_type,
-            peer_four_byte,
-        );
+        let mut stalled = !self.send_decisions(peer_ip, decisions);
         if !stalled && !send_eor_ipv4(&update_tx) {
-            stalled = true;
-        }
-        if stalled {
             self.stalled_peers.push(peer_ip);
+            stalled = true;
         }
         self.sync_advertised(peer_ip);
         stalled
@@ -400,13 +390,12 @@ impl DaemonState {
         if !self.ipv6_capable_peers.contains(&peer_ip) {
             return false;
         }
-        let Some(max_len) = self.negotiated_max_len.get(&peer_ip).copied() else {
+        if !self.negotiated_max_len.contains_key(&peer_ip) {
             return false;
-        };
+        }
         let Some(update_tx) = self.update_senders.get(&peer_ip).cloned() else {
             return false;
         };
-        let peer_four_byte = self.four_byte_peers.contains(&peer_ip);
 
         let all_nlris_v6: Vec<Nlri<Ipv6Addr>> =
             self.rib.loc_rib_v6.best_routes().map(|(n, _)| n).collect();
@@ -465,19 +454,10 @@ impl DaemonState {
             })
             .collect();
 
-        let mut stalled = !flush_updates_v6(
-            peer_ip,
-            decisions_v6,
-            max_len,
-            &update_tx,
-            peer_type,
-            peer_four_byte,
-        );
+        let mut stalled = !self.send_decisions_v6(peer_ip, decisions_v6);
         if !stalled && !send_eor_ipv6(&update_tx) {
-            stalled = true;
-        }
-        if stalled {
             self.stalled_peers.push(peer_ip);
+            stalled = true;
         }
         self.sync_advertised(peer_ip);
         stalled
