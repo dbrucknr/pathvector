@@ -48,6 +48,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
     ]
 }
 
+#[allow(clippy::too_many_lines)] // one scenario: drive, resume, check
 async fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
     let (mut handle, mut peer) = established(config(HOLD)).await;
     peer.clear_sent();

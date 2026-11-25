@@ -135,6 +135,8 @@ pub fn on_session_terminated(peer: IpAddr, reason: &TerminationReason) {
         TerminationReason::Unclean => "unclean",
         TerminationReason::Notification(_) => "notification",
         TerminationReason::OperatorStop => "operator_stop",
+        // RFC 9687 §7: report the reason in operational state.
+        TerminationReason::SendHoldTimerExpired => "send_hold_timer_expired",
     };
     metrics::counter!(
         "pathvectord_bgp_sessions_terminated_total",
@@ -369,6 +371,10 @@ mod tests {
         for (reason, expected_label) in [
             (TerminationReason::Unclean, "unclean"),
             (TerminationReason::OperatorStop, "operator_stop"),
+            (
+                TerminationReason::SendHoldTimerExpired,
+                "send_hold_timer_expired",
+            ),
         ] {
             let snap = capture(|| on_session_terminated(peer(1), &reason));
             let labels = vec![

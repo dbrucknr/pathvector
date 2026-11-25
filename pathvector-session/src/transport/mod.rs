@@ -26,6 +26,7 @@ use tokio::time::{Instant, Sleep};
 
 use crate::framing::FramingError;
 use crate::fsm::{Fsm, FsmConfig, FsmInput, FsmOutput, SessionInfo, UpdateRecovery};
+pub use crate::fsm::{InvalidSendHoldTime, SendHoldTime};
 use crate::message::{
     AsnWidth, BgpMessage, Capability, CeaseError, CodecError, MsgHeaderError, NotificationError,
     NotificationMessage, OpenMessage, OpenMsgError, UpdateMessage,
@@ -229,6 +230,11 @@ pub struct SessionConfig {
     /// [`DEFAULT_CONNECT_RETRY_TIME`] for the RFC-recommended 120 s default.
     /// Set lower in tests or latency-sensitive deployments.
     pub connect_retry_time: std::time::Duration,
+    /// RFC 9687 `SendHoldTime`: how long the session stays up when no BGP
+    /// message can be sent to the peer. [`SendHoldTime::default`] is the
+    /// RFC-recommended greater of 8 minutes and twice the negotiated hold
+    /// time.
+    pub send_hold_time: SendHoldTime,
     /// Capabilities advertised in the OPEN message.
     pub capabilities: Vec<Capability>,
     /// Capabilities the peer MUST advertise. If absent, the session is rejected
@@ -318,6 +324,14 @@ pub enum TerminationReason {
     /// The session was torn down by this side, whether by the operator or by
     /// the local system's own logic.  Always flushes routes immediately.
     OperatorStop,
+    /// The RFC 9687 `SendHoldTimer` expired: nothing could be sent to the peer.
+    ///
+    /// This side generated a "Send Hold Timer Expired" NOTIFICATION (which the
+    /// peer may well not have received), so Graceful Restart retention applies
+    /// only under RFC 8538: "The BGP speaker generating the BGP NOTIFICATION
+    /// message MUST also follow the rules for the Receiving Speaker" when the
+    /// N bit was exchanged.
+    SendHoldTimerExpired,
 }
 
 /// Events emitted by a session to its caller.
@@ -474,6 +488,11 @@ struct Session<T: BgpTransport> {
     // The interval the FSM last armed the KeepaliveTimer with, so that sending
     // an UPDATE can restart it.
     keepalive_interval: Option<Duration>,
+    // The value the FSM started the SendHoldTimer with, so that sending a
+    // message can restart it. `None` while it is stopped.
+    send_hold_interval: Option<Duration>,
+    // Set for a teardown that must not wait for the connection to drain.
+    abort_on_close: bool,
     // Wakes the loop at the earliest deadline. Kept across iterations so it is
     // only re-registered when that deadline changes.
     wake: Pin<Box<Sleep>>,
@@ -543,6 +562,7 @@ impl<T: BgpTransport> Session<T> {
             peer_as: config.peer_as,
             confederation_member: config.confederation_member,
             public_as: config.public_as,
+            send_hold_time: config.send_hold_time,
         });
         let events = Outbox::new(event_tx, config.peer_addr.ip());
 
@@ -557,6 +577,8 @@ impl<T: BgpTransport> Session<T> {
             write_batch: WriteBatch::DEFAULT,
             event_backlog_limit: EventBacklogLimit::DEFAULT,
             keepalive_interval: None,
+            send_hold_interval: None,
+            abort_on_close: false,
             wake: Box::pin(tokio::time::sleep_until(Instant::now())),
             link: None,
             closing: None,
@@ -605,6 +627,7 @@ impl<T: BgpTransport> Session<T> {
                     FsmInput::MalformedUpdate(r) if r.is_session_reset() => {
                         TerminationReason::OperatorStop
                     }
+                    FsmInput::SendHoldTimerExpired => TerminationReason::SendHoldTimerExpired,
                     _ => TerminationReason::Unclean,
                 };
             }
@@ -632,6 +655,9 @@ impl<T: BgpTransport> Session<T> {
                 drop(candidate);
                 self.deadlines.cancel(Timer::CandidateOpen);
             }
+            // RFC 9687 §4.3: send the NOTIFICATION only if that does not
+            // delay dropping the connection.
+            self.abort_on_close = matches!(input, FsmInput::SendHoldTimerExpired);
             let outputs = self.fsm.process(input);
             if !self.execute(outputs) {
                 // A TCP send failed; feed TcpFailed back into the FSM.
@@ -687,6 +713,7 @@ impl<T: BgpTransport> Session<T> {
             if let Some(input) = self.pump_updates(None) {
                 return input;
             }
+            self.restart_send_hold_timer();
             if let Some(timer) = self.turns.next(&self.deadlines, Instant::now()) {
                 if let Some(input) = self.on_timer(timer) {
                     return input;
@@ -889,9 +916,46 @@ impl<T: BgpTransport> Session<T> {
         }
     }
 
+    /// RFC 9687 §4.3: "Each time the local system sends a BGP message, it
+    /// restarts the `SendHoldTimer`". "Sent" means accepted by the transport:
+    /// for TCP, written to the socket.
+    fn restart_send_hold_timer(&mut self) {
+        let sent = self.link.as_mut().is_some_and(|l| l.out.take_sent());
+        if sent && let Some(interval) = self.send_hold_interval {
+            self.deadlines
+                .arm(Timer::SendHold, Instant::now() + interval);
+        }
+    }
+
     /// Service one overdue timer.
     fn on_timer(&mut self, timer: Timer) -> Option<FsmInput> {
         match timer {
+            Timer::SendHold => {
+                // The connection may have become writable since the last turn.
+                if let Some(link) = &mut self.link
+                    && link.out.is_flushing()
+                    && matches!(link.out.try_flush(), Some(Ok(())))
+                {
+                    self.restart_send_hold_timer();
+                    return None;
+                }
+                self.deadlines.cancel(Timer::SendHold);
+                // RFC 9687 §5: "an error MUST be logged in the local system,
+                // indicating the \"Send Hold Timer Expired\" Error Code."
+                tracing::error!(
+                    peer = %self.config.peer_addr,
+                    error_code = 8,
+                    send_hold_time = ?self.send_hold_interval,
+                    "Send Hold Timer Expired: no BGP message could be sent to the peer; \
+                     closing the session"
+                );
+                metrics::counter!(
+                    "pathvector_session_send_hold_expired_total",
+                    "peer" => self.config.peer_addr.ip().to_string()
+                )
+                .increment(1);
+                Some(FsmInput::SendHoldTimerExpired)
+            }
             Timer::Keepalive => {
                 if let Some(deadline) = self.deadlines.get(Timer::Keepalive) {
                     record_keepalive_lateness(self.config.peer_addr.ip(), deadline);
@@ -1443,6 +1507,14 @@ impl<T: BgpTransport> Session<T> {
                 FsmOutput::StopKeepaliveTimer => {
                     self.deadlines.cancel(Timer::Keepalive);
                 }
+                FsmOutput::StartSendHoldTimer(d) => {
+                    self.send_hold_interval = Some(d);
+                    self.deadlines.arm(Timer::SendHold, Instant::now() + d);
+                }
+                FsmOutput::StopSendHoldTimer => {
+                    self.send_hold_interval = None;
+                    self.deadlines.cancel(Timer::SendHold);
+                }
                 FsmOutput::StartConnectRetryTimer(_) => {
                     self.deadlines.arm(
                         Timer::ConnectRetry,
@@ -1537,17 +1609,22 @@ impl<T: BgpTransport> Session<T> {
 
     /// Close the connection after letting it take what is already queued,
     /// normally a NOTIFICATION. If it cannot at once, it carries on in the
-    /// background for at most [`CLOSE_FLUSH_TIMEOUT`].
+    /// background for at most [`CLOSE_FLUSH_TIMEOUT`], unless this teardown
+    /// must not wait (`abort_on_close`).
     fn close_connection(&mut self) {
         if let Some(mut link) = self.link.take()
             && link.out.is_flushing()
             && link.out.try_flush().is_none()
         {
-            if let Some(mut older) = self.closing.replace(link) {
-                older.out.abort();
+            if self.abort_on_close {
+                link.out.abort();
+            } else {
+                if let Some(mut older) = self.closing.replace(link) {
+                    older.out.abort();
+                }
+                self.deadlines
+                    .arm(Timer::CloseFlush, Instant::now() + CLOSE_FLUSH_TIMEOUT);
             }
-            self.deadlines
-                .arm(Timer::CloseFlush, Instant::now() + CLOSE_FLUSH_TIMEOUT);
         }
         self.drop_connection();
     }
@@ -1831,6 +1908,7 @@ mod tests {
             peer_addr: "127.0.0.1:0".parse().unwrap(),
             tcp_md5: None,
             connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
+            send_hold_time: crate::fsm::SendHoldTime::default(),
         }
     }
 
@@ -4101,6 +4179,7 @@ mod tests {
             peer_as: Some(65002),
             confederation_member: false,
             public_as: 65001,
+            send_hold_time: crate::fsm::SendHoldTime::default(),
         });
 
         assert!(!fsm.is_established(), "FSM must start non-Established");
@@ -4303,6 +4382,7 @@ mod command_flood_tests {
             peer_addr: "127.0.0.1:0".parse().unwrap(),
             tcp_md5: None,
             connect_retry_time: Duration::from_secs(1),
+            send_hold_time: crate::fsm::SendHoldTime::default(),
         };
         let (mut session, _handle) = Session::<FramedBgpTransport>::new(config);
         let (cmd_tx, cmd_rx) = mpsc::channel(10_000);

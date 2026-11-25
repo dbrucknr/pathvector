@@ -146,6 +146,7 @@ impl Daemon {
             public_as: LOCAL_AS,
             peer_addr,
             tcp_md5: None,
+            send_hold_time: pathvector_session::fsm::SendHoldTime::default(),
         });
         handle.start().await;
 

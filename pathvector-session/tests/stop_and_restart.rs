@@ -52,6 +52,7 @@ async fn established() -> (SpawnedSessionHandle, TcpListener, Reader, Writer) {
         peer_addr: listener.local_addr().unwrap(),
         tcp_md5: None,
         connect_retry_time: CONNECT_RETRY,
+        send_hold_time: pathvector_session::fsm::SendHoldTime::default(),
     });
     handle.start().await;
 

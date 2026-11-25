@@ -46,6 +46,7 @@ fn local_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
         peer_addr,
         tcp_md5: None,
         connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
+        send_hold_time: pathvector_session::fsm::SendHoldTime::default(),
     }
 }
 
@@ -242,6 +243,7 @@ fn short_timer_config(peer_addr: std::net::SocketAddr) -> SessionConfig {
         peer_addr,
         tcp_md5: None,
         connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
+        send_hold_time: pathvector_session::fsm::SendHoldTime::default(),
     }
 }
 

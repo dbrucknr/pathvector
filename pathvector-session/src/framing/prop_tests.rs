@@ -123,6 +123,7 @@ fn arb_path_attribute() -> impl Strategy<Value = PathAttribute> {
 fn arb_notification_error() -> impl Strategy<Value = NotificationError> {
     prop_oneof![
         Just(NotificationError::HoldTimerExpired),
+        Just(NotificationError::SendHoldTimerExpired),
         Just(NotificationError::FsmError),
         Just(NotificationError::FsmErrorOpenSent),
         Just(NotificationError::FsmErrorOpenConfirm),
@@ -179,7 +180,10 @@ fn arb_notification_error() -> impl Strategy<Value = NotificationError> {
             prop_oneof![Just(0u8), 11u8..=u8::MAX].prop_map(CeaseError::Unknown),
         ]
         .prop_map(NotificationError::Cease),
-        (prop_oneof![Just(0u8), 7u8..=u8::MAX], any::<u8>())
+        (
+            prop_oneof![Just(0u8), Just(7u8), 9u8..=u8::MAX],
+            any::<u8>()
+        )
             .prop_map(|(code, subcode)| NotificationError::Unknown { code, subcode }),
     ]
 }

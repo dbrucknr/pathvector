@@ -48,6 +48,7 @@ pub struct MockWriter {
     consumed: Arc<AtomicUsize>,
     writable: watch::Receiver<bool>,
     broken: Arc<AtomicBool>,
+    aborted: Arc<AtomicBool>,
     _alive: Arc<()>,
 }
 
@@ -58,6 +59,7 @@ pub struct MockPeer {
     consumed: Arc<AtomicUsize>,
     writable: watch::Sender<bool>,
     broken: Arc<AtomicBool>,
+    aborted: Arc<AtomicBool>,
     alive: std::sync::Weak<()>,
     log: Mutex<Vec<Sent>>,
 }
@@ -69,6 +71,7 @@ pub fn mock() -> (MockTransport, MockPeer) {
     let consumed = Arc::new(AtomicUsize::new(0));
     let alive = Arc::new(());
     let broken = Arc::new(AtomicBool::new(false));
+    let aborted = Arc::new(AtomicBool::new(false));
     let weak = Arc::downgrade(&alive);
     (
         MockTransport {
@@ -83,6 +86,7 @@ pub fn mock() -> (MockTransport, MockPeer) {
                 consumed: Arc::clone(&consumed),
                 writable: writable_rx,
                 broken: Arc::clone(&broken),
+                aborted: Arc::clone(&aborted),
                 _alive: alive,
             },
         },
@@ -92,6 +96,7 @@ pub fn mock() -> (MockTransport, MockPeer) {
             consumed,
             writable: writable_tx,
             broken,
+            aborted,
             alive: weak,
             log: Mutex::new(Vec::new()),
         },
@@ -143,6 +148,10 @@ impl BgpWriter for MockWriter {
         }
         Ok(())
     }
+
+    fn abort(&mut self) {
+        self.aborted.store(true, Ordering::SeqCst);
+    }
 }
 
 impl MockPeer {
@@ -163,6 +172,11 @@ impl MockPeer {
     /// Every further write fails.
     pub fn break_writes(&self) {
         self.broken.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the session discarded unwritten data when it closed.
+    pub fn aborted(&self) -> bool {
+        self.aborted.load(Ordering::SeqCst)
     }
 
     /// Whether the session still holds this connection.
@@ -216,6 +230,7 @@ pub fn config(hold_time: u16) -> SessionConfig {
         peer_addr: "127.0.0.1:0".parse().unwrap(),
         tcp_md5: None,
         connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
+        send_hold_time: pathvector_session::fsm::SendHoldTime::default(),
     }
 }
 

@@ -194,6 +194,8 @@ pub(super) fn ready_now<F: Future>(future: F) -> Option<F::Output> {
 pub(super) struct Outbound<W> {
     writer: W,
     flushing: bool,
+    // Set when queued messages have been written out.
+    sent: bool,
     // Idempotent messages already waiting in the buffer. Queuing another copy
     // behind them would grow the buffer without telling the peer anything.
     keepalive_waiting: bool,
@@ -205,6 +207,7 @@ impl<W: BgpWriter> Outbound<W> {
         Self {
             writer,
             flushing: false,
+            sent: false,
             keepalive_waiting: false,
             refresh_waiting: Vec::new(),
         }
@@ -240,10 +243,16 @@ impl<W: BgpWriter> Outbound<W> {
     /// Write everything queued. Cancel safe.
     pub(super) async fn flush(&mut self) -> io::Result<()> {
         self.writer.flush().await?;
+        self.sent |= self.flushing;
         self.flushing = false;
         self.keepalive_waiting = false;
         self.refresh_waiting.clear();
         Ok(())
+    }
+
+    /// Whether messages were written out since the last call.
+    pub(super) fn take_sent(&mut self) -> bool {
+        std::mem::take(&mut self.sent)
     }
 
     /// Write as much as can be written without waiting. `None` if some is left.

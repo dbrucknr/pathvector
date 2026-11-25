@@ -23,6 +23,8 @@ use tokio::time::Instant;
 /// Declaration order breaks ties between timers with the same deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Timer {
+    /// RFC 9687 §4.2 Event 29.
+    SendHold,
     /// RFC 4271 §8.1.3 Event 11.
     Keepalive,
     /// RFC 4271 §8.1.3 Event 10.
@@ -36,7 +38,8 @@ pub(super) enum Timer {
 }
 
 impl Timer {
-    pub(super) const ALL: [Self; 5] = [
+    pub(super) const ALL: [Self; 6] = [
+        Self::SendHold,
         Self::Keepalive,
         Self::Hold,
         Self::ConnectRetry,
@@ -259,8 +262,11 @@ mod tests {
         /// a row.
         #[test]
         fn every_overdue_timer_is_serviced_within_a_bounded_number_of_turns(
-            offsets in proptest::collection::vec(proptest::option::of(0u64..100), 5),
-            rearm in proptest::collection::vec(0u64..3, 5),
+            offsets in proptest::collection::vec(
+                proptest::option::of(0u64..100),
+                Timer::ALL.len(),
+            ),
+            rearm in proptest::collection::vec(0u64..3, Timer::ALL.len()),
             now_ms in 0u64..100,
         ) {
             let base = Instant::now();
