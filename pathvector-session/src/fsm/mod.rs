@@ -80,7 +80,8 @@ pub struct FsmConfig {
 pub enum FsmInput {
     /// Operator command to start the session.
     ManualStart,
-    /// Operator command to tear down the session.
+    /// Operator command to tear down the session (RFC 4271 §8.1.2 Event 2).
+    /// No automatic reconnect: only [`FsmInput::ManualStart`] restarts it.
     ManualStop,
     /// The connect-retry timer fired.
     ConnectRetryTimerExpired,
@@ -100,28 +101,25 @@ pub enum FsmInput {
     CollisionDetected,
     /// A complete BGP message was received from the peer.
     MessageReceived(BgpMessage),
-    /// The daemon requests a locally initiated, administrative teardown:
-    /// send the given NOTIFICATION, then close with no automatic
-    /// reconnect (no `ConnectRetryTimer`). Used for intentional peer
-    /// removal/shutdown (RFC 9003 shutdown messages) and daemon-detected
-    /// conditions the daemon itself will re-arm on its own schedule (e.g.
-    /// RFC 4486 §4 max-prefix-exceeded, which uses its own idle-hold
-    /// timer). Do **not** reuse this for a protocol error on an ongoing,
-    /// still-configured peer relationship — see
-    /// [`FsmInput::ProtocolErrorNotificationToSend`] for that case.
+    /// An operator stop that sends the given NOTIFICATION, e.g. peer removal
+    /// with an RFC 9003 shutdown message. Like [`FsmInput::ManualStop`], there
+    /// is no automatic reconnect. For a teardown the local system decides on
+    /// by itself, use [`FsmInput::AutomaticStop`].
     NotificationToSend(crate::message::NotificationMessage),
-    /// The daemon locally detected a protocol error while Established
-    /// (e.g. RFC 7606 §3(g)'s duplicated `MP_REACH_NLRI`/`MP_UNREACH_NLRI`,
-    /// which requires a session reset) and requests the given NOTIFICATION
-    /// be sent before tearing down. Unlike [`FsmInput::NotificationToSend`],
-    /// this **does** schedule an automatic reconnect (RFC 4271 §8.2.2 Event
-    /// 28: `UpdateMsgErr` — NOTIFICATION, `ConnectRetryTimer`, drop TCP,
-    /// Idle) — the peer is still configured and the error was ours to
-    /// detect, not evidence the peer should be given up on.
+    /// The local system tears down an Established session by its own logic:
+    /// send the given NOTIFICATION, close, and reconnect after the
+    /// `ConnectRetry` interval.
     ///
-    /// The full [`NotificationMessage`] is carried so the RFC-mandated data
-    /// field is preserved verbatim.
-    ProtocolErrorNotificationToSend(crate::message::NotificationMessage),
+    /// This covers RFC 4271 §8.1.2 Event 8 (`AutomaticStop`, whose example is
+    /// exceeding a peer's maximum number of prefixes) and an UPDATE error the
+    /// caller detects (§8.2.2 Established, Event 28), such as RFC 7606 §5.2's
+    /// session reset. §8.2.2 leaves the session in Idle in both cases; when it
+    /// is started again is local policy (§8.1.1 `AllowAutomaticStart`), and
+    /// this FSM does it with the connect-retry timer.
+    ///
+    /// The full [`NotificationMessage`] is carried so the data field is
+    /// preserved verbatim.
+    AutomaticStop(crate::message::NotificationMessage),
     /// An UPDATE with a malformed path attribute was received, together with
     /// its RFC 7606 recovery decision.
     ///
@@ -337,6 +335,13 @@ impl Fsm {
                     FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
                     FsmOutput::InitiateTcpConnect,
                 ]
+            }
+            // An automatic restart may be pending here (the connect-retry
+            // timer started on the way into Idle). An operator stop cancels
+            // it: RFC 4271 §8.2.2 has `ManualStop` leave the session in Idle
+            // with the ConnectRetryTimer at zero.
+            FsmInput::ManualStop | FsmInput::NotificationToSend(_) => {
+                vec![FsmOutput::StopConnectRetryTimer]
             }
             _ => vec![],
         }
@@ -603,7 +608,7 @@ impl Fsm {
             // state machine has established that an UPDATE is permitted.
             FsmInput::MalformedUpdate(recovery) => match recovery.into_outcome() {
                 // RFC 4271 §8.2.2 Established, Event 28 (UpdateMsgErr).
-                Outcome::SessionReset(notif) => self.update_msg_err(notif),
+                Outcome::SessionReset(notif) => self.notify_and_restart(notif),
                 // RFC 7606 §2: the recovered UPDATE is processed as an
                 // ordinary Event 27 UPDATE — including the HoldTimer restart.
                 Outcome::TreatAsWithdraw(update) | Outcome::AttributeDiscard(update) => {
@@ -716,9 +721,8 @@ impl Fsm {
                     FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
                 ]
             }
-            // Locally initiated administrative teardown (peer removal/RFC 9003
-            // shutdown, or a daemon-detected condition with its own separate
-            // re-arm schedule) — no automatic reconnect.
+            // Operator stop with a specific NOTIFICATION (peer removal with an
+            // RFC 9003 shutdown message) — no automatic reconnect.
             FsmInput::NotificationToSend(msg) => {
                 self.state = State::Idle;
                 vec![
@@ -729,12 +733,9 @@ impl Fsm {
                     FsmOutput::SessionTerminated,
                 ]
             }
-            // RFC 4271 §8.2.2 Event 28 (UpdateMsgErr): a locally detected
-            // protocol error on an ongoing, still-configured peer — send the
-            // NOTIFICATION, drop the TCP connection, and (unlike
-            // `NotificationToSend`) schedule an automatic reconnect rather
-            // than leaving the peer stuck in Idle indefinitely.
-            FsmInput::ProtocolErrorNotificationToSend(msg) => self.update_msg_err(msg),
+            // The local system's own teardown (Event 8, or an Event 28 the
+            // caller detected) — unlike the two arms above, reconnect.
+            FsmInput::AutomaticStop(msg) => self.notify_and_restart(msg),
             _ => vec![],
         }
     }
@@ -750,13 +751,15 @@ impl Fsm {
         out
     }
 
+    /// Send `notif`, drop the connection, go to Idle and schedule a restart.
+    ///
     /// RFC 4271 §8.2.2 Established, Event 28 (UpdateMsgErr): "sends a
     /// NOTIFICATION message with an Update error, ... deletes all routes
     /// associated with this connection, ... drops the TCP connection, ...
-    /// changes its state to Idle." A locally detected protocol error on a
-    /// still-configured peer, so unlike [`FsmInput::NotificationToSend`] it
-    /// schedules an automatic reconnect.
-    fn update_msg_err(&mut self, notif: NotificationMessage) -> Vec<FsmOutput> {
+    /// changes its state to Idle." `AutomaticStop` (Event 8) does the same with
+    /// a Cease. The connect-retry timer started here is this implementation's
+    /// automatic restart; the RFC leaves its timing to local policy.
+    fn notify_and_restart(&mut self, notif: NotificationMessage) -> Vec<FsmOutput> {
         self.state = State::Idle;
         vec![
             FsmOutput::StopHoldTimer,
@@ -1702,12 +1705,14 @@ mod tests {
 
     // ── ManualStop ────────────────────────────────────────────────────────────
 
+    /// RFC 4271 §8.2.2: `ManualStop` leaves an Idle session in Idle. The only
+    /// action is cancelling this implementation's pending automatic restart.
     #[test]
-    fn test_manual_stop_from_idle_is_noop() {
+    fn test_manual_stop_from_idle_only_cancels_pending_restart() {
         let mut fsm = Fsm::new(default_config());
         let out = fsm.process(FsmInput::ManualStop);
         assert_eq!(fsm.state(), State::Idle);
-        assert!(out.is_empty());
+        assert_eq!(out, vec![FsmOutput::StopConnectRetryTimer]);
     }
 
     #[test]
@@ -2872,7 +2877,7 @@ mod tests {
     /// reconnect, leaving a misbehaving-but-still-configured peer stuck in
     /// Idle forever.
     #[test]
-    fn test_established_protocol_error_notification_schedules_reconnect() {
+    fn test_established_automatic_stop_schedules_reconnect() {
         use crate::message::UpdateMsgError;
 
         let mut fsm = Fsm::new(default_config());
@@ -2882,7 +2887,7 @@ mod tests {
             error: NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList),
             data: vec![],
         };
-        let out = fsm.process(FsmInput::ProtocolErrorNotificationToSend(notif.clone()));
+        let out = fsm.process(FsmInput::AutomaticStop(notif.clone()));
         assert_eq!(fsm.state(), State::Idle);
         assert!(
             out.contains(&FsmOutput::SendMessage(BgpMessage::Notification(notif))),
@@ -2900,9 +2905,43 @@ mod tests {
             out.iter()
                 .any(|o| matches!(o, FsmOutput::StartConnectRetryTimer(_))),
             "must schedule ConnectRetryTimer for automatic reconnect — unlike \
-             NotificationToSend, a protocol error on a still-configured peer \
-             must not leave it stuck in Idle indefinitely"
+             NotificationToSend, a reset the local system decided on must not \
+             leave the peer stuck in Idle indefinitely"
         );
+    }
+
+    /// A second reset arriving after the first (or a stale one) must not
+    /// cancel the restart the first one scheduled. RFC 4271 §8.2.2 Idle:
+    /// "The `ManualStop` event (Event 2) and `AutomaticStop` (Event 8) event
+    /// are ignored in the Idle state."
+    #[test]
+    fn test_idle_ignores_automatic_stop() {
+        let mut fsm = Fsm::new(default_config());
+        reach_established(&mut fsm);
+        fsm.process(FsmInput::TcpFailed); // → Idle with ConnectRetryTimer
+
+        let out = fsm.process(FsmInput::AutomaticStop(NotificationMessage {
+            error: NotificationError::Cease(CeaseError::OutOfResources),
+            data: vec![],
+        }));
+        assert_eq!(fsm.state(), State::Idle);
+        assert!(out.is_empty());
+    }
+
+    /// An operator stop carrying a NOTIFICATION cancels a pending restart,
+    /// like `ManualStop`.
+    #[test]
+    fn test_idle_notification_to_send_cancels_pending_restart() {
+        let mut fsm = Fsm::new(default_config());
+        reach_established(&mut fsm);
+        fsm.process(FsmInput::TcpFailed); // → Idle with ConnectRetryTimer
+
+        let out = fsm.process(FsmInput::NotificationToSend(NotificationMessage {
+            error: NotificationError::Cease(CeaseError::AdministrativeShutdown),
+            data: vec![],
+        }));
+        assert_eq!(fsm.state(), State::Idle);
+        assert_eq!(out, vec![FsmOutput::StopConnectRetryTimer]);
     }
 
     #[test]
