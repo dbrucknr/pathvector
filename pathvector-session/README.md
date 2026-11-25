@@ -185,6 +185,17 @@ The same bilateral decision also fixes how every ASN in `AS_PATH` and `AGGREGATO
 
 `PathAttribute::AsPath` therefore always holds the true 32-bit path in memory. Segments longer than 255 ASNs are split on encode, and zero-length or overrunning segments are RFC 7606 treat-as-withdraw at either width. `BgpMessage::encode()` is shorthand for `encode_with(AsnWidth::Four)`.
 
+### AS numbers a session refuses
+
+| Received | Action |
+|---|---|
+| OPEN claiming AS 0 (`my_as` or the capability) | NOTIFICATION Bad Peer AS (RFC 7607) |
+| AS 0 in `AS_PATH` | treat-as-withdraw (RFC 7607, RFC 7606 §7.2) |
+| AS 0 in `AGGREGATOR`, `AS4_PATH` or `AS4_AGGREGATOR` | attribute discard (RFC 7607, RFC 7606 §7.7, RFC 6793 §6) |
+| `AS_SET` or `AS_CONFED_SET` in `AS_PATH` or `AS4_PATH` | treat-as-withdraw (RFC 9774); no setting permits them |
+
+The last two groups surface as `BgpMessage::MalformedUpdate`; for treat-as-withdraw the offending attribute stays in `update.attributes`, so it can be inspected. The session also never starts while its own AS is 0. The **encoder writes what it is given**: a program that originates routes through `SessionHandle::update_sender` must not send AS 0 or set segments itself.
+
 ---
 
 ## Hold time and keepalives

@@ -48,6 +48,15 @@ assert!(large.is_four_byte());
 assert!(large.is_private());
 ```
 
+**`SpeakerAsn`** is an ASN that can identify a BGP speaker: anything but 0. `Asn` holds 0 because raw data needs it (an RPKI ROA for AS 0 says "do not route this prefix"), but RFC 7607 forbids a speaker to claim it.
+
+```rust
+use pathvector_types::{Asn, SpeakerAsn};
+
+assert!(SpeakerAsn::try_from(65001).is_ok());
+assert!(SpeakerAsn::try_from(Asn::ZERO).is_err());
+```
+
 ---
 
 ### `AsPath` / `AsPathSegment` — AS Path
@@ -67,6 +76,8 @@ An AS path is not a flat list — it is composed of typed **segments**:
 | `AS_SET` | Unordered group; produced when routes from multiple ASes are aggregated into one prefix |
 | `AS_CONFED_SEQUENCE` | Ordered list within a BGP confederation ([RFC 5065](https://www.rfc-editor.org/rfc/rfc5065)) |
 | `AS_CONFED_SET` | Unordered group within a confederation |
+
+**Representable is not permitted.** [RFC 9774](https://www.rfc-editor.org/rfc/rfc9774) deprecates both set types: by default a speaker must not advertise them, and must treat a received one as a withdrawal. [RFC 7607](https://www.rfc-editor.org/rfc/rfc7607) likewise prohibits AS 0. This crate still represents all of them, so historical data and offending messages can be inspected (`AsPath::contains_as_set` finds sets); `pathvector-session` and `pathvectord` enforce the rules on live sessions. Where an AS number identifies a speaker, use `SpeakerAsn`, which cannot be 0.
 
 **Path length** is computed per segment type, not per raw ASN:
 - `AS_SEQUENCE` — each ASN counts as 1
@@ -90,12 +101,30 @@ assert!(!path.contains(Asn::new(65003)));
 path.prepend(Asn::new(65003));
 assert_eq!(path.path_length(), 3);
 
-// A mixed path: sequence + set (produced by aggregation)
+// A mixed path: sequence + set, as historical aggregation produced it.
+// Representable for inspection; RFC 9774 forbids it on a live session.
 let aggregated = AsPath::from_segments(vec![
     AsPathSegment::Sequence(vec![Asn::new(65003)]),
     AsPathSegment::Set(vec![Asn::new(65001), Asn::new(65002)]),
 ]);
 assert_eq!(aggregated.path_length(), 2); // 1 (sequence) + 1 (set)
+assert!(aggregated.contains_as_set());
+```
+
+**`As4Path`** is the `AS4_PATH` to send a two-octet peer (RFC 6793 §4.2.2). Its only constructor leaves out confederation segments and returns `None` when nothing needs four octets.
+
+```rust
+use pathvector_types::{As4Path, Asn, AsPath, AsPathSegment};
+
+let path = AsPath::from_segments(vec![
+    AsPathSegment::ConfedSequence(vec![Asn::new(65010)]),
+    AsPathSegment::Sequence(vec![Asn::new(131_072)]),
+]);
+assert_eq!(
+    As4Path::for_two_byte_peer(&path).unwrap().into_path(),
+    AsPath::from_sequence(vec![Asn::new(131_072)]),
+);
+assert!(As4Path::for_two_byte_peer(&AsPath::from_sequence(vec![Asn::new(65001)])).is_none());
 ```
 
 ---

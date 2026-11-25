@@ -113,6 +113,19 @@ fn expect_clean(frame: &[u8], width: AsnWidth) -> UpdateMessage {
     }
 }
 
+/// The UPDATE as parsed from a frame whose path holds a set segment: flagged
+/// treat-as-withdraw (RFC 9774 §3) and retained as received, so segment
+/// parsing and the RFC 6793 merge can still be asserted on it.
+fn expect_set_flagged(frame: &[u8], width: AsnWidth) -> UpdateMessage {
+    let m = expect_malformed(frame, width);
+    assert!(m.treat_as_withdraw && !m.session_reset, "{m:?}");
+    assert!(
+        m.errors.iter().all(|e| e.detail.contains("RFC 9774")),
+        "{m:?}"
+    );
+    m.update
+}
+
 fn expect_malformed(frame: &[u8], width: AsnWidth) -> MalformedUpdate {
     match decode(frame, width) {
         BgpMessage::MalformedUpdate(m) => m,
@@ -163,7 +176,7 @@ fn multi_segment_legacy_path_is_not_misparsed_as_four_octet() {
     ];
     let frame = legacy_update(&value, &[]);
     assert_eq!(
-        expect_clean(&frame, AsnWidth::Two),
+        expect_set_flagged(&frame, AsnWidth::Two),
         expected_update(path(vec![seq(&[1, 2]), set(&[3])]), vec![]),
     );
     // Documents the failure mode being fixed: at the wrong width the very
@@ -184,7 +197,7 @@ fn all_four_segment_types_decode_at_two_octets() {
         0x02, 0x02, 0xfd, 0xea, 0x5b, 0xa0, // AS_SEQUENCE 65002 AS_TRANS
         0x01, 0x01, 0xfd, 0xe9, // AS_SET 65001
     ];
-    let got = expect_clean(&legacy_update(&value, &[]), AsnWidth::Two);
+    let got = expect_set_flagged(&legacy_update(&value, &[]), AsnWidth::Two);
     assert_eq!(
         got,
         expected_update(
@@ -824,9 +837,7 @@ fn encode_for_old_peer_then_decode_as_old_peer_recovers_the_true_path() {
     ]);
     let wire = msg.encode_with(AsnWidth::Two);
     // Decoding at the same (two-octet) width merges AS4_PATH back.
-    let BgpMessage::Update(u) = decode(&wire, AsnWidth::Two) else {
-        panic!("clean update expected")
-    };
+    let u = expect_set_flagged(&wire, AsnWidth::Two);
     assert_eq!(u.attributes[1], PathAttribute::AsPath(original));
     assert!(
         !u.attributes
