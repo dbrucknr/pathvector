@@ -920,7 +920,7 @@ impl PolicyService for PolicyServiceImpl {
         let peer_ip = parse_peer_address(&req.peer_address)?;
         let action = parse_policy_action(req.action)?;
 
-        let mut s = self.state.write().await;
+        let mut s = crate::lock_timing::write_timed(&self.state, "grpc_set_import_default").await;
         if !s.import_policies.contains_key(&peer_ip) {
             return Err(Status::not_found(format!(
                 "peer {peer_ip} is not configured"
@@ -939,7 +939,7 @@ impl PolicyService for PolicyServiceImpl {
         let peer_ip = parse_peer_address(&req.peer_address)?;
         let action = parse_policy_action(req.action)?;
 
-        let mut s = self.state.write().await;
+        let mut s = crate::lock_timing::write_timed(&self.state, "grpc_set_export_default").await;
         if !s.export_policies.contains_key(&peer_ip) {
             return Err(Status::not_found(format!(
                 "peer {peer_ip} is not configured"
@@ -1111,11 +1111,15 @@ impl OriginationService for OriginationServiceImpl {
         if is_ipv6_prefix(&req.prefix) {
             let route = parse_originate_request_v6(req)?;
             tracing::info!(prefix = %route.nlri, "OriginateRoute (IPv6)");
-            self.state.write().await.originate_route_v6(route);
+            crate::lock_timing::write_timed(&self.state, "grpc_originate")
+                .await
+                .originate_route_v6(route);
         } else {
             let route = parse_originate_request(req)?;
             tracing::info!(prefix = %route.nlri, "OriginateRoute");
-            self.state.write().await.originate_route(route);
+            crate::lock_timing::write_timed(&self.state, "grpc_originate")
+                .await
+                .originate_route(route);
         }
         Ok(Response::new(OriginateRouteResponse {}))
     }
@@ -1137,7 +1141,7 @@ impl OriginationService for OriginationServiceImpl {
             }
         }
         tracing::info!(count, "OriginateRoutes (batch)");
-        let mut state = self.state.write().await;
+        let mut state = crate::lock_timing::write_timed(&self.state, "grpc_originate_batch").await;
         if !v4.is_empty() {
             state.originate_routes(v4);
         }
@@ -1153,7 +1157,7 @@ impl OriginationService for OriginationServiceImpl {
     ) -> Result<Response<WithdrawOriginatedRouteResponse>, Status> {
         let prefix = request.into_inner().prefix;
         tracing::info!(%prefix, "WithdrawOriginatedRoute");
-        let mut state = self.state.write().await;
+        let mut state = crate::lock_timing::write_timed(&self.state, "grpc_withdraw").await;
         if is_ipv6_prefix(&prefix) {
             let nlri = parse_nlri_v6(&prefix)?;
             state.withdraw_originated_route_v6(nlri);
@@ -1180,7 +1184,7 @@ impl OriginationService for OriginationServiceImpl {
                 v4.push(parse_nlri(p)?);
             }
         }
-        let mut state = self.state.write().await;
+        let mut state = crate::lock_timing::write_timed(&self.state, "grpc_withdraw_batch").await;
         if !v4.is_empty() {
             state.withdraw_originated_routes(&v4);
         }

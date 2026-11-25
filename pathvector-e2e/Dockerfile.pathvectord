@@ -58,6 +58,7 @@ COPY pathvector/          pathvector/
 COPY pathvectord/         pathvectord/
 COPY pathvector-stress/   pathvector-stress/
 COPY pathvector-mrt/      pathvector-mrt/
+COPY pathvector-loadtest/ pathvector-loadtest/
 COPY pathvector-e2e/                 pathvector-e2e/
 COPY proto/               proto/
 

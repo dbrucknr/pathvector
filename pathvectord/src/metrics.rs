@@ -11,6 +11,16 @@
 //     pathvectord_bgp_originated_routes{afi}                        — self-originated routes present in Loc-RIB
 //     pathvectord_bgp_fib_routes_installed{afi}                     — routes currently installed in the kernel FIB
 //
+//   Histograms (control-plane stall instrumentation — PRODUCTION_READINESS.md PR-1)
+//     pathvectord_state_lock_wait_seconds{kind}                     — time queued for the DaemonState write lock
+//     pathvectord_state_lock_hold_seconds{kind}                     — time the write guard was held; kind names the call site
+//                                                                      (event_batch|rpki_reeval|rpki_install|fib_change|gr_deadline|
+//                                                                       selection_deferral|max_prefix_idle|mrai|grpc_*)
+//     pathvectord_event_loop_batch_events                           — events coalesced under one `event_batch` lock hold
+//     pathvector_session_event_send_blocked_seconds{peer}           — time a session task was parked on a full event channel
+//                                                                      (count = times blocked; absent while never blocked)
+//     pathvector_session_keepalive_lateness_seconds{peer}           — how long past due the keepalive timer was serviced
+//
 //   Counters
 //     pathvectord_bgp_sessions_established_total{peer}
 //     pathvectord_bgp_sessions_terminated_total{peer, reason}       — reason: clean|notification|operator_stop|unclean
@@ -36,8 +46,19 @@
 
 use std::{collections::HashMap, net::IpAddr};
 
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use pathvector_session::transport::TerminationReason;
+
+/// Bucket upper bounds (seconds) for every `*_seconds` histogram.
+const LATENCY_BUCKETS: &[f64] = &[
+    0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// Bucket upper bounds for the event-loop batch-size histogram (events
+/// coalesced under one write-lock hold). The channel into the loop holds 256.
+const BATCH_BUCKETS: &[f64] = &[
+    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
+];
 
 /// Install the Prometheus recorder and start the HTTP scrape listener.
 ///
@@ -55,6 +76,16 @@ use pathvector_session::transport::TerminationReason;
 pub fn install(port: u16) -> Result<(), metrics_exporter_prometheus::BuildError> {
     PrometheusBuilder::new()
         .with_http_listener(([0, 0, 0, 0], port))
+        // Without explicit buckets the exporter renders histograms as
+        // summaries (client-side quantiles), which cannot be aggregated across
+        // peers or scrapes. The PR-1 latency histograms need real buckets so
+        // `histogram_quantile()` works; the range spans 100 µs (an idle lock
+        // hold) to 30 s (far past any BGP hold time).
+        .set_buckets_for_metric(Matcher::Suffix("_seconds".to_string()), LATENCY_BUCKETS)?
+        .set_buckets_for_metric(
+            Matcher::Full("pathvectord_event_loop_batch_events".to_string()),
+            BATCH_BUCKETS,
+        )?
         .install()?;
     tracing::info!(
         port,
