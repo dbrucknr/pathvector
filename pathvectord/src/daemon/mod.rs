@@ -1308,6 +1308,122 @@ where
     )
 }
 
+/// A [`SessionCommand::SetCapabilities`] owed to a session whose teardown has
+/// just been processed.
+///
+/// Built under the state write lock and sent after it is released, so the lock
+/// is never held across the channel send.
+#[must_use = "send the capability refresh once the state lock is released"]
+struct CapabilityRefresh {
+    session: mpsc::Sender<SessionCommand>,
+    capabilities: Vec<Capability>,
+}
+
+impl CapabilityRefresh {
+    async fn send(self) {
+        let _ = self
+            .session
+            .send(SessionCommand::SetCapabilities(self.capabilities))
+            .await;
+    }
+}
+
+/// Handles one [`SessionEvent::Terminated`].
+///
+/// This is the only handler for that event: `run_event_loop` calls it both for
+/// the event that starts a batch and for events coalesced behind it, which used
+/// to be two copies that drifted apart (GH #105, GH #148).
+///
+/// Returns the capability refresh the session needs before its next OPEN, or
+/// `None` if the peer was being removed (or has no command channel).
+fn handle_session_terminated(
+    s: &mut DaemonState,
+    peer_ip: IpAddr,
+    termination_reason: TerminationReason,
+    stop_senders: &Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>,
+) -> Option<CapabilityRefresh> {
+    let is_removed = s.pending_removal.remove(&peer_ip);
+    // Capture identity fields while they are still in the RIB.  on_terminated
+    // clears session-level state (peer_types, hold_times, etc.); remove_peer
+    // clears everything including peer_remote_as.  Both run below.
+    let removal_identity = if is_removed {
+        s.rib
+            .peer_remote_as
+            .get(&peer_ip)
+            .copied()
+            .map(|remote_as| (remote_as, s.rib.local_as))
+    } else {
+        None
+    };
+    // Recorded before `on_terminated` consumes the reason.
+    crate::metrics::on_session_terminated(peer_ip, &termination_reason);
+    // For removal, suppress the intermediate Changed(None) broadcast — the
+    // explicit Removed event below is the authoritative notification.
+    s.on_terminated(peer_ip, termination_reason, !is_removed);
+
+    if is_removed {
+        // Permanent removal: erase all per-peer state so the peer no longer
+        // appears in gRPC responses and remove the stop sender so no further
+        // commands can be sent to this session.
+        s.remove_peer(peer_ip);
+        stop_senders.lock().unwrap().remove(&peer_ip);
+        // Broadcast a Removed event carrying the last-known remote_as and
+        // local_as so watch_peers subscribers can identify the removed peer
+        // without re-reading a snapshot that no longer contains it.
+        if let Some((remote_as, local_as)) = removal_identity {
+            let _ = s.peer_tx.send(proto::PeerEvent {
+                r#type: proto::PeerEventType::Removed as i32,
+                peer: Some(proto::PeerState {
+                    address: peer_ip.to_string(),
+                    remote_as,
+                    local_as,
+                    ..Default::default()
+                }),
+            });
+        }
+        return None;
+    }
+
+    // RFC 4724 §4.2: when re-establishing a session, the Restart State (R) bit
+    // "MUST NOT be set unless the Receiving Speaker has restarted". The session
+    // may still hold the R=1/F=0 set it was spawned with after our restart, so
+    // replace it: this teardown was not a restart of ours, and F=0 would make
+    // the peer delete the routes it retained for us.
+    let gr_time = s
+        .config_capabilities
+        .iter()
+        .find_map(|c| {
+            if let Capability::GracefulRestart { restart_time, .. } = c {
+                Some(*restart_time)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    // RFC 5065 §4: the FourByteAsn capability must carry the same AS number as
+    // `my_as` — the Confederation Identifier for `External` peers, the
+    // Member-AS Number otherwise.  `peer_config_types` survives disconnects
+    // (only cleared on permanent removal), so it reflects this peer's static
+    // classification here.
+    let peer_type = s
+        .peer_config_types
+        .get(&peer_ip)
+        .copied()
+        .unwrap_or(PeerType::External);
+    let public_as = effective_session_as(s.rib.local_as, s.rib.confederation_id, peer_type);
+    let capabilities = build_local_capabilities(
+        public_as,
+        gr_time,
+        false,
+        s.rib.peer_roles.get(&peer_ip).copied(),
+    );
+    let session = stop_senders.lock().unwrap().get(&peer_ip).cloned()?;
+    Some(CapabilityRefresh {
+        session,
+        capabilities,
+    })
+}
+
 pub(crate) async fn run_event_loop(
     mut event_rx: mpsc::Receiver<(IpAddr, SessionEvent)>,
     state: Arc<RwLock<DaemonState>>,
@@ -1376,85 +1492,12 @@ pub(crate) async fn run_event_loop(
                         );
                     }
                     SessionEvent::Terminated(termination_reason) => {
-                        let is_removed = s.pending_removal.remove(&peer_ip);
-                        // Capture identity fields while they are still in the
-                        // RIB.  on_terminated clears session-level state
-                        // (peer_types, hold_times, etc.); remove_peer clears
-                        // everything including peer_remote_as.  Both run below.
-                        let removal_identity = if is_removed {
-                            s.rib.peer_remote_as.get(&peer_ip).copied().map(|remote_as| {
-                                (remote_as, s.rib.local_as)
-                            })
-                        } else {
-                            None
-                        };
-                        // For removal, suppress the intermediate Changed(None)
-                        // broadcast — the explicit Removed event below is the
-                        // authoritative notification.
-                        crate::metrics::on_session_terminated(peer_ip, &termination_reason);
-                        s.on_terminated(peer_ip, termination_reason, !is_removed);
-                        // RFC 4724 §3: refresh the session's capability set so
-                        // the next OPEN reflects the current R-bit state. The
-                        // restart window may have expired since the original OPEN
-                        // was sent; we always push R=0 on reconnect — if we were
-                        // still restarting the first connection would have cleared
-                        // the window, so subsequent reconnects must not set R.
-                        let caps_refresh: Option<(mpsc::Sender<SessionCommand>, Vec<Capability>)> =
-                            if is_removed {
-                                None
-                            } else {
-                                let gr_time = s.config_capabilities.iter().find_map(|c| {
-                                    if let Capability::GracefulRestart { restart_time, .. } = c {
-                                        Some(*restart_time)
-                                    } else {
-                                        None
-                                    }
-                                }).unwrap_or(0);
-                                // RFC 5065 §4: the FourByteAsn capability must carry the
-                                // same AS number as `my_as` — the Confederation Identifier
-                                // for `External` peers, the Member-AS Number otherwise.
-                                // `peer_config_types` survives disconnects (only cleared on
-                                // permanent removal), so it reflects this peer's static
-                                // classification here.
-                                let peer_type = s
-                                    .peer_config_types
-                                    .get(&peer_ip)
-                                    .copied()
-                                    .unwrap_or(PeerType::External);
-                                let public_as =
-                                    effective_session_as(s.rib.local_as, s.rib.confederation_id, peer_type);
-                                let fresh_caps = build_local_capabilities(
-                                    public_as,
-                                    gr_time,
-                                    false,
-                                    s.rib.peer_roles.get(&peer_ip).copied(),
-                                );
-                                stop_senders.lock().unwrap().get(&peer_ip).cloned()
-                                    .map(|tx| (tx, fresh_caps))
-                            };
-                        if is_removed {
-                            // Permanent removal: erase all per-peer state so
-                            // the peer no longer appears in gRPC responses and
-                            // remove the stop sender so no further commands can
-                            // be sent to this session.
-                            s.remove_peer(peer_ip);
-                            stop_senders.lock().unwrap().remove(&peer_ip);
-                            // Broadcast a Removed event carrying the last-known
-                            // remote_as and local_as so watch_peers subscribers
-                            // can identify the removed peer without re-reading a
-                            // snapshot that no longer contains it.
-                            if let Some((remote_as, local_as)) = removal_identity {
-                                let _ = s.peer_tx.send(proto::PeerEvent {
-                                    r#type: proto::PeerEventType::Removed as i32,
-                                    peer: Some(proto::PeerState {
-                                        address: peer_ip.to_string(),
-                                        remote_as,
-                                        local_as,
-                                        ..Default::default()
-                                    }),
-                                });
-                            }
-                        }
+                        let refresh = handle_session_terminated(
+                            &mut s,
+                            peer_ip,
+                            termination_reason,
+                            &stop_senders,
+                        );
                         // This arm skips the end-of-batch gauge refresh below, so
                         // refresh the RIB-size gauges here: the peer's routes have
                         // just been flushed (GH #105).
@@ -1467,8 +1510,8 @@ pub(crate) async fn run_event_loop(
                         // lock while the channel send blocks, then skip the coalescing
                         // loop (no pending_decisions were touched in Terminated path).
                         drop(s);
-                        if let Some((tx, caps)) = caps_refresh {
-                            let _ = tx.send(SessionCommand::SetCapabilities(caps)).await;
+                        if let Some(refresh) = refresh {
+                            refresh.send().await;
                         }
                         continue;
                     }
@@ -1519,6 +1562,9 @@ pub(crate) async fn run_event_loop(
                 // their Stop is sent after the drain loop alongside stalled peers
                 // to avoid dropping and re-acquiring the write lock mid-iteration.
                 let mut idle_hold_rejected: Vec<IpAddr> = Vec::new();
+                // Owed by coalesced `Terminated` events; sent once the write
+                // lock is released, on both ways out of this loop (GH #148).
+                let mut capability_refreshes: Vec<CapabilityRefresh> = Vec::new();
 
                 // PR-1: the drain loop has no cap, so batch size is the main
                 // driver of `event_batch` lock-hold time. Counted here
@@ -1553,33 +1599,12 @@ pub(crate) async fn run_event_loop(
                             crate::metrics::on_session_established(extra_ip);
                         }
                         SessionEvent::Terminated(termination_reason) => {
-                            let is_removed = s.pending_removal.remove(&extra_ip);
-                            let removal_identity = if is_removed {
-                                s.rib.peer_remote_as.get(&extra_ip).copied().map(|remote_as| {
-                                    (remote_as, s.rib.local_as)
-                                })
-                            } else {
-                                None
-                            };
-                            // Recorded before `on_terminated` consumes the reason,
-                            // exactly as in the first-event arm (GH #105).
-                            crate::metrics::on_session_terminated(extra_ip, &termination_reason);
-                            s.on_terminated(extra_ip, termination_reason, !is_removed);
-                            if is_removed {
-                                s.remove_peer(extra_ip);
-                                stop_senders.lock().unwrap().remove(&extra_ip);
-                                if let Some((remote_as, local_as)) = removal_identity {
-                                    let _ = s.peer_tx.send(proto::PeerEvent {
-                                        r#type: proto::PeerEventType::Removed as i32,
-                                        peer: Some(proto::PeerState {
-                                            address: extra_ip.to_string(),
-                                            remote_as,
-                                            local_as,
-                                            ..Default::default()
-                                        }),
-                                    });
-                                }
-                            }
+                            capability_refreshes.extend(handle_session_terminated(
+                                &mut s,
+                                extra_ip,
+                                termination_reason,
+                                &stop_senders,
+                            ));
                         }
                         SessionEvent::RouteUpdate(msg) => {
                             // See the primary RouteUpdate arm above: this only
@@ -1602,6 +1627,9 @@ pub(crate) async fn run_event_loop(
                                 s.flush_pending();
                                 let notify_stalled = s.take_stalled_peers();
                                 drop(s);
+                                for refresh in capability_refreshes {
+                                    refresh.send().await;
+                                }
                                 let tx = stop_senders.lock().unwrap().get(&extra_ip).cloned();
                                 if let Some(tx) = tx {
                                     let _ = tx.send(SessionCommand::Notification(err)).await;
@@ -1630,6 +1658,12 @@ pub(crate) async fn run_event_loop(
                 // outside the write-lock so we don't hold it across async sends.
                 let stalled = s.take_stalled_peers();
                 drop(s);
+
+                // Before any Stop below: a session being stopped still needs
+                // the new set for its next OPEN.
+                for refresh in capability_refreshes {
+                    refresh.send().await;
+                }
 
                 for peer in stalled {
                     tracing::error!(
@@ -16246,6 +16280,8 @@ mod run_with_tests {
     /// Test-side view with access to the stop receiver.
     struct MockPeerWithStop {
         event_tx: mpsc::Sender<SessionEvent>,
+        /// The capability set the session was spawned with.
+        spawn_capabilities: Vec<pathvector_session::message::Capability>,
         stop_rx: mpsc::Receiver<SessionCommand>,
         /// Keep the update receiver alive so `try_send` on the update channel
         /// does not fail with `TrySendError::Closed` when the EOR is sent.
@@ -16258,13 +16294,14 @@ mod run_with_tests {
     ) {
         let peers: Arc<Mutex<Vec<MockPeerWithStop>>> = Arc::new(Mutex::new(vec![]));
         let peers_clone = Arc::clone(&peers);
-        let spawn_fn = move |_cfg: SessionConfig| {
+        let spawn_fn = move |cfg: SessionConfig| {
             let (event_tx, event_rx) = mpsc::channel(8);
             let (update_tx, update_rx) = mpsc::channel(8);
             let (stop_tx, stop_rx) = mpsc::channel(8);
             let started = Arc::new(AtomicBool::new(false));
             peers_clone.lock().unwrap().push(MockPeerWithStop {
                 event_tx,
+                spawn_capabilities: cfg.capabilities,
                 stop_rx,
                 update_rx,
             });
@@ -16445,8 +16482,192 @@ mod run_with_tests {
         assert_eq!(
             restart_flags & 0x08,
             0,
-            "R-bit must always be 0 on reconnect — see the comment at the caps_refresh call site"
+            "R-bit must always be 0 on reconnect — see `handle_session_terminated`"
         );
+    }
+
+    // ── Capability refresh for coalesced teardowns (GH #148) ──────────────────
+
+    const GR_PEER_A: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+    const GR_PEER_B: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
+
+    /// Two peers on a daemon that has itself just restarted, so both sessions
+    /// are spawned with R=1 and F=0 (RFC 4724 §4.1).
+    async fn build_restarting_daemon() -> (
+        Arc<RwLock<DaemonState>>,
+        mpsc::Receiver<(IpAddr, SessionEvent)>,
+        mpsc::Sender<(IpAddr, SessionEvent)>,
+        Arc<Mutex<std::collections::HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
+        MockPeerWithStop,
+        MockPeerWithStop,
+    ) {
+        let (spawn_fn, peers) = make_mock_spawn_capturing_stop();
+        let mut cfg = make_config(&[(GR_PEER_A, 65002), (GR_PEER_B, 65003)]);
+        cfg.daemon.graceful_restart_time = 120;
+        cfg.daemon.restarting = true;
+        let (state, event_rx, event_tx, stop_senders, _, _) = build_daemon(&cfg, spawn_fn).await;
+        // Mocks are pushed in `cfg.peers` order.
+        let mut spawned = std::mem::take(&mut *peers.lock().unwrap()).into_iter();
+        let a = spawned.next().expect("peer A spawned");
+        let b = spawned.next().expect("peer B spawned");
+        (state, event_rx, event_tx, stop_senders, a, b)
+    }
+
+    /// `(R bit set, F bit per advertised family)` of the GR capability.
+    fn restart_bits(
+        caps: &[pathvector_session::message::Capability],
+    ) -> (bool, Vec<(pathvector_types::AfiSafi, bool)>) {
+        caps.iter()
+            .find_map(|c| match c {
+                pathvector_session::message::Capability::GracefulRestart {
+                    restart_flags,
+                    families,
+                    ..
+                } => Some((
+                    restart_flags & 0x08 != 0,
+                    families
+                        .iter()
+                        .map(|f| (f.afi_safi, f.forwarding_preserved))
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .expect("GracefulRestart capability must be present")
+    }
+
+    async fn next_command(rx: &mut mpsc::Receiver<SessionCommand>) -> SessionCommand {
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for a SessionCommand")
+            .expect("command channel closed")
+    }
+
+    /// RFC 4724 §4.2: in re-establishing a session the R bit "MUST NOT be set
+    /// unless the Receiving Speaker has restarted", and the F bit depends on the
+    /// actual forwarding state, which a session drop does not disturb (RFC 8538
+    /// §4: speakers SHOULD set F once re-established; with F clear the peer
+    /// deletes the routes it retained, RFC 4724 §4.2).
+    fn assert_post_session_drop_refresh(cmd: SessionCommand) {
+        use pathvector_types::AfiSafi;
+        let SessionCommand::SetCapabilities(caps) = cmd else {
+            panic!("expected SetCapabilities, got {cmd:?}");
+        };
+        assert_eq!(
+            restart_bits(&caps),
+            (
+                false,
+                vec![(AfiSafi::IPV4_UNICAST, true), (AfiSafi::IPV6_UNICAST, true)]
+            )
+        );
+    }
+
+    fn assert_spawned_as_restarting(peer: &MockPeerWithStop) {
+        let (r_bit, families) = restart_bits(&peer.spawn_capabilities);
+        assert!(r_bit, "precondition: spawned with R=1");
+        assert!(
+            families.iter().all(|&(_, forwarding)| !forwarding),
+            "precondition: spawned with F=0"
+        );
+    }
+
+    /// Everything is queued before the loop starts, so peer B's teardown is
+    /// drained behind peer A's Established rather than starting a batch.
+    async fn queue_coalesced_teardown(event_tx: &mpsc::Sender<(IpAddr, SessionEvent)>) {
+        for event in [
+            (GR_PEER_A, established_info_for_peer(65002)),
+            (GR_PEER_B, established_info_for_peer(65003)),
+            (
+                GR_PEER_B,
+                SessionEvent::Terminated(TerminationReason::Unclean),
+            ),
+        ] {
+            event_tx.send(event).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn coalesced_teardown_refreshes_capabilities() {
+        let (state, event_rx, event_tx, stop_senders, _a, mut b) = build_restarting_daemon().await;
+        assert_spawned_as_restarting(&b);
+        queue_coalesced_teardown(&event_tx).await;
+
+        tokio::spawn(run_event_loop(event_rx, state, stop_senders, None));
+
+        assert_post_session_drop_refresh(next_command(&mut b.stop_rx).await);
+    }
+
+    /// A later coalesced UPDATE that resets its session leaves the drain loop
+    /// early; refreshes already owed must still be sent on that path.
+    #[tokio::test]
+    async fn coalesced_teardown_refreshes_capabilities_when_batch_ends_in_notification() {
+        let (state, event_rx, event_tx, stop_senders, mut a, mut b) =
+            build_restarting_daemon().await;
+        queue_coalesced_teardown(&event_tx).await;
+        // Attributes, a missing ORIGIN and no NLRI: session reset
+        // (RFC 7606 §5.2).
+        event_tx
+            .send((
+                GR_PEER_A,
+                SessionEvent::RouteUpdate(UpdateMessage {
+                    withdrawn: vec![],
+                    attributes: vec![PathAttribute::AsPath(AsPath::from_sequence(vec![
+                        Asn::new(65002),
+                    ]))],
+                    announced: vec![],
+                }),
+            ))
+            .await
+            .unwrap();
+
+        tokio::spawn(run_event_loop(event_rx, state, stop_senders, None));
+
+        assert_post_session_drop_refresh(next_command(&mut b.stop_rx).await);
+        let cmd = next_command(&mut a.stop_rx).await;
+        assert!(
+            matches!(cmd, SessionCommand::Notification(_)),
+            "precondition: the batch must end on the NOTIFICATION path, got {cmd:?}"
+        );
+    }
+
+    /// A session that is slow to take commands must not stall every other user
+    /// of the state lock.
+    #[tokio::test]
+    async fn coalesced_capability_refresh_is_sent_without_the_state_lock() {
+        let (state, event_rx, event_tx, stop_senders, _a, mut b) = build_restarting_daemon().await;
+        let b_commands = stop_senders.lock().unwrap()[&GR_PEER_B].clone();
+        while b_commands.try_send(SessionCommand::Stop).is_ok() {}
+        queue_coalesced_teardown(&event_tx).await;
+
+        tokio::spawn(run_event_loop(
+            event_rx,
+            Arc::clone(&state),
+            stop_senders,
+            None,
+        ));
+
+        // The refresh cannot be delivered until B's channel is drained, yet
+        // the lock must become free once the teardown has been applied.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::task::yield_now().await;
+                if let Ok(s) = state.try_write()
+                    && s.rib.peer_types.contains_key(&GR_PEER_A)
+                    && !s.rib.peer_types.contains_key(&GR_PEER_B)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("state lock still held while the refresh is blocked");
+
+        let cmd = loop {
+            match next_command(&mut b.stop_rx).await {
+                SessionCommand::Stop => {}
+                other => break other,
+            }
+        };
+        assert_post_session_drop_refresh(cmd);
     }
 
     // ── withdraw_stale_bgp_routes ─────────────────────────────────────────────
