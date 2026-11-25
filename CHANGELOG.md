@@ -4,6 +4,73 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-25 (pathvector-rib: one destination, one key — issue #71)
+
+RFC 4271 §4.3 says of the bits that pad a prefix to an octet boundary that "the value of
+[the] trailing bits is irrelevant" (RFC 4760 §5 repeats it for the multiprotocol
+attributes). `Nlri` keeps whatever bits it is built with, and `LocRib`, `AdjRibIn` and
+`AdjRibOut` keyed their hash maps on that raw value while the best-path prefix tree masked
+it. Inserting `10.1.2.3/8` left `longest_match(10.9.8.7)` returning `None` and
+`best_routes()` empty beside `len() == 1`; two spellings of one destination became two
+entries that never competed in best-path selection. The session decoders mask, so wire
+ingestion was not affected, but the management API was: `OriginateRoute` parses the
+operator's prefix unmasked.
+
+- `pathvector-rib`: new crate-private `CanonicalNlri` whose only constructor masks. Every
+  RIB map and `BestTable` is declared in terms of it, so a non-canonical key cannot be
+  stored. It implements neither `Borrow<Nlri>` nor `Deref`, so a map cannot be probed with
+  a raw `Nlri`. Public signatures are unchanged. (`ipnetx` 0.3.0 provides
+  `IpPrefix::masked`, used underneath, but no canonical-prefix type.)
+- `pathvectord`: `originate_routes` / `withdraw_originated_routes` (IPv4 and IPv6) mask at
+  the boundary, so `originated_routes`, route events and UPDATEs carry one spelling.
+  `GetBestRoute` and `ListCandidates` label results with the stored NLRI.
+- Behavior change: `Route::nlri`, iterator keys and `BestPathChange` prefixes are always
+  canonical, whatever was supplied.
+- Docs: `LocRib`'s rustdoc had been attached to the `RibView` trait declared below it; the
+  trait now sits above.
+- Proof: `pathvector-rib/tests/canonical_prefix.rs` — the reported reproductions, host-bit
+  variants at non-octet-aligned lengths (including /0, /31) through every entry point in
+  both families, and properties comparing the hash-keyed and prefix-tree views with an
+  independently masked model after every step of random operation sequences. 16 of its 17
+  tests failed before the fix (the other guards that host routes are *not* merged), as did
+  the three `issue_71_*` daemon tests. `canonical::tests` checks every length of both
+  families.
+- Benchmarks (Apple M2 Max, release, jemalloc; old → new; minimum of five rounds that
+  alternated the two binaries, because other work was loading the machine). The new
+  `prefix_keyed_ops` bench times one pass over all `n` prefixes:
+
+  | IPv4 | 100 | 1 k | 10 k | Takeaway |
+  |---|---|---|---|---|
+  | `LocRib::insert` | 29.9 → 29.9 µs | 300 → 299 µs | 3.16 → 3.14 ms | unchanged |
+  | `LocRib::best` | 2.45 → 2.43 µs | 24.8 → 24.1 µs | 264 → 252 µs | unchanged |
+  | `LocRib::longest_match` | 3.04 → 3.00 µs | 30.4 → 29.5 µs | 314 → 313 µs | unchanged |
+  | `LocRib::withdraw` | 28.4 → 28.4 µs | 299 → 300 µs | 3.21 → 3.25 ms | unchanged |
+  | `AdjRibIn` insert + get + withdraw | 2.90 → 3.13 µs | 32.1 → 34.4 µs | 374 → 396 µs | +6–8 %, about 2 ns per prefix for three canonicalizations |
+  | `AdjRibOut` insert + get + withdraw | 3.66 → 5.86 µs | 41.8 → 60.6 µs | 467 → 450 µs | see below |
+
+  | IPv6 | 100 | 1 k | 10 k | Takeaway |
+  |---|---|---|---|---|
+  | `LocRib::insert` | 38.8 → 38.0 µs | 391 → 387 µs | 3.97 → 4.00 ms | unchanged |
+  | `LocRib::best` | 5.54 → 5.53 µs | 59.2 → 59.3 µs | 568 → 560 µs | unchanged |
+  | `LocRib::longest_match` | 6.74 → 6.63 µs | 70.3 → 69.9 µs | 710 → 700 µs | unchanged (was +10–19 % until tree reads stopped re-masking) |
+  | `LocRib::withdraw` | 37.8 → 37.4 µs | 372 → 374 µs | 3.92 → 3.85 ms | unchanged |
+  | `AdjRibIn` insert + get + withdraw | 3.52 → 3.66 µs | 37.8 → 40.5 µs | 464 → 470 µs | +1–7 % |
+  | `AdjRibOut` insert + get + withdraw | 4.20 → 4.22 µs | 45.6 → 48.5 µs | 517 → 546 µs | 0–6 % |
+
+  Existing benches: `loc_rib_insert_steady` (best-path hot path) `hot` 534 → 511 ns,
+  538 → 505 ns, 538 → 508 ns and `scattered` 600 → 599 ns, 1.20 → 1.07 µs, 1.36 → 1.42 µs at
+  10 k / 100 k / 500 k; `outbound_pipeline` (which calls `AdjRibOut::insert`) 1–4 % faster at
+  1 / 10 / 50 peers; `peer_win_count/scan` (the pre-#106 scan, no longer a daemon path)
+  4–11 % slower, because `best_peer` now canonicalizes its argument.
+
+  The `AdjRibOut` IPv4 figures at 100 and 1 k are an unresolved microbenchmark effect. The
+  old binary is bimodal from run to run (1 k: 42–58 µs) and the new one sits near 60 µs. A
+  throwaway build with the masking removed from `CanonicalNlri::new` also measured ~59.5 µs,
+  so the mask arithmetic is not the cause; it appears to be code generation or layout. It is
+  absent at 10 k, for IPv6, and in `outbound_pipeline`.
+
+---
+
 ## 2026-11-24 (pathvectord: list_peers / get_peer no longer scan the Loc-RIB — issue #106)
 
 `build_peer_state` counted `prefixes_accepted` by walking every best route once per
