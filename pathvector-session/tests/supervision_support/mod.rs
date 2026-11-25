@@ -54,7 +54,7 @@ pub struct MockWriter {
 
 /// The remote end of a [`MockTransport`].
 pub struct MockPeer {
-    inbound: mpsc::UnboundedSender<Result<BgpMessage, FramingError>>,
+    inbound: Option<mpsc::UnboundedSender<Result<BgpMessage, FramingError>>>,
     sent: mpsc::UnboundedReceiver<Sent>,
     consumed: Arc<AtomicUsize>,
     writable: watch::Sender<bool>,
@@ -91,7 +91,7 @@ pub fn mock() -> (MockTransport, MockPeer) {
             },
         },
         MockPeer {
-            inbound: in_tx,
+            inbound: Some(in_tx),
             sent: sent_rx,
             consumed,
             writable: writable_tx,
@@ -156,7 +156,14 @@ impl BgpWriter for MockWriter {
 
 impl MockPeer {
     pub fn push(&self, msg: BgpMessage) {
-        let _ = self.inbound.send(Ok(msg));
+        if let Some(inbound) = &self.inbound {
+            let _ = inbound.send(Ok(msg));
+        }
+    }
+
+    /// Close the connection after everything already pushed.
+    pub fn close(&mut self) {
+        self.inbound = None;
     }
 
     /// Inbound messages the session has read so far.

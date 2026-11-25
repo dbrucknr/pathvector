@@ -416,6 +416,35 @@ async fn permanent_consumer_stall_ends_in_a_bounded_overload_reset() {
     assert!(events < 300, "{events} events were buffered");
 }
 
+/// A connection that closes while the backlog is full is a TCP failure
+/// (`Unclean`, so Graceful Restart can apply), not a local overload reset.
+#[tokio::test(start_paused = true)]
+async fn close_behind_a_full_backlog_is_reported_as_a_tcp_failure() {
+    let (mut handle, mut peer) = established(config(9)).await;
+    peer.clear_sent();
+    // Exactly fills the 64-entry channel and the 64-entry backlog.
+    for n in 0..128 {
+        peer.push(update_msg(n));
+    }
+    peer.close();
+    for _ in 0..1_000 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle_briefly().await;
+    }
+    assert!(!peer.connection_open());
+
+    for n in 0..128 {
+        assert!(
+            matches!(next_event(&mut handle).await, SessionEvent::RouteUpdate(u) if u == update(n))
+        );
+    }
+    let event = next_event(&mut handle).await;
+    assert!(
+        matches!(event, SessionEvent::Terminated(TerminationReason::Unclean)),
+        "{event:?}"
+    );
+}
+
 async fn settle_briefly() {
     for _ in 0..20 {
         tokio::task::yield_now().await;
