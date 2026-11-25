@@ -287,7 +287,7 @@ mod tests {
 
     /// RFC 7606 §2: treat-as-withdraw handles the routes the UPDATE
     /// *contains* as withdrawn. Routes it already withdraws through
-    /// MP_UNREACH_NLRI stay withdrawn: losing them would leave the peer's
+    /// `MP_UNREACH_NLRI` stay withdrawn: losing them would leave the peer's
     /// older route installed for ever.
     #[test]
     fn test_make_treat_as_withdraw_keeps_explicit_mp_unreach() {

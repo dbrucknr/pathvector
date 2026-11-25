@@ -5,6 +5,7 @@ use pathvector_types::{
     LargeCommunity, NextHop, Nlri, Origin, Safi,
 };
 
+use super::as_rules::apply_receive_rules;
 use super::asn_width::AsnWidth;
 use super::error::CodecError;
 use super::header::{MessageType, encode_header};
@@ -470,6 +471,7 @@ fn decode_path_attributes(
         }
     }
 
+    apply_receive_rules(&mut attrs, &mut errors);
     reconcile_as4_attributes(&mut attrs, &mut errors, asn_width);
 
     Ok((attrs, errors))
