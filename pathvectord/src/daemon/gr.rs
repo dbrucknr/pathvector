@@ -183,20 +183,15 @@ impl DaemonState {
                 .get(&other_ip)
                 .copied()
                 .unwrap_or(PeerType::External);
-            let max_len = self
-                .negotiated_max_len
-                .get(&other_ip)
-                .copied()
-                .unwrap_or(MAX_LEN);
             let Some(export_policy) = self.export_policies.get(&other_ip) else {
                 continue;
             };
             let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&other_ip) else {
                 continue;
             };
-            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+            if !self.update_senders.contains_key(&other_ip) {
                 continue;
-            };
+            }
             let local_next_hop = self
                 .rib
                 .local_addrs
@@ -207,7 +202,6 @@ impl DaemonState {
                 })
                 .unwrap_or(local_bgp_id);
             let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
-            let other_four_byte = self.four_byte_peers.contains(&other_ip);
             let decisions: Vec<PrefixDecision> = affected
                 .iter()
                 .map(|&nlri| {
@@ -215,6 +209,7 @@ impl DaemonState {
                         nlri,
                         &self.rib.loc_rib,
                         adj_rib_out,
+                        &self.rib.rr_clients,
                         export_policy,
                         other_type,
                         local_as,
@@ -225,16 +220,7 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates(
-                other_ip,
-                decisions,
-                max_len,
-                update_tx,
-                other_type,
-                other_four_byte,
-            ) {
-                self.stalled_peers.push(other_ip);
-            }
+            self.send_decisions(other_ip, decisions);
             self.sync_advertised(other_ip);
         }
     }
@@ -266,22 +252,16 @@ impl DaemonState {
                 .get(&other_ip)
                 .copied()
                 .unwrap_or(PeerType::External);
-            let max_len = self
-                .negotiated_max_len
-                .get(&other_ip)
-                .copied()
-                .unwrap_or(MAX_LEN);
             let Some(export_policy_v6) = self.export_policies_v6.get(&other_ip) else {
                 continue;
             };
             let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&other_ip) else {
                 continue;
             };
-            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+            if !self.update_senders.contains_key(&other_ip) {
                 continue;
-            };
+            }
             let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
-            let other_four_byte = self.four_byte_peers.contains(&other_ip);
             let decisions_v6: Vec<PrefixDecisionV6> = affected
                 .iter()
                 .map(|&nlri| {
@@ -289,6 +269,7 @@ impl DaemonState {
                         nlri,
                         &self.rib.loc_rib_v6,
                         adj_rib_out_v6,
+                        &self.rib.rr_clients,
                         export_policy_v6,
                         other_type,
                         local_as,
@@ -299,16 +280,7 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates_v6(
-                other_ip,
-                decisions_v6,
-                max_len,
-                update_tx,
-                other_type,
-                other_four_byte,
-            ) {
-                self.stalled_peers.push(other_ip);
-            }
+            self.send_decisions_v6(other_ip, decisions_v6);
             self.sync_advertised(other_ip);
         }
     }
@@ -358,20 +330,15 @@ impl DaemonState {
                 .get(&other_ip)
                 .copied()
                 .unwrap_or(PeerType::External);
-            let max_len = self
-                .negotiated_max_len
-                .get(&other_ip)
-                .copied()
-                .unwrap_or(MAX_LEN);
             let Some(export_policy) = self.export_policies.get(&other_ip) else {
                 continue;
             };
             let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&other_ip) else {
                 continue;
             };
-            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+            if !self.update_senders.contains_key(&other_ip) {
                 continue;
-            };
+            }
             let local_next_hop = self
                 .rib
                 .local_addrs
@@ -382,7 +349,6 @@ impl DaemonState {
                 })
                 .unwrap_or(local_bgp_id);
             let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
-            let other_four_byte = self.four_byte_peers.contains(&other_ip);
             let decisions: Vec<PrefixDecision> = stale
                 .iter()
                 .map(|&nlri| {
@@ -390,6 +356,7 @@ impl DaemonState {
                         nlri,
                         &self.rib.loc_rib,
                         adj_rib_out,
+                        &self.rib.rr_clients,
                         export_policy,
                         other_type,
                         local_as,
@@ -400,16 +367,7 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates(
-                other_ip,
-                decisions,
-                max_len,
-                update_tx,
-                other_type,
-                other_four_byte,
-            ) {
-                self.stalled_peers.push(other_ip);
-            }
+            self.send_decisions(other_ip, decisions);
             self.sync_advertised(other_ip);
         }
         self.emit_route_events(&prev_prefixes);
@@ -450,11 +408,6 @@ impl DaemonState {
                 .get(&other_ip)
                 .copied()
                 .unwrap_or(PeerType::External);
-            let max_len = self
-                .negotiated_max_len
-                .get(&other_ip)
-                .copied()
-                .unwrap_or(MAX_LEN);
             if !self.ipv6_capable_peers.contains(&other_ip) {
                 continue;
             }
@@ -464,11 +417,10 @@ impl DaemonState {
             let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&other_ip) else {
                 continue;
             };
-            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+            if !self.update_senders.contains_key(&other_ip) {
                 continue;
-            };
+            }
             let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
-            let other_four_byte = self.four_byte_peers.contains(&other_ip);
             let decisions_v6: Vec<PrefixDecisionV6> = stale
                 .iter()
                 .map(|&nlri| {
@@ -476,6 +428,7 @@ impl DaemonState {
                         nlri,
                         &self.rib.loc_rib_v6,
                         adj_rib_out_v6,
+                        &self.rib.rr_clients,
                         export_policy_v6,
                         other_type,
                         local_as,
@@ -486,16 +439,7 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates_v6(
-                other_ip,
-                decisions_v6,
-                max_len,
-                update_tx,
-                other_type,
-                other_four_byte,
-            ) {
-                self.stalled_peers.push(other_ip);
-            }
+            self.send_decisions_v6(other_ip, decisions_v6);
             self.sync_advertised(other_ip);
         }
     }
@@ -571,20 +515,15 @@ impl DaemonState {
                 .get(&other_ip)
                 .copied()
                 .unwrap_or(PeerType::External);
-            let max_len = self
-                .negotiated_max_len
-                .get(&other_ip)
-                .copied()
-                .unwrap_or(MAX_LEN);
             let Some(export_policy) = self.export_policies.get(&other_ip) else {
                 continue;
             };
             let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&other_ip) else {
                 continue;
             };
-            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+            if !self.update_senders.contains_key(&other_ip) {
                 continue;
-            };
+            }
             let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
             let local_next_hop = self
                 .rib
@@ -595,7 +534,6 @@ impl DaemonState {
                     IpAddr::V6(_) => None,
                 })
                 .unwrap_or(local_bgp_id);
-            let other_four_byte = self.four_byte_peers.contains(&other_ip);
             let decisions: Vec<PrefixDecision> = prev_prefixes
                 .iter()
                 .map(|&nlri| {
@@ -603,6 +541,7 @@ impl DaemonState {
                         nlri,
                         &self.rib.loc_rib,
                         adj_rib_out,
+                        &self.rib.rr_clients,
                         export_policy,
                         other_type,
                         local_as,
@@ -613,16 +552,7 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates(
-                other_ip,
-                decisions,
-                max_len,
-                update_tx,
-                other_type,
-                other_four_byte,
-            ) {
-                self.stalled_peers.push(other_ip);
-            }
+            self.send_decisions(other_ip, decisions);
             self.sync_advertised(other_ip);
         }
 
@@ -650,22 +580,16 @@ impl DaemonState {
                 .get(&other_ip)
                 .copied()
                 .unwrap_or(PeerType::External);
-            let max_len = self
-                .negotiated_max_len
-                .get(&other_ip)
-                .copied()
-                .unwrap_or(MAX_LEN);
             let Some(export_policy_v6) = self.export_policies_v6.get(&other_ip) else {
                 continue;
             };
             let Some(adj_rib_out_v6) = self.adj_ribs_out_v6.get_mut(&other_ip) else {
                 continue;
             };
-            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+            if !self.update_senders.contains_key(&other_ip) {
                 continue;
-            };
+            }
             let other_next_hop_self = self.rib.next_hop_self_peers.contains(&other_ip);
-            let other_four_byte = self.four_byte_peers.contains(&other_ip);
             let decisions_v6: Vec<PrefixDecisionV6> = prev_prefixes_v6
                 .iter()
                 .map(|&nlri| {
@@ -673,6 +597,7 @@ impl DaemonState {
                         nlri,
                         &self.rib.loc_rib_v6,
                         adj_rib_out_v6,
+                        &self.rib.rr_clients,
                         export_policy_v6,
                         other_type,
                         local_as,
@@ -683,16 +608,7 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            if !flush_updates_v6(
-                other_ip,
-                decisions_v6,
-                max_len,
-                update_tx,
-                other_type,
-                other_four_byte,
-            ) {
-                self.stalled_peers.push(other_ip);
-            }
+            self.send_decisions_v6(other_ip, decisions_v6);
             self.sync_advertised(other_ip);
         }
 

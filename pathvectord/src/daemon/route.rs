@@ -385,7 +385,7 @@ impl DaemonState {
         self.sync_received(peer_ip);
 
         // Propagate best-path changes for affected prefixes to all established
-        // peers (iBGP split-horizon is enforced by AdjRibOut).
+        // peers (`propagate_prefix` applies the split-horizon rules).
         self.propagate_to_all_peers(&affected);
         if !affected_v6.is_empty() {
             self.propagate_to_all_peers_v6(&affected_v6);
@@ -413,7 +413,6 @@ impl DaemonState {
         let local_as = self.rib.local_as;
         let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_bgp_id = self.rib.local_bgp_id;
-        let is_rr = !self.rib.rr_clients.is_empty();
         // RFC 4724 §4.1: while the IPv4 selection-deferral gate is closed,
         // incremental propagation is suppressed the same way the initial
         // dump is — nothing is written to AdjRibOut until the gate opens.
@@ -443,9 +442,7 @@ impl DaemonState {
                 continue;
             };
             let rr_clients = &self.rib.rr_clients;
-            let peer_types = &self.rib.peer_types;
             let loc_rib = &self.rib.loc_rib;
-            let dest_is_client = rr_clients.contains(&peer_ip);
             let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
             // RFC 4271 §9.2.1.1: MRAI is applied to eBGP peers only (option
             // (b) of the iBGP SHOULD), per destination. The gate wraps the
@@ -456,28 +453,12 @@ impl DaemonState {
             let decisions: Vec<PrefixDecision> = nlris
                 .iter()
                 .map(|&nlri| {
-                    // RR split-horizon (RFC 4456 §8): when acting as an RR,
-                    // block propagation between two non-client iBGP peers.
-                    // All other source/dest combinations are allowed; the
-                    // AdjRibOut `reflects` flag suppresses the regular iBGP
-                    // split-horizon so it does not re-block reflected routes.
-                    if is_rr
-                        && peer_type == PeerType::Internal
-                        && let Some(src) = loc_rib.best_peer(&nlri)
-                        && let IpAddr::V4(src_ip) = src.ip()
-                    {
-                        let src_is_client = rr_clients.contains(&IpAddr::V4(src_ip));
-                        let src_is_ibgp = peer_types.get(&IpAddr::V4(src_ip)).copied()
-                            == Some(PeerType::Internal);
-                        if src_is_ibgp && !src_is_client && !dest_is_client {
-                            return PrefixDecision::NoChange;
-                        }
-                    }
                     let propagate = |adj: &mut AdjRibOut<Ipv4Addr>| {
                         propagate_prefix(
                             nlri,
                             loc_rib,
                             adj,
+                            rr_clients,
                             export_policy,
                             peer_type,
                             local_as,
@@ -579,7 +560,6 @@ impl DaemonState {
             .copied()
             .filter(|ip| self.ipv6_capable_peers.contains(ip))
             .collect();
-        let is_rr = !self.rib.rr_clients.is_empty();
         let local_as = self.rib.local_as;
         let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_ipv6 = self.rib.local_ipv6;
@@ -600,9 +580,7 @@ impl DaemonState {
                 continue;
             };
             let rr_clients = &self.rib.rr_clients;
-            let peer_types = &self.rib.peer_types;
             let loc_rib_v6 = &self.rib.loc_rib_v6;
-            let dest_is_client = rr_clients.contains(&peer_ip);
             let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
             // RFC 4271 §9.2.1.1 is per destination, not per address family,
             // and RFC 4760 does not exempt MP_REACH_NLRI: same eBGP gate as
@@ -612,25 +590,12 @@ impl DaemonState {
             let decisions: Vec<PrefixDecisionV6> = nlris
                 .iter()
                 .map(|&nlri| {
-                    // RFC 4456 §8 split-horizon: block non-client iBGP →
-                    // non-client iBGP for IPv6 routes (same rule as IPv4).
-                    if is_rr
-                        && peer_type == PeerType::Internal
-                        && let Some(src) = loc_rib_v6.best_peer(&nlri)
-                        && let IpAddr::V4(src_ip) = src.ip()
-                    {
-                        let src_is_client = rr_clients.contains(&IpAddr::V4(src_ip));
-                        let src_is_ibgp = peer_types.get(&IpAddr::V4(src_ip)).copied()
-                            == Some(PeerType::Internal);
-                        if src_is_ibgp && !src_is_client && !dest_is_client {
-                            return PrefixDecisionV6::NoChange;
-                        }
-                    }
                     let propagate = |adj: &mut AdjRibOut<Ipv6Addr>| {
                         propagate_prefix_v6(
                             nlri,
                             loc_rib_v6,
                             adj,
+                            rr_clients,
                             export_policy_v6,
                             peer_type,
                             local_as,
@@ -686,58 +651,101 @@ impl DaemonState {
             .collect();
 
         for peer_ip in peers {
-            let decisions = self.pending_decisions.remove(&peer_ip).unwrap_or_default();
-            let decisions_v6 = self
-                .pending_decisions_v6
-                .remove(&peer_ip)
-                .unwrap_or_default();
+            self.flush_peer(peer_ip);
+        }
+    }
 
-            if decisions.is_empty() && decisions_v6.is_empty() {
-                continue;
-            }
+    /// Sends IPv4 `decisions` to `peer_ip` now, after (and together with)
+    /// anything already buffered for that peer. For callers that cannot wait
+    /// for [`flush_pending`](Self::flush_pending). Returns `false` if the peer
+    /// stalled.
+    pub(super) fn send_decisions(
+        &mut self,
+        peer_ip: IpAddr,
+        decisions: Vec<PrefixDecision>,
+    ) -> bool {
+        buffer_decisions(&mut self.pending_decisions, peer_ip, decisions);
+        self.flush_peer(peer_ip)
+    }
 
-            let Some(update_tx) = self.update_senders.get(&peer_ip) else {
-                continue;
-            };
-            let peer_type = self
-                .rib
-                .peer_types
-                .get(&peer_ip)
-                .copied()
-                .unwrap_or(PeerType::External);
-            let max_len = self
-                .negotiated_max_len
-                .get(&peer_ip)
-                .copied()
-                .unwrap_or(MAX_LEN);
-            let peer_four_byte = self.four_byte_peers.contains(&peer_ip);
+    /// IPv6 counterpart of [`send_decisions`](Self::send_decisions).
+    pub(super) fn send_decisions_v6(
+        &mut self,
+        peer_ip: IpAddr,
+        decisions: Vec<PrefixDecisionV6>,
+    ) -> bool {
+        buffer_decisions(&mut self.pending_decisions_v6, peer_ip, decisions);
+        self.flush_peer(peer_ip)
+    }
 
-            if !decisions.is_empty()
-                && !flush_updates(
-                    peer_ip,
-                    decisions,
-                    max_len,
-                    update_tx,
-                    peer_type,
-                    peer_four_byte,
-                )
-            {
-                self.stalled_peers.push(peer_ip);
-                continue;
-            }
-            if !decisions_v6.is_empty()
-                && !flush_updates_v6(
+    /// Drains `peer_ip`'s coalescing buffers onto the wire.
+    ///
+    /// The only caller of `flush_updates` / `flush_updates_v6`: a decision
+    /// sent around the buffer would reach the peer before older ones still in
+    /// it, and those would then undo it.
+    ///
+    /// Returns `false` if the peer's channel overflowed; it is then also
+    /// recorded in `stalled_peers`.
+    fn flush_peer(&mut self, peer_ip: IpAddr) -> bool {
+        let decisions = self.pending_decisions.remove(&peer_ip).unwrap_or_default();
+        let decisions_v6 = self
+            .pending_decisions_v6
+            .remove(&peer_ip)
+            .unwrap_or_default();
+
+        if decisions.is_empty() && decisions_v6.is_empty() {
+            return true;
+        }
+
+        let Some(update_tx) = self.update_senders.get(&peer_ip) else {
+            return true;
+        };
+        let peer_type = self
+            .rib
+            .peer_types
+            .get(&peer_ip)
+            .copied()
+            .unwrap_or(PeerType::External);
+        let max_len = self
+            .negotiated_max_len
+            .get(&peer_ip)
+            .copied()
+            .unwrap_or(MAX_LEN);
+        let peer_four_byte = self.four_byte_peers.contains(&peer_ip);
+
+        let sent = (decisions.is_empty()
+            || flush_updates(
+                peer_ip,
+                decisions,
+                max_len,
+                update_tx,
+                peer_type,
+                peer_four_byte,
+            ))
+            && (decisions_v6.is_empty()
+                || flush_updates_v6(
                     peer_ip,
                     decisions_v6,
                     max_len,
                     update_tx,
                     peer_type,
                     peer_four_byte,
-                )
-            {
-                self.stalled_peers.push(peer_ip);
-            }
+                ));
+        if !sent {
+            self.stalled_peers.push(peer_ip);
         }
+        sent
+    }
+}
+
+/// Appends `decisions` to `peer_ip`'s buffer, taking over the allocation when
+/// the buffer is empty (a full-table dump is large).
+fn buffer_decisions<D>(buffers: &mut HashMap<IpAddr, Vec<D>>, peer_ip: IpAddr, decisions: Vec<D>) {
+    let buffer = buffers.entry(peer_ip).or_default();
+    if buffer.is_empty() {
+        *buffer = decisions;
+    } else {
+        buffer.extend(decisions);
     }
 }
 
