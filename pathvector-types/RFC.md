@@ -45,6 +45,36 @@ field live in `pathvector-session`.
 | `Asn` stored as 32-bit value | `src/asn.rs` | ✅ | `test_asn_new_and_value`, `test_asn_is_four_byte` |
 | `AS_TRANS` (23456) is a named constant | `src/asn.rs` | ✅ | `test_asn_is_trans` |
 | §4.2.3: `AsPath::reconstruct_with_as4_path` — N<M ignores `AS4_PATH`; otherwise take N−M leading ASNs (sets count 1, confed 0), split a straddling sequence, keep leading/adjacent confed segments, ignore confed in `AS4_PATH` | `src/aspath.rs` | ✅ | `reconstruct_*`, `has_non_mappable_asn_inspects_every_segment_type` |
+| §§3, 4.2.2: the `AS4_PATH` to send excludes confederation segments and exists only when a non-mappable ASN remains — enforced by `As4Path`'s only constructor, used by `downgrade_for_two_byte_peer` (issue #109: the helper returned a copy of the whole path) | `src/aspath.rs` | ✅ | `as4_path_excludes_confed_segments_but_as_path_keeps_them`, `as4_path_excludes_confed_set`, `confed_only_path_has_no_as4_path`, `non_mappable_asn_only_in_confed_segment_has_no_as4_path`, `prop_downgrade_for_two_byte_peer` |
+
+---
+
+## RFC 7607 — Codification of AS 0 Processing
+
+**Owns:** The vocabulary: `Asn::ZERO` (a representable value, which ROAs need)
+and `SpeakerAsn`, the non-zero AS number a BGP speaker may claim or accept.  
+**Boundary:** Enforcement lives in `pathvector-session` (receive) and
+`pathvectord` (configuration, send). `Asn` and `AsPath` accept 0 on purpose.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc7607
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| AS 0 cannot become a speaker identity | `src/asn.rs` `SpeakerAsn` | ✅ | `speaker_asn_excludes_only_zero` |
+
+---
+
+## RFC 9774 — Deprecation of AS_SET and AS_CONFED_SET
+
+**Owns:** Recognising set segments: `AsPathSegment::is_set`,
+`AsPath::contains_as_set`.  
+**Boundary:** `Set` and `ConfedSet` remain representable so historical data and
+offending messages can be decoded and inspected. The rule is enforced by
+`pathvector-session` (receive) and `pathvectord` (receive gate, send).  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc9774
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| Either set type is recognised wherever it sits in a path | `src/aspath.rs` | ✅ | doctest on `contains_as_set`, and the enforcement tests in the other two crates |
 
 ---
 

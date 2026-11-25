@@ -9,7 +9,9 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::error::PduError;
+use ipnetx::interfaces::IpAddress;
+
+use crate::{error::PduError, vrp::Vrp};
 
 // ── Codec primitives (private, mirrors pathvector-session's Cursor/Writer) ────
 
@@ -235,17 +237,11 @@ pub enum Pdu {
     },
     Ipv4Prefix {
         flags: PrefixFlags,
-        prefix_len: u8,
-        max_len: u8,
-        prefix: Ipv4Addr,
-        asn: u32,
+        vrp: Vrp<Ipv4Addr>,
     },
     Ipv6Prefix {
         flags: PrefixFlags,
-        prefix_len: u8,
-        max_len: u8,
-        prefix: Ipv6Addr,
-        asn: u32,
+        vrp: Vrp<Ipv6Addr>,
     },
     EndOfData {
         session_id: u16,
@@ -261,6 +257,46 @@ pub enum Pdu {
         text: String,
     },
     RouterKey,
+}
+
+/// Announcement PDUs from plain tuples, for the test fixtures.
+#[cfg(any(test, feature = "test-util"))]
+impl Pdu {
+    /// # Panics
+    ///
+    /// If the lengths cannot form a VRP (see [`Vrp::new`]).
+    pub(crate) fn announce_v4(prefix: Ipv4Addr, prefix_len: u8, max_len: u8, asn: u32) -> Self {
+        Self::Ipv4Prefix {
+            flags: PrefixFlags { announce: true },
+            vrp: Vrp::new(prefix, prefix_len, max_len, asn).expect("invalid test VRP"),
+        }
+    }
+
+    /// IPv6 counterpart of [`Pdu::announce_v4`].
+    ///
+    /// # Panics
+    ///
+    /// If the lengths cannot form a VRP.
+    pub(crate) fn announce_v6(prefix: Ipv6Addr, prefix_len: u8, max_len: u8, asn: u32) -> Self {
+        Self::Ipv6Prefix {
+            flags: PrefixFlags { announce: true },
+            vrp: Vrp::new(prefix, prefix_len, max_len, asn).expect("invalid test VRP"),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Pdu {
+    /// The withdrawal of the record this announcement PDU carries.
+    pub(crate) fn withdrawn(mut self) -> Self {
+        match &mut self {
+            Self::Ipv4Prefix { flags, .. } | Self::Ipv6Prefix { flags, .. } => {
+                flags.announce = false;
+            }
+            other => panic!("not a prefix PDU: {other:?}"),
+        }
+        self
+    }
 }
 
 /// RFC 8210 §5.9 refresh/retry/expire intervals, present on `EndOfData` only
@@ -331,39 +367,13 @@ pub(crate) fn encode(version: RtrVersion, pdu: &Pdu) -> Vec<u8> {
                 LEN_CACHE_RESPONSE,
             );
         }
-        Pdu::Ipv4Prefix {
-            flags,
-            prefix_len,
-            max_len,
-            prefix,
-            asn,
-        } => {
+        Pdu::Ipv4Prefix { flags, vrp } => {
             write_header(&mut w, version, PduType::Ipv4Prefix, 0, LEN_IPV4_PREFIX);
-            encode_prefix_body(
-                &mut w,
-                *flags,
-                *prefix_len,
-                *max_len,
-                &prefix.octets(),
-                *asn,
-            );
+            encode_prefix_body(&mut w, *flags, vrp, &vrp.prefix().ip().octets());
         }
-        Pdu::Ipv6Prefix {
-            flags,
-            prefix_len,
-            max_len,
-            prefix,
-            asn,
-        } => {
+        Pdu::Ipv6Prefix { flags, vrp } => {
             write_header(&mut w, version, PduType::Ipv6Prefix, 0, LEN_IPV6_PREFIX);
-            encode_prefix_body(
-                &mut w,
-                *flags,
-                *prefix_len,
-                *max_len,
-                &prefix.octets(),
-                *asn,
-            );
+            encode_prefix_body(&mut w, *flags, vrp, &vrp.prefix().ip().octets());
         }
         Pdu::EndOfData {
             session_id,
@@ -399,20 +409,18 @@ pub(crate) fn encode(version: RtrVersion, pdu: &Pdu) -> Vec<u8> {
     w.finish()
 }
 
-fn encode_prefix_body(
+fn encode_prefix_body<A: IpAddress>(
     w: &mut Writer,
     flags: PrefixFlags,
-    prefix_len: u8,
-    max_len: u8,
-    prefix_octets: &[u8],
-    asn: u32,
+    vrp: &Vrp<A>,
+    address_octets: &[u8],
 ) {
     w.put_u8(flags.as_byte());
-    w.put_u8(prefix_len);
-    w.put_u8(max_len);
+    w.put_u8(vrp.prefix().mask());
+    w.put_u8(vrp.max_len());
     w.put_u8(0); // reserved
-    w.put_slice(prefix_octets);
-    w.put_u32(asn);
+    w.put_slice(address_octets);
+    w.put_u32(vrp.asn());
 }
 
 /// # Panics
@@ -479,7 +487,7 @@ pub(crate) fn decode_header(buf: &[u8]) -> Result<(RtrVersion, PduType, u16, u32
 /// (which must contain exactly `len` bytes total — header included; the
 /// caller is responsible for buffering `len` bytes off the wire before
 /// calling this, since PDUs are self-describing but not framed by a
-/// delimiter).
+/// delimiter — see `frame.rs`).
 pub(crate) fn decode_payload(
     version: RtrVersion,
     pdu_type: PduType,
@@ -546,15 +554,10 @@ fn decode_ipv4_prefix_body(cur: &mut Cursor<'_>) -> Result<Pdu, PduError> {
     let prefix_len = cur.read_u8()?;
     let max_len = cur.read_u8()?;
     cur.read_u8()?; // reserved
-    let prefix = cur.read_ipv4addr()?;
+    let address = cur.read_ipv4addr()?;
     let asn = cur.read_u32()?;
-    Ok(Pdu::Ipv4Prefix {
-        flags,
-        prefix_len,
-        max_len,
-        prefix,
-        asn,
-    })
+    let vrp = Vrp::new(address, prefix_len, max_len, asn).map_err(PduError::InvalidPrefix)?;
+    Ok(Pdu::Ipv4Prefix { flags, vrp })
 }
 
 fn decode_ipv6_prefix_body(cur: &mut Cursor<'_>) -> Result<Pdu, PduError> {
@@ -562,15 +565,10 @@ fn decode_ipv6_prefix_body(cur: &mut Cursor<'_>) -> Result<Pdu, PduError> {
     let prefix_len = cur.read_u8()?;
     let max_len = cur.read_u8()?;
     cur.read_u8()?; // reserved
-    let prefix = cur.read_ipv6addr()?;
+    let address = cur.read_ipv6addr()?;
     let asn = cur.read_u32()?;
-    Ok(Pdu::Ipv6Prefix {
-        flags,
-        prefix_len,
-        max_len,
-        prefix,
-        asn,
-    })
+    let vrp = Vrp::new(address, prefix_len, max_len, asn).map_err(PduError::InvalidPrefix)?;
+    Ok(Pdu::Ipv6Prefix { flags, vrp })
 }
 
 fn decode_end_of_data_body(
@@ -652,30 +650,6 @@ fn decode_router_key_body(
     Ok(Pdu::RouterKey)
 }
 
-/// Decodes one PDU from the start of `buf` exactly as `client.rs`'s
-/// `read_pdu` does off a live socket — 8-byte header, then `len - 8` more
-/// bytes — except operating on an in-memory slice instead of async I/O.
-/// Discards the result either way; only used to prove the decoder never
-/// panics on adversarial input.
-///
-/// Exposed only for fuzzing (`pathvector-fuzz`'s `rtr_pdu` target); not part
-/// of the crate's normal public API — real callers only ever decode PDUs
-/// already framed off a live TCP stream (see `client.rs`).
-#[cfg(any(test, feature = "test-util"))]
-pub fn decode_for_fuzzing(buf: &[u8]) {
-    if buf.len() < HEADER_LEN as usize {
-        return;
-    }
-    let Ok((version, pdu_type, field, len)) = decode_header(buf) else {
-        return;
-    };
-    let len_usize = len as usize;
-    if len < HEADER_LEN || buf.len() < len_usize || len > 64 * 1024 {
-        return;
-    }
-    let _ = decode_payload(version, pdu_type, field, len, &buf[..len_usize]);
-}
-
 fn expect_len(pdu_type: PduType, actual: u32, expected: u32) -> Result<(), PduError> {
     if actual == expected {
         Ok(())
@@ -699,6 +673,7 @@ fn roundtrip(version: RtrVersion, pdu: &Pdu) -> Result<Pdu, PduError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::VrpError;
 
     fn v4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
         Ipv4Addr::new(a, b, c, d)
@@ -738,37 +713,19 @@ mod tests {
 
     #[test]
     fn ipv4_prefix_announce_roundtrip() {
-        let pdu = Pdu::Ipv4Prefix {
-            flags: PrefixFlags { announce: true },
-            prefix_len: 24,
-            max_len: 24,
-            prefix: v4(192, 0, 2, 0),
-            asn: 65001,
-        };
+        let pdu = Pdu::announce_v4(v4(192, 0, 2, 0), 24, 24, 65001);
         assert_eq!(roundtrip(RtrVersion::V1, &pdu), Ok(pdu));
     }
 
     #[test]
     fn ipv4_prefix_withdraw_roundtrip() {
-        let pdu = Pdu::Ipv4Prefix {
-            flags: PrefixFlags { announce: false },
-            prefix_len: 8,
-            max_len: 16,
-            prefix: v4(10, 0, 0, 0),
-            asn: 65002,
-        };
+        let pdu = Pdu::announce_v4(v4(10, 0, 0, 0), 8, 16, 65002).withdrawn();
         assert_eq!(roundtrip(RtrVersion::V1, &pdu), Ok(pdu));
     }
 
     #[test]
     fn ipv6_prefix_roundtrip() {
-        let pdu = Pdu::Ipv6Prefix {
-            flags: PrefixFlags { announce: true },
-            prefix_len: 32,
-            max_len: 48,
-            prefix: "2001:db8::".parse().unwrap(),
-            asn: 65003,
-        };
+        let pdu = Pdu::announce_v6("2001:db8::".parse().unwrap(), 32, 48, 65003);
         assert_eq!(roundtrip(RtrVersion::V1, &pdu), Ok(pdu));
     }
 
@@ -950,20 +907,8 @@ mod tests {
             },
             Pdu::ResetQuery,
             Pdu::CacheResponse { session_id: 1 },
-            Pdu::Ipv4Prefix {
-                flags: PrefixFlags { announce: true },
-                prefix_len: 24,
-                max_len: 24,
-                prefix: v4(192, 0, 2, 0),
-                asn: 1,
-            },
-            Pdu::Ipv6Prefix {
-                flags: PrefixFlags { announce: true },
-                prefix_len: 32,
-                max_len: 32,
-                prefix: "2001:db8::".parse().unwrap(),
-                asn: 1,
-            },
+            Pdu::announce_v4(v4(192, 0, 2, 0), 24, 24, 1),
+            Pdu::announce_v6("2001:db8::".parse().unwrap(), 32, 32, 1),
             Pdu::EndOfData {
                 session_id: 1,
                 serial: 1,
@@ -996,6 +941,27 @@ mod tests {
         }
     }
 
+    /// Issue #91's reproduction: a structurally complete IPv4 Prefix PDU with
+    /// Prefix Length 24 and Max Length 16 (RFC 8210 §5.1 forbids it).
+    #[test]
+    fn max_length_below_prefix_length_does_not_decode() {
+        let bytes = [
+            1, 4, 0, 0, 0, 0, 0, 20, // v1 IPv4 Prefix, 20 octets
+            1, 24, 16, 0, // announce, 24, max 16
+            192, 0, 2, 0, 0, 0, 0xfd, 0xe9, // 192.0.2.0, AS65001
+        ];
+        let (v, t, field, len) = decode_header(&bytes).unwrap();
+        assert_eq!(
+            decode_payload(v, t, field, len, &bytes),
+            Err(PduError::InvalidPrefix(
+                VrpError::MaxLengthBelowPrefixLength {
+                    prefix_len: 24,
+                    max_len: 16
+                }
+            ))
+        );
+    }
+
     #[test]
     fn prefix_flags_ignores_reserved_bits() {
         assert!(PrefixFlags::from_byte(0b1111_1111).announce);
@@ -1013,42 +979,41 @@ mod prop_tests {
         any::<bool>().prop_map(|announce| PrefixFlags { announce })
     }
 
+    /// `(prefix_len, max_len)` anywhere in the legal range of a family.
+    fn arb_lengths(bits: u8) -> impl Strategy<Value = (u8, u8)> {
+        (0..=bits).prop_flat_map(move |prefix_len| (Just(prefix_len), prefix_len..=bits))
+    }
+
     fn arb_ipv4_pdu() -> impl Strategy<Value = Pdu> {
         (
             arb_prefix_flags(),
-            0u8..=32,
-            0u8..=32,
+            arb_lengths(32),
             any::<u32>(),
             any::<u32>(),
         )
-            .prop_map(
-                |(flags, prefix_len, max_len, prefix_bits, asn)| Pdu::Ipv4Prefix {
+            .prop_map(|(flags, (prefix_len, max_len), prefix_bits, asn)| {
+                let vrp = Vrp::new(Ipv4Addr::from(prefix_bits), prefix_len, max_len, asn);
+                Pdu::Ipv4Prefix {
                     flags,
-                    prefix_len,
-                    max_len,
-                    prefix: Ipv4Addr::from(prefix_bits),
-                    asn,
-                },
-            )
+                    vrp: vrp.unwrap(),
+                }
+            })
     }
 
     fn arb_ipv6_pdu() -> impl Strategy<Value = Pdu> {
         (
             arb_prefix_flags(),
-            0u8..=128,
-            0u8..=128,
+            arb_lengths(128),
             any::<u128>(),
             any::<u32>(),
         )
-            .prop_map(
-                |(flags, prefix_len, max_len, prefix_bits, asn)| Pdu::Ipv6Prefix {
+            .prop_map(|(flags, (prefix_len, max_len), prefix_bits, asn)| {
+                let vrp = Vrp::new(Ipv6Addr::from(prefix_bits), prefix_len, max_len, asn);
+                Pdu::Ipv6Prefix {
                     flags,
-                    prefix_len,
-                    max_len,
-                    prefix: Ipv6Addr::from(prefix_bits),
-                    asn,
-                },
-            )
+                    vrp: vrp.unwrap(),
+                }
+            })
     }
 
     fn arb_serial_query() -> impl Strategy<Value = Pdu> {

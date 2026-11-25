@@ -1790,10 +1790,21 @@ tracked as their own issues: #89, #91, #92, #93, #94. Interactions worth knowing
 about: #93 (application-level query deadline) is what bounds a *stalled* sync — expiry
 now bounds how stale the data can get meanwhile; #92 will want the staged transfer
 (`Staged`) as the place to detect duplicate/unknown records before anything is
-published; #89's persistent frame buffer replaces `read_frame` in `client.rs` and is
-independent of the new state machine; `pathvectord` should call
+published; `pathvectord` should call
 `RtrConfig::validate()` when loading `[daemon.rpki]` timers (not done here — outside
 the crate).
+
+**#89 and #91 fixed 2026-11-25** (see CHANGELOG): framing is now `frame.rs` +
+`transport.rs`, and prefix records are `Vrp<A>` values. Left open from that work:
+
+- Error Reports for other malformed input. `Violation::malformed` reports only a
+  forbidden prefix tuple; an unknown PDU type (RFC 8210 §12 code 5), unsupported
+  protocol version (code 4) or wrong Length (code 0) still drops the session silently.
+  The decoder already hands over the offending bytes; the care needed is in never
+  reporting a malformed Error Report (§5.11) and not disturbing the v1→v0 fallback.
+- `RtrHandle::validate_v4`/`validate_v6` take a bare `(address, prefix_len)`, so a
+  caller can still ask about a `/33`. A typed prefix argument would need a
+  `pathvector-policy` change.
 
 **22. "Audit-the-audit" pass — is anything not tracked that should be?**
 Prompted directly by the user asking whether `RFC_REQUIREMENTS.md` itself
@@ -2103,6 +2114,22 @@ passes consistently; removed the now-stale pinned regression-file line
 whose comment described a value the fixed generator can no longer produce.
 
 ---
+
+## AS-number rules: follow-ups from issues #109–#111 (2026-11-25)
+
+- **RFC 9774 operator exception.** §3 allows an operator to permit AS_SET /
+  AS_CONFED_SET during a transition. Not offered: a peer still sending them
+  has those routes withdrawn. If needed, make it a per-peer, opt-in setting
+  that is logged, covering both receive (session decoder and daemon gate) and
+  send.
+- **Differing repeated FourByteAsn capabilities.** The first instance wins
+  (zero in any instance is refused). RFC 6793 does not define the case; decide
+  whether differing values should be rejected, as for BGP Role.
+- **Library send path.** `SessionHandle::update_sender` sends what it is given;
+  only `pathvectord` applies the RFC 7607 / 9774 send rules.
+- **Flaky transport tests.** `test_framed_transport_send_io_error_is_forwarded`
+  and `test_collision_candidate_deferred_in_open_sent_closed_on_manual_stop`
+  each failed intermittently in full parallel runs (socket close timing).
 
 ## General
 

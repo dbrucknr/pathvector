@@ -8,6 +8,8 @@
 
 use std::{
     collections::HashSet,
+    fmt::Display,
+    future::Future,
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
@@ -62,6 +64,29 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// Runs one daemon-facing call under `--timeout-secs`. A daemon that never
+    /// answers must fail the scenario, not hang the harness.
+    async fn bounded<T, E: Display>(
+        &self,
+        what: &str,
+        call: impl Future<Output = Result<T, E>>,
+    ) -> Res<T> {
+        match tokio::time::timeout(self.timeout, call).await {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(_) => Err(format!(
+                "timed out after {:?} waiting for {what} ({})",
+                self.timeout,
+                self.probe_summary()
+            )),
+        }
+    }
+
+    async fn set_export_default(&self, ip: &str, accept: bool) -> Res<()> {
+        let mut c = PathvectorClient::connect(grpc_url(&self.topo)).map_err(|e| e.to_string())?;
+        self.bounded("set_export_default", c.set_export_default(ip, accept))
+            .await
+    }
+
     fn bgp_addr(&self) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], self.topo.bgp_port))
     }
@@ -110,7 +135,7 @@ impl Ctx {
     async fn peer_state(&self, i: usize) -> Res<pathvector_client::types::PeerState> {
         let addr: IpAddr = self.topo.loaders[i].addr.into();
         let mut c = PathvectorClient::connect(grpc_url(&self.topo)).map_err(|e| e.to_string())?;
-        c.get_peer(addr).await.map_err(|e| e.to_string())
+        self.bounded("get_peer", c.get_peer(addr)).await
     }
 
     /// Cross-checks the `pathvectord_bgp_session_up` gauge against reality.
@@ -289,7 +314,7 @@ impl Ctx {
         let hold = Duration::from_secs(u64::from(self.topo.control_hold));
 
         let lat = latency_stats(&self.monitor.probes.lock().unwrap(), w.t0, t1);
-        let gaps = gap_stats(&stats.arrivals(), w.t0, t1, alive);
+        let gaps = gap_stats(stats.established_at(), &stats.arrivals(), w.t0, t1, alive);
 
         let d = |base: &str| histogram_deltas(&w.before, &after, base);
         Ok(WindowReport {
@@ -342,7 +367,7 @@ pub async fn converge(ctx: &mut Ctx) -> Res<WindowReport> {
         .loaders
         .iter()
         .flatten()
-        .map(|l| l.send_all(Arc::clone(&ctx.table_msgs)));
+        .map(|l| l.send_all(Arc::clone(&ctx.table_msgs), ctx.timeout));
     let results = futures::future::join_all(sends).await;
     let mut notes = Vec::new();
     for (i, r) in results.into_iter().enumerate() {
@@ -417,11 +442,11 @@ async fn churn_loop(ctx: &Ctx, secs: u64) -> Res<u64> {
     let end = Instant::now() + Duration::from_secs(secs);
     let mut cycles = 0u64;
     while Instant::now() < end {
-        l.send_all(Arc::clone(&withdraw))
+        l.send_all(Arc::clone(&withdraw), ctx.timeout)
             .await
             .map_err(|e| e.to_string())?;
         sleep(Duration::from_millis(100)).await;
-        l.send_all(Arc::clone(&announce))
+        l.send_all(Arc::clone(&announce), ctx.timeout)
             .await
             .map_err(|e| e.to_string())?;
         sleep(Duration::from_millis(100)).await;
@@ -537,7 +562,7 @@ pub async fn reconverge(ctx: &mut Ctx) -> Res<WindowReport> {
     let w = ctx.begin().await?;
     let sent = ctx
         .loader(0)?
-        .send_all(Arc::clone(&ctx.table_msgs))
+        .send_all(Arc::clone(&ctx.table_msgs), ctx.timeout)
         .await
         .map_err(|e| e.to_string())?;
     ctx.wait_daemon_quiet(&w.before, Duration::from_millis(1500))
@@ -581,17 +606,13 @@ pub async fn export_reeval(ctx: &Ctx) -> Res<Vec<WindowReport>> {
     let target = 1;
     let ip = ctx.loader_ip(target);
     let peer = ctx.loader(target)?;
-    let mut client = PathvectorClient::connect(grpc_url(&ctx.topo)).map_err(|e| e.to_string())?;
     let want = ctx.want_prefixes();
 
     // accept
     let w = ctx.begin().await?;
     let rx_before = peer.stats.updates_rx.load(Ordering::Relaxed);
     let t = Instant::now();
-    client
-        .set_export_default(&ip, true)
-        .await
-        .map_err(|e| e.to_string())?;
+    ctx.set_export_default(&ip, true).await?;
     let rpc = t.elapsed();
     ctx.wait_daemon_quiet(&w.before, Duration::from_millis(1500))
         .await?;
@@ -617,10 +638,7 @@ pub async fn export_reeval(ctx: &Ctx) -> Res<Vec<WindowReport>> {
     // reject
     let w = ctx.begin().await?;
     let t = Instant::now();
-    client
-        .set_export_default(&ip, false)
-        .await
-        .map_err(|e| e.to_string())?;
+    ctx.set_export_default(&ip, false).await?;
     let rpc = t.elapsed();
     ctx.wait_daemon_quiet(&w.before, Duration::from_millis(1500))
         .await?;
@@ -655,7 +673,173 @@ pub fn unique_prefixes(entries: &[RibEntry]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{daemon::Monitor, report::Verdict};
+    use pathvector_session::message::{BgpMessage, OpenMessage};
     use std::net::Ipv4Addr;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    /// Longer than any deadline under test: reaching it means the harness
+    /// operation would have hung.
+    const HANG: Duration = Duration::from_secs(10);
+
+    /// A "daemon" that completes the BGP handshake and then goes completely
+    /// quiet: it never sends another message and never reads again, while the
+    /// TCP connection stays open.
+    async fn stalled_bgp() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut header = [0u8; 19];
+                s.read_exact(&mut header).await.unwrap();
+                let len = usize::from(u16::from_be_bytes([header[16], header[17]]));
+                let mut open = vec![0u8; len - header.len()];
+                s.read_exact(&mut open).await.unwrap();
+                let reply = BgpMessage::Open(OpenMessage {
+                    version: 4,
+                    my_as: 65002,
+                    hold_time: 90,
+                    bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+                    capabilities: vec![],
+                });
+                s.write_all(&reply.encode()).await.unwrap();
+                s.write_all(&BgpMessage::Keepalive.encode()).await.unwrap();
+                held.push(s);
+            }
+        });
+        port
+    }
+
+    /// An endpoint that accepts connections and never answers.
+    async fn black_hole() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+        port
+    }
+
+    /// A `/metrics` endpoint with nothing to report.
+    async fn empty_metrics() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut request = [0u8; 256];
+                let _ = s.read(&mut request).await;
+                let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await;
+            }
+        });
+        port
+    }
+
+    /// A harness context wired to a stalled daemon: one loader, one control
+    /// peer, and a table far larger than the socket buffers.
+    async fn stalled_ctx(control_hold: u16) -> Ctx {
+        let local = Ipv4Addr::LOCALHOST;
+        let mut topo = Topology::from_addrs(&[local, local], control_hold);
+        topo.bgp_port = stalled_bgp().await;
+        topo.grpc_port = black_hole().await;
+        topo.metrics_port = empty_metrics().await;
+        let control = PeerHandle::connect(
+            "control",
+            local,
+            SocketAddr::from((local, topo.bgp_port)),
+            topo.control.remote_as,
+            90,
+            true,
+        )
+        .await
+        .expect("handshake with the fake daemon");
+        Ctx {
+            monitor: Monitor::start(&topo, std::process::id(), None),
+            topo,
+            control,
+            loaders: vec![None],
+            table_msgs: Arc::new(vec![vec![0u8; 1 << 20]; 64]),
+            expected_prefixes: 1,
+            accepted: None,
+            entries: Arc::new(Vec::new()),
+            timeout: Duration::from_millis(500),
+            churn_prefixes: 0,
+            churn_secs: 0,
+        }
+    }
+
+    /// A daemon that stops draining a loader must fail the scenario, not park
+    /// the harness in `write_all` forever.
+    #[tokio::test]
+    async fn a_daemon_that_stops_reading_fails_the_scenario() {
+        let mut ctx = stalled_ctx(9).await;
+        let result = tokio::time::timeout(HANG, converge(&mut ctx))
+            .await
+            .expect("converge hung on a daemon that stopped reading");
+        let err = result.expect_err("a stalled daemon is a failed scenario");
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    /// The same for a gRPC call the daemon never answers.
+    #[tokio::test]
+    async fn an_unanswered_rpc_fails_the_scenario() {
+        let ctx = stalled_ctx(9).await;
+        let result = tokio::time::timeout(HANG, ctx.peer_state(0))
+            .await
+            .expect("get_peer hung on a daemon that never answered");
+        let err = result.expect_err("no answer is a failure");
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    /// And for the export-policy call, which goes through its own method.
+    #[tokio::test]
+    async fn an_unanswered_policy_change_fails_the_scenario() {
+        let ctx = stalled_ctx(9).await;
+        let result = tokio::time::timeout(HANG, ctx.set_export_default("127.0.0.1", true))
+            .await
+            .expect("set_export_default hung on a daemon that never answered");
+        let err = result.expect_err("no answer is a failure");
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    /// A session whose send timed out can still be torn down.
+    #[tokio::test]
+    async fn a_stuck_session_can_still_be_closed() {
+        let mut ctx = stalled_ctx(9).await;
+        ctx.connect_loader(0).await.unwrap();
+        let loader = ctx.loaders[0].take().unwrap();
+        let err = loader
+            .send_all(Arc::clone(&ctx.table_msgs), ctx.timeout)
+            .await
+            .expect_err("nothing is reading");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        tokio::time::timeout(HANG, loader.close_abruptly())
+            .await
+            .expect("close_abruptly hung on a stuck session");
+    }
+
+    /// Silence that starts right after the handshake counts against the hold
+    /// time: the daemon's KEEPALIVE that completed the handshake is the last
+    /// thing the control peer heard.
+    #[tokio::test]
+    async fn a_control_peer_never_heard_from_again_fails_the_window() {
+        let ctx = stalled_ctx(1).await;
+        let window = ctx.begin().await.unwrap();
+        sleep(Duration::from_millis(1200)).await;
+        let report = ctx.finish(window, "silent", vec![]).await.unwrap();
+        assert!(
+            matches!(report.control.verdict(), Verdict::Failed(_)),
+            "{:?} with gaps {:?}",
+            report.control.verdict(),
+            report.control.gaps
+        );
+    }
 
     fn entry(second_octet: u8, prefix_len: u8, attr_byte: u8) -> RibEntry {
         RibEntry {

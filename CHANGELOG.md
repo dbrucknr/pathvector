@@ -48,6 +48,64 @@ registered that session, but nothing told it to close.
 
 ---
 
+## 2026-11-25 (AS-number rules on the wire: RFC 6793 AS4_PATH, RFC 7607 AS 0, RFC 9774 AS_SET — issues #109, #110, #111)
+
+### Behavior changes (read before upgrading)
+
+- **Routes carrying `AS_SET` or `AS_CONFED_SET` are no longer accepted or advertised**
+  (RFC 9774 §3). A received one is a withdrawal of the routes in that UPDATE. There is no
+  setting to permit them during a transition.
+- AS 0 is refused in `local_as`, `confederation_id` and `remote_as`; a persisted dynamic
+  peer with `remote_as = 0` is skipped. A peer claiming AS 0 gets NOTIFICATION Bad Peer AS.
+- `AsPath::downgrade_for_two_byte_peer` returns `(AsPath, Option<As4Path>)`.
+- `BgpMessage::decode` now returns `MalformedUpdate` for a path with a set or AS 0. The
+  offending attribute stays in `update.attributes` when the action is treat-as-withdraw.
+- By RFC 7606 §5.2, an UPDATE with such a path and **no reachable NLRI** (a withdrawal
+  that still carries path attributes) now resets the session.
+- Replaying real routing tables (`pathvector-mrt`) installs fewer routes: those that carry
+  a set are withdrawn.
+
+### Fixes
+
+- #109 (`pathvector-types`): the AS4_PATH result kept confederation segments (RFC 6793
+  §4.2.2). The rule now lives in the new `As4Path` type, whose only constructor excludes
+  them and yields nothing when no non-mappable ASN remains. The daemon builders already
+  stripped them; they and the session encoder now use the same constructor.
+- #111: OPEN claiming AS 0 was accepted when no peer AS was expected; AS 0 was accepted in
+  AGGREGATOR, AS4_PATH and AS4_AGGREGATOR; nothing stopped AS 0 being advertised. The FSM no
+  longer starts a session while its own identity is AS 0. New types: `SpeakerAsn` (a
+  non-zero AS number), `ReservedAsZero`.
+- #110: sets were decoded, installed and re-advertised like any segment.
+- Found on the way: treat-as-withdraw dropped `MP_UNREACH_NLRI` attributes already in the
+  UPDATE, so those IPv6 withdrawals were lost and the older routes stayed installed.
+
+### Structure
+
+- `pathvector-session/src/message/as_rules.rs`: the receive rules, one pure step of
+  attribute decoding, before the AS4 merge.
+- `pathvectord/src/egress.rs`: the send rules, pure, the counterpart of `daemon/ingress.rs`.
+
+### Performance
+
+UPDATE decode, `cargo bench -p pathvector-session --bench codec -- decode`, Apple M2 Max,
+release. Before = `385fdd4`, after = this change; five alternating runs, median (best in
+brackets). Other work was running on the machine.
+
+| UPDATE | before | after | Takeaway |
+|---|---|---|---|
+| 1 prefix | 173 ns (170) | 178 ns (178) | about +6 ns per UPDATE |
+| 100 prefixes | 859 ns (856) | 872 ns (842) | within noise |
+| 1000 prefixes | 4.82 µs (4.79) | 4.82 µs (4.78) | within noise |
+| 4-hop AS_PATH + AGGREGATOR | 183 ns (181) | 200 ns (185) | +4 to +17 ns |
+| 32-hop | 185 ns (185) | 194 ns (190) | +5 to +9 ns |
+| 128-hop | 192 ns (188) | 204 ns (194) | +6 to +11 ns |
+
+The cost is per UPDATE, not per prefix. A first version of the checks cost about +35 ns at
+128 hops; scanning each path once with a branch-free AS 0 test removed most of that. The
+`decode_update_path_len` group is new.
+
+---
+
 ## 2026-11-25 (pathvectord: a coalesced session teardown refreshes the capability set — issue #148)
 
 `run_event_loop` had two hand-written copies of `SessionEvent::Terminated` handling. Only the one
@@ -66,6 +124,57 @@ restarted, and a peer that receives F = 0 MUST delete the stale routes it retain
 - Unchanged: a session that has not reached Established since our restart still sends R = 1 after
   `graceful_restart_time` has passed. RFC 4724 §4.1 requires the Restarting Speaker to set R to
   re-establish a session and defines no expiry for it.
+
+---
+
+## 2026-11-25 (pathvector-rpki: partial RTR PDUs and prefix tuple bounds — issues #89, #91)
+
+**#89 — a refresh could lose the bytes of a partly received PDU.** The idle loop races the
+socket read against the RFC 8210 §6 refresh timer. The read kept its header and body in
+local buffers, so when the timer won mid-PDU those bytes were gone and the remainder was
+parsed as a header: a spurious protocol error and reconnect on a healthy session.
+
+- New pure `frame.rs` (`FrameDecoder`) and `transport.rs` (`Connection`). Partial PDUs live
+  in the connection, so a read can be cancelled at any await point. Buffering stays bounded
+  (one PDU of at most 64 KiB plus a 16 KiB read).
+- The socket is read in 16 KiB chunks instead of two `read` calls per PDU.
+- Proof: black-box tests split a Serial Notify at all 11 offsets, v0 and v1, with the
+  refresh timer firing in the gap (all 22 failed before); exhaustive two-way splits;
+  cancellation at every byte and at the cooperative-budget yield; property tests over
+  segmentation and cancellation points; the `rtr_pdu` fuzz target now asserts that
+  segmentation does not change the result.
+
+**#91 — impossible prefix tuples were accepted.** A Prefix Length past the family was
+silently skipped while the transfer still committed; a Max Length past the family, or below
+the Prefix Length, was installed.
+
+- A `Vrp<A>` new-type enforces `prefix_len <= max_len <= family width` (RFC 8210 §§5.1,
+  5.6, 5.7; RFC 6810 §5) in its only constructor; Prefix PDUs decode into it and the table
+  accepts nothing else.
+- A violation sends Error Report 0 "Corrupt Data" with the offending PDU and drops the
+  session. Nothing of the failed transfer is published, the completed generation is kept,
+  and the next query is a Reset Query.
+- **Behaviour change:** a record whose Max Length was below its Prefix Length used to count
+  as *covering* (RFC 6811 §2), making routes under it `Invalid` and, by default, rejected.
+  RFC 8210 §5.1 says Max Length MUST NOT be less than Prefix Length, so it is not a VRP;
+  it no longer reaches the table. A cache that serves one now cannot update the router
+  until it is corrected; the previous data stays until the Expire Interval.
+- Address bits beyond the Prefix Length are cleared, as the table already did implicitly.
+- API: `PduError::InvalidPrefix(VrpError)` is new (a breaking change for exhaustive
+  matches). `for_testing` / `insert_roa_*` now panic on a tuple no cache could send.
+
+**Cost** (M2 Max, release build, loopback full load from Reset Query to the completed-sync
+notification; median of 301 / 201 / 101 runs):
+
+| VRPs | before | after | Takeaway |
+|---|---|---|---|
+| 100 | 162 µs | 73 µs | 2.2× faster: bulk reads replace ~200 `read` calls |
+| 1 000 | 1.12 ms | 0.29 ms | 3.9× faster: per-PDU `read` calls and allocations, not table inserts, were most of the cost |
+| 10 000 | 11.4 ms | 2.28 ms | 5.0× faster; the new bounds check is not visible |
+
+Median of five alternated before/after rounds; reproduce with
+`cargo test --release -p pathvector-rpki -- --ignored --nocapture sync_cost`.
+`validate_v4` / `validate_v6` are unchanged.
 
 ---
 
@@ -493,6 +602,18 @@ stayed at 3.0–3.2 s in every window; it never approached the 9 s hold time.
   `Idle` and ignores inbound connections until its ConnectRetry timer fires
   (120 s by default), so a peer that flaps and redials gets no OPEN for that
   long. Observed directly; not changed.
+
+**Harness corrections from review of PR #114** (2026-11-25):
+
+- Silence before the control peer's first recorded message was not measured: a
+  daemon that sent nothing after the handshake read as 0 ns and **OK**. It is
+  now measured from the handshake KEEPALIVE. A one-loader full-table re-run
+  with the fix (`idle`, `converge`, `cow`, `teardown`, `reconverge`; same
+  machine and dump size) read 3.00 s in five windows and 3.69 s in the
+  `watch_routes` window, hold 9 s.
+- Bulk sends and the harness's `get_peer` / `set_export_default` calls had no
+  deadline, so a stalled daemon hung the run instead of failing it. Each is now
+  bounded by `--timeout-secs`, as is the startup readiness check.
 
 **Not yet done** (PR-1 exit criteria): a run with ≥ 2 simultaneous full-table
 peers (needs `lo0` aliases on macOS), the `export` scenario (needs ≥ 2
