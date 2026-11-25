@@ -46,7 +46,7 @@ notification; median of 301 / 201 / 101 runs):
 | VRPs | before | after | Takeaway |
 |---|---|---|---|
 | 100 | 162 µs | 73 µs | 2.2× faster: bulk reads replace ~200 `read` calls |
-| 1 000 | 1.12 ms | 0.29 ms | 3.9× faster; syscalls, not table inserts, dominated before |
+| 1 000 | 1.12 ms | 0.29 ms | 3.9× faster: per-PDU `read` calls and allocations, not table inserts, were most of the cost |
 | 10 000 | 11.4 ms | 2.28 ms | 5.0× faster; the new bounds check is not visible |
 
 Median of five alternated before/after rounds; reproduce with
