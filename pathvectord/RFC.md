@@ -346,6 +346,7 @@ NOTIFICATIONs on termination to decide between immediate flush and GR window.
 | §4 NOTIFICATION from peer without N-bit → flush immediately (RFC 4724 §4.2 preserved) | `src/daemon/peer.rs` — `on_terminated` | ✅ | `notification_without_peer_n_bit_flushes` |
 | §4 WE must have N-bit for notification mode to engage; otherwise flush immediately | `src/daemon/peer.rs` — `on_terminated` | ✅ | `notification_flushes_when_local_daemon_has_no_gr` |
 | `OperatorStop` (local-initiated teardown) always flushes immediately, regardless of N-bit | `src/daemon/peer.rs` — `on_terminated` | ✅ | `operator_stop_always_flushes` |
+| §4 "The BGP speaker generating the BGP NOTIFICATION message MUST also follow the rules for the Receiving Speaker": an RFC 9687 Send Hold Timer expiry opens a GR window only when the N bit was exchanged | `src/daemon/peer.rs` — `on_terminated` | ✅ | `send_hold_expiry_with_n_bit_enters_gr_window`, `send_hold_expiry_without_n_bit_flushes` |
 
 **Note on e2e peers:** GoBGP 4.6.0 sends `CEASE/Hard Reset` (subcode 9) on all shutdowns
 when `notification-enabled = true` — used to validate the §5 Hard Reset bypass path.

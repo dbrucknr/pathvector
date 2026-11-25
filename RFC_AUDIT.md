@@ -1005,3 +1005,23 @@ the encode-only tier. Remaining open threads: the "needs investigation"
 rows scattered through earlier sections, the newly-found RFC 1997/5065
 gaps, and a possible future pass specifically hunting for more
 "tracked-but-overclaiming" cases the way this round found two.)*
+
+---
+
+## Timer supervision (RFC 4271 §4.4/§8.2.2/§10) and RFC 9687 (2026-11-25, issue #102)
+
+**Method:** read RFC 4271 §4.4, §8.2.2, §10, RFC 9687 in full and RFC 8538
+§4, then wrote tests for each clause and ran them against the old code. The
+§8 and §10 passes above checked which events exist and what they do, not
+whether they are ever delivered while the session is busy.
+
+| Finding | Confidence | Resolution |
+|---|---|---|
+| §8.2.2 Events 9–11 were starved: the `biased;` `select!` polled commands and messages ahead of the timers (a KEEPALIVE was sent only after 5,000 of 5,000 ready UPDATEs) | Confirmed gap (reproduced) | Fixed: timers and input alternate |
+| Socket writes and event sends were awaited inline, so a non-reading peer or a stalled consumer suspended every timer and command | Confirmed gap (reproduced) | Fixed: the session loop waits in one place; writes and event delivery are polled alongside timers |
+| A failed NOTIFICATION write skipped the rest of the teardown, so `Terminated` was never delivered | Confirmed gap (reproduced) | Fixed |
+| §8.2.2 "Each time the local system sends a KEEPALIVE or UPDATE message, it restarts its KeepaliveTimer": UPDATEs did not | Confirmed gap (reproduced) | Fixed |
+| RFC 9687 (`SendHoldTimer`) not implemented at all | Confirmed gap | Implemented; see `pathvector-session/RFC.md` |
+| §10 jitter SHOULD on KeepaliveTimer / ConnectRetryTimer | Confirmed gap (read from code) | Open, `TODO.md` |
+| Hold Timer expiry is reported as `Unclean`, so the daemon retains a GR peer's routes without the N bit, although this side sent a NOTIFICATION and RFC 8538 §4 describes retention after Hold Timer expiry for N-bit speakers | Needs investigation (read from code, not tested) | Open, `TODO.md`; unchanged here |
+

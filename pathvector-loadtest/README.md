@@ -23,6 +23,10 @@ The control peer's verdict is **OK** (keepalives on cadence), **LATE**
 exceeded the hold time, or the session was lost). The process exits non-zero
 on any FAILED window or aborted scenario.
 
+`event_send_blocked` is how long events waited for the daemon's event loop,
+one sample per blocked episode. Since issue #102 the session task is not parked
+meanwhile: it stops reading that peer but keeps running timers and writes.
+
 ## Scenarios
 
 | Name | What it does |

@@ -84,6 +84,11 @@ marking, peer teardown propagation, and RPKI-triggered policy re-evaluation can
 hold that lock while processing many routes. A slow operation for one peer can
 therefore delay state transitions and management reads for every peer.
 
+The session side is fixed (issue #102, 2026-11-25): a busy or stalled daemon
+loop no longer delays a session's own timers, writes or commands, and a peer
+that stops reading is closed by the RFC 9687 `SendHoldTimer`. This does not
+shorten any lock hold, and the two-full-table-peer run is still outstanding.
+
 **Exit criteria:**
 
 - Run at least two simultaneous full-table peers plus one control peer while

@@ -39,8 +39,8 @@ How a BGP UPDATE from a remote peer reaches the Loc-RIB:
 Peer TCP socket (port 179)
   │
   ▼
-FramedBgpTransport                     pathvector-session/src/transport/mod.rs
-  │  FramedRead<TcpStream, BgpCodec>
+FramedBgpTransport                     pathvector-session/src/transport/link.rs
+  │  FramedRead<OwnedReadHalf, BgpCodec>
   │  → BgpCodec::decode()              pathvector-session/src/framing/
   │    strips 16-byte marker, validates length and type field
   │  → BgpMessage::decode()            pathvector-session/src/message/
@@ -51,7 +51,7 @@ Session<FramedBgpTransport>::run()     pathvector-session/src/transport/mod.rs
   │  Converts BgpMessage to FsmInput
   │
   ▼
-Fsm::on_input(FsmInput)                pathvector-session/src/fsm/mod.rs
+Fsm::process(FsmInput)                pathvector-session/src/fsm/mod.rs
   │  Pure state machine — no I/O.
   │  Returns Vec<FsmOutput>; callers execute each output (send a message,
   │  start/stop a timer, emit a SessionEvent).
@@ -130,12 +130,13 @@ update_tx: mpsc::Sender<UpdateMessage>  ─────────────�
   ┌────────────────────────────────────────────────────────────────────────────┘
   ▼
 Session::wait_for_input()              pathvector-session/src/transport/mod.rs
-  │  select! loop: timers | peer messages | outbound UPDATE channel
-  │  lowest-priority arm drains outbound channel without blocking timer handling
+  │  the one place the session task waits; overdue timers alternate with input
+  │  takes UPDATEs only while the writer is idle, one bounded batch at a time
   │
   ▼
-FramedBgpTransport::send(BgpMessage::Update(msg))
-  │  BgpCodec::encode() → write to FramedWrite<TcpStream>
+Outbound::queue() / flush()            pathvector-session/src/transport/link.rs
+  │  BgpCodec::encode() into a buffer; written to the socket concurrently
+  │  with everything else the loop waits for
   │
   ▼
 Peer TCP socket
@@ -194,22 +195,31 @@ blocks waiting on slow gRPC clients.
 
 ## The `BgpTransport` trait seam
 
-`Session<T: BgpTransport>` is generic over its I/O layer:
+`Session<T: BgpTransport>` is generic over its I/O layer, which splits into the
+two directions the session drives independently:
 
 ```
-BgpTransport (trait)
-  ├─ FramedBgpTransport   production: FramedRead + FramedWrite over TcpStream
-  └─ MockTransport        test-only (#[cfg(test)]): in-memory Vec<BgpMessage>
+BgpTransport::into_split() → (BgpReader, BgpWriter)
+  BgpReader   recv()            cancel safe
+  BgpWriter   queue()           never waits
+              flush()           cancel safe
+
+  ├─ FramedBgpTransport   production: FramedRead + a byte buffer over TcpStream
+  └─ mock transports      tests: in-memory channels, with writes that can block
 ```
 
 `transport::spawn()` is non-generic and always produces `Session<FramedBgpTransport>`.
-`transport::spawn_with<T: BgpTransport>()` (test-only) injects a pre-built transport,
-bypassing real TCP. The first `InitiateTcpConnect` output from the FSM activates the
+`transport::spawn_with<T: BgpTransport>()` injects a pre-built transport, bypassing
+real TCP. The first `InitiateTcpConnect` output from the FSM activates the
 injected transport and queues `TcpConnected` — the FSM never knows it isn't talking
 to a real socket.
 
-This seam is what allows all FSM write-path tests (`test_send_failure_in_execute_*`,
-`test_outbound_update_write_failure_*`) to run without binding any ports.
+This seam is what lets the write-path, backpressure and timer tests run with paused
+tokio time and no ports (`tests/deadline_supervision.rs`, `tests/send_hold_timer.rs`).
+
+Around the I/O sit two modules with no I/O of their own: `transport/schedule.rs`
+(which timer to service, and the budgets) and `transport/outbox.rs` (ordered,
+non-blocking event delivery).
 
 ---
 

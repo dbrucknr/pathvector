@@ -4,6 +4,18 @@
 //! over a real TCP connection. Call [`spawn`] to start a session task and
 //! interact with it via the returned [`SpawnedSessionHandle`], which
 //! implements the [`SessionHandle`] trait.
+//!
+//! # Timer supervision and backpressure
+//!
+//! The session task waits in exactly one place; writing, emitting events and
+//! arming timers never block. So the RFC 4271 and RFC 9687 timers keep running
+//! however much input is ready, whether or not the peer is reading and whether
+//! or not events are being consumed:
+//!
+//! * overdue timers and ready input alternate (`schedule`);
+//! * writes are buffered and flushed alongside everything else (`link`);
+//! * events that do not fit the channel are held in order, and the peer is not
+//!   read while any are held (`outbox`).
 
 mod link;
 pub mod listener;
@@ -999,7 +1011,10 @@ impl<T: BgpTransport> Session<T> {
             && let Some(link) = &mut self.link
             && let Some(msg) = ready_now(link.reader.recv())
         {
-            if !self.event_backlog_limit.is_reached_by(self.events.held()) {
+            // A closed or broken connection adds no UPDATE to the backlog.
+            if !matches!(msg, Some(Ok(_)))
+                || !self.event_backlog_limit.is_reached_by(self.events.held())
+            {
                 return self.handle_primary_message(msg);
             }
             // The peer is alive but the consumer has taken nothing for as long

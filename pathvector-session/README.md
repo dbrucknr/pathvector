@@ -143,6 +143,7 @@ Signals an error and immediately terminates the session. The TCP connection is c
 | 4 | Hold Timer Expired — no message received within the negotiated hold time |
 | 5 | Finite State Machine Error — message received in an unexpected state |
 | 6 | Cease — operator-initiated teardown ([RFC 4486](https://www.rfc-editor.org/rfc/rfc4486) defines subcodes) |
+| 8 | Send Hold Timer Expired — nothing could be sent to the peer for the `SendHoldTime` ([RFC 9687](https://www.rfc-editor.org/rfc/rfc9687)) |
 
 ### ROUTE-REFRESH (type 5)
 
@@ -193,7 +194,49 @@ The hold timer is BGP's session liveness mechanism. During OPEN, each peer propo
 
 Once established, the session must receive a KEEPALIVE or UPDATE from the peer within every hold-time window. If none arrives, a NOTIFICATION (Hold Timer Expired, error code 4) is sent and the session drops.
 
-To keep the timer from expiring when there are no routes to advertise, each peer sends a KEEPALIVE every `hold_time / 3` seconds. With the common 90-second hold time this means a keepalive every 30 seconds and a 3-missed-keepalive tolerance before the session drops.
+To keep the timer from expiring when there are no routes to advertise, each peer sends a KEEPALIVE every `hold_time / 3` seconds. With the common 90-second hold time this means a keepalive every 30 seconds and a 3-missed-keepalive tolerance before the session drops. Sending an UPDATE restarts that interval too ([RFC 4271 §8.2.2](https://www.rfc-editor.org/rfc/rfc4271#section-8.2.2)).
+
+### Send hold timer
+
+The hold timer only watches what the peer *sends*. A peer that keeps sending KEEPALIVEs but advertises a closed TCP window would stay "up" for ever while receiving nothing. [RFC 9687](https://www.rfc-editor.org/rfc/rfc9687) adds the `SendHoldTimer` for that: if no BGP message can be sent for the `SendHoldTime`, the session is closed (NOTIFICATION error code 8, if it can be written without waiting) and the expiry is logged as an error.
+
+`SessionConfig::send_hold_time` takes a `SendHoldTime`:
+
+| Value | Meaning |
+|---|---|
+| `SendHoldTime::RECOMMENDED` (default) | the greater of 8 minutes and twice the negotiated hold time (§6) |
+| `SendHoldTime::from_secs(n, hold_time)` | `n` seconds; rejected unless `n > hold_time` (§4.4) |
+| `SendHoldTime::DISABLED` | no timer |
+
+It never runs when the negotiated hold time is zero. "Sent" means accepted by the transport: for TCP, written to the socket. The kernel's send buffer therefore absorbs messages for a while after a peer stops reading, and the period is counted from the last write the socket accepted. On a session that only exchanges KEEPALIVEs, filling that buffer can take hours.
+
+---
+
+## Timer supervision and backpressure
+
+One task runs each session, and it waits in exactly one place. Writing, emitting events and arming timers never block, so neither a slow peer nor a slow consumer can stop the timers.
+
+| Pressure | What the session does |
+|---|---|
+| Input continuously ready | Overdue timers and ready input alternate, so at most one input is processed ahead of each overdue timer. |
+| Peer not reading | Writes are buffered and flushed in the background. At most one 8 KiB batch of UPDATEs (plus one KEEPALIVE) is buffered; after that the 256-entry UPDATE channel fills, and its sender sees `Full`. Reading and timers carry on. `SendHoldTimer` bounds how long. |
+| Consumer not taking events | Once the 64-entry event channel is full the session stops reading, so TCP flow control holds the peer back. KEEPALIVEs and commands carry on. |
+| Hold timer expires with input unread | Up to 16 already-received messages are read first; a KEEPALIVE or UPDATE among them restarts the timer. A silent peer still expires. |
+| Consumer never resumes | While the peer keeps talking, each hold period admits one more message. At 64 held events the session is reset with Cease / Out of Resources. |
+| Stop or protocol error while the peer is not reading | The state changes at once; the connection gets up to 5 s to take the NOTIFICATION, then is reset. |
+
+### Custom transports
+
+`spawn_with` takes any `BgpTransport`, which splits into a `BgpReader` and a `BgpWriter`. Both `recv` and `flush` must be cancel safe, and `queue` must not wait.
+
+### Metrics
+
+| Metric | Meaning |
+|---|---|
+| `pathvector_session_event_send_blocked_seconds{peer}` | How long events waited for the consumer; one sample per blocked episode. |
+| `pathvector_session_keepalive_lateness_seconds{peer}` | How far past due the keepalive timer was serviced. |
+| `pathvector_session_send_hold_expired_total{peer}` | Sessions closed by the `SendHoldTimer`. |
+| `pathvector_session_event_backlog_resets_total{peer}` | Sessions reset because their events were not consumed. |
 
 ---
 
