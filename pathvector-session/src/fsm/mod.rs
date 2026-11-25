@@ -8,8 +8,10 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
-use pathvector_types::PeerType;
+use pathvector_types::{PeerType, ReservedAsZero, SpeakerAsn};
 
+#[cfg(test)]
+mod open_as_zero_tests;
 mod recovery;
 mod send_hold;
 
@@ -35,6 +37,12 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(120);
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 /// Local configuration for a BGP session.
+///
+/// RFC 7607 §2: "A router MUST NOT initiate a connection claiming to be AS 0."
+/// If `local_as`, `public_as` or a [`Capability::FourByteAsn`] value is 0, the
+/// FSM stays in [`State::Idle`] on `ManualStart`, logs an error and never
+/// sends an OPEN. A peer that claims AS 0 gets Bad Peer AS whatever `peer_as`
+/// says.
 #[derive(Debug, Clone)]
 pub struct FsmConfig {
     /// Local AS number, used for own-AS classification (`peer_as ==
@@ -353,6 +361,12 @@ impl Fsm {
     fn on_idle(&mut self, input: &FsmInput) -> Vec<FsmOutput> {
         match input {
             FsmInput::ManualStart | FsmInput::ConnectRetryTimerExpired => {
+                // RFC 7607 §2: "A router MUST NOT initiate a connection
+                // claiming to be AS 0."
+                if let Err(e) = local_speaker_as(&self.config) {
+                    tracing::error!("not starting the BGP session: {e}");
+                    return vec![];
+                }
                 self.state = State::Connect;
                 vec![
                     FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
@@ -815,7 +829,16 @@ impl Fsm {
 
     /// [`FsmInput::TcpConnected`] from Connect or Active: send OPEN, enter [`State::OpenSent`].
     fn do_tcp_connected(&mut self) -> Vec<FsmOutput> {
-        let open = self.make_open();
+        // Checked again here: the capability set can be replaced between
+        // connection attempts.
+        let public_as = match local_speaker_as(&self.config) {
+            Ok(public_as) => public_as,
+            Err(e) => {
+                tracing::error!("not sending OPEN: {e}");
+                return self.do_stop_pre_open();
+            }
+        };
+        let open = self.make_open(public_as);
         self.state = State::OpenSent;
         vec![
             FsmOutput::StopConnectRetryTimer,
@@ -845,18 +868,11 @@ impl Fsm {
     }
 
     /// Build the OPEN message we send to the peer.
-    fn make_open(&self) -> OpenMessage {
+    fn make_open(&self, public_as: SpeakerAsn) -> OpenMessage {
         // RFC 5065 §4: advertise `public_as` (the Confederation Identifier for
         // `External` peers, the Member-AS Number otherwise), not `local_as`
         // directly — see `FsmConfig::public_as`.
-        let my_as = if self.config.public_as > u32::from(u16::MAX) {
-            AS_TRANS
-        } else {
-            #[allow(clippy::cast_possible_truncation)] // guarded by the branch above
-            {
-                self.config.public_as as u16
-            }
-        };
+        let my_as = u16::try_from(public_as.as_u32()).unwrap_or(AS_TRANS);
         OpenMessage {
             version: 4,
             my_as,
@@ -892,10 +908,19 @@ impl Fsm {
             ));
         }
 
+        // RFC 7607 §2: zero as the peer AS is Bad Peer AS, whether or not a
+        // particular peer AS is expected.
+        let bad_peer_as = || {
+            (
+                NotificationError::OpenMessage(OpenMsgError::BadPeerAs),
+                vec![],
+            )
+        };
+        let peer_as = peer_speaker_as(peer).map_err(|_| bad_peer_as())?.as_u32();
+
         // RFC 6286: BGP Identifier must be unique within the AS. An iBGP peer
         // with the same BGP ID as the local speaker indicates a routing loop or
         // misconfiguration — reject with BadBgpIdentifier.
-        let peer_as = resolve_as(peer);
         if peer_as == self.config.local_as && peer.bgp_id == self.config.local_bgp_id {
             return Err((
                 NotificationError::OpenMessage(OpenMsgError::BadBgpIdentifier),
@@ -904,12 +929,9 @@ impl Fsm {
         }
 
         if let Some(expected) = self.config.peer_as
-            && resolve_as(peer) != expected
+            && peer_as != expected
         {
-            return Err((
-                NotificationError::OpenMessage(OpenMsgError::BadPeerAs),
-                vec![],
-            ));
+            return Err(bad_peer_as());
         }
 
         // RFC 4271 §6.2: hold time values 1 and 2 are unacceptable.
@@ -1044,6 +1066,29 @@ fn resolve_as(open: &OpenMessage) -> u32 {
             }
         })
         .unwrap_or_else(|| u32::from(open.my_as))
+}
+
+/// The AS number the peer's OPEN claims, refusing AS 0 (RFC 7607 §2).
+///
+/// RFC 6793 §4.1 puts it in the [`Capability::FourByteAsn`] value "in lieu of"
+/// `my_as`. Nothing says which of several differing instances counts, so a
+/// zero in any of them is refused.
+fn peer_speaker_as(open: &OpenMessage) -> Result<SpeakerAsn, ReservedAsZero> {
+    if open.capabilities.contains(&Capability::FourByteAsn(0)) {
+        return Err(ReservedAsZero);
+    }
+    SpeakerAsn::try_from(resolve_as(open))
+}
+
+/// The AS number to claim in our OPEN, or [`ReservedAsZero`] if any part of
+/// the configured identity is AS 0: `local_as`, `public_as` or a
+/// [`Capability::FourByteAsn`] value (RFC 7607 §2).
+fn local_speaker_as(config: &FsmConfig) -> Result<SpeakerAsn, ReservedAsZero> {
+    if config.capabilities.contains(&Capability::FourByteAsn(0)) {
+        return Err(ReservedAsZero);
+    }
+    SpeakerAsn::try_from(config.local_as)?;
+    SpeakerAsn::try_from(config.public_as)
 }
 
 /// A Finite State Machine Error NOTIFICATION for an unexpected message.

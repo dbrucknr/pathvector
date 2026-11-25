@@ -19,27 +19,35 @@ pub struct GapStats {
 
 /// Computes [`GapStats`] for arrivals recorded on one session.
 ///
-/// `arrivals` must be ascending. `alive` says whether the session was still
-/// up at `end`; a dead session has no "open" gap, its death is reported
-/// separately.
+/// `since` is when observation began: the arrival of the KEEPALIVE that
+/// completed the handshake. Silence is measured from it until the first
+/// recorded arrival, so a peer that is never heard from again does not read as
+/// healthy. It is not itself counted in [`GapStats::messages`].
+///
+/// `arrivals` must be ascending and none earlier than `since`. `alive` says
+/// whether the session was still up at `end`; a dead session has no "open"
+/// gap, its death is reported separately.
 #[must_use]
-pub fn gap_stats(arrivals: &[Instant], start: Instant, end: Instant, alive: bool) -> GapStats {
+pub fn gap_stats(
+    since: Instant,
+    arrivals: &[Instant],
+    start: Instant,
+    end: Instant,
+    alive: bool,
+) -> GapStats {
     let mut max_gap = Duration::ZERO;
     let mut messages = 0usize;
+    let mut last = since;
 
-    for pair in arrivals.windows(2) {
-        let (prev, cur) = (pair[0], pair[1]);
-        if cur >= start && cur <= end {
-            max_gap = max_gap.max(cur.duration_since(prev));
-        }
-    }
-    for &t in arrivals {
-        if t >= start && t <= end {
+    for &t in arrivals.iter().take_while(|&&t| t <= end) {
+        if t >= start {
             messages += 1;
+            max_gap = max_gap.max(t.duration_since(last));
         }
+        last = t;
     }
-    if alive && let Some(&last) = arrivals.iter().rev().find(|&&t| t <= end) {
-        max_gap = max_gap.max(end.duration_since(last));
+    if alive {
+        max_gap = max_gap.max(end.saturating_duration_since(last));
     }
     GapStats { messages, max_gap }
 }
@@ -115,7 +123,7 @@ mod tests {
     fn steady_keepalives_report_their_spacing() {
         let b = Instant::now();
         let arrivals: Vec<Instant> = (0..5).map(|i| at(b, i * 3000)).collect();
-        let s = gap_stats(&arrivals, b, at(b, 12_000), true);
+        let s = gap_stats(b, &arrivals, b, at(b, 12_000), true);
         assert_eq!(s.messages, 5);
         assert_eq!(s.max_gap, Duration::from_secs(3));
     }
@@ -127,7 +135,7 @@ mod tests {
     fn gap_straddling_window_start_is_attributed_by_its_end() {
         let b = Instant::now();
         let arrivals = vec![at(b, 0), at(b, 7000)];
-        let s = gap_stats(&arrivals, at(b, 5000), at(b, 8000), true);
+        let s = gap_stats(b, &arrivals, at(b, 5000), at(b, 8000), true);
         assert_eq!(s.messages, 1);
         assert_eq!(s.max_gap, Duration::from_secs(7));
     }
@@ -138,21 +146,54 @@ mod tests {
     fn open_gap_counts_for_live_session_only() {
         let b = Instant::now();
         let arrivals = vec![at(b, 0), at(b, 3000)];
-        let live = gap_stats(&arrivals, b, at(b, 20_000), true);
+        let live = gap_stats(b, &arrivals, b, at(b, 20_000), true);
         assert_eq!(live.max_gap, Duration::from_secs(17));
-        let dead = gap_stats(&arrivals, b, at(b, 20_000), false);
+        let dead = gap_stats(b, &arrivals, b, at(b, 20_000), false);
         assert_eq!(dead.max_gap, Duration::from_secs(3));
     }
 
+    /// A live session that has said nothing since the handshake has been
+    /// silent for all that time, including time before the window opened.
     #[test]
-    fn no_arrivals_yields_zero() {
+    fn silence_with_no_arrivals_is_measured_from_the_handshake() {
         let b = Instant::now();
-        let s = gap_stats(&[], b, at(b, 1000), true);
+        let s = gap_stats(b, &[], at(b, 2000), at(b, 20_000), true);
         assert_eq!(
             s,
             GapStats {
                 messages: 0,
-                max_gap: Duration::ZERO
+                max_gap: Duration::from_secs(20)
+            }
+        );
+        let dead = gap_stats(b, &[], b, at(b, 20_000), false);
+        assert_eq!(dead.max_gap, Duration::ZERO);
+    }
+
+    /// A first message that only arrives as the window closes does not erase
+    /// the silence before it.
+    #[test]
+    fn late_first_arrival_reports_the_silence_before_it() {
+        let b = Instant::now();
+        let s = gap_stats(b, &[at(b, 18_000)], b, at(b, 18_000), true);
+        assert_eq!(
+            s,
+            GapStats {
+                messages: 1,
+                max_gap: Duration::from_secs(18)
+            }
+        );
+    }
+
+    /// Arrivals after the window closes belong to a later window.
+    #[test]
+    fn arrivals_after_the_window_are_ignored() {
+        let b = Instant::now();
+        let s = gap_stats(b, &[at(b, 3000), at(b, 30_000)], b, at(b, 5000), true);
+        assert_eq!(
+            s,
+            GapStats {
+                messages: 1,
+                max_gap: Duration::from_secs(3)
             }
         );
     }

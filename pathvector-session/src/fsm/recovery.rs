@@ -178,24 +178,26 @@ fn is_nlri_less_with_attributes(update: &UpdateMessage, errors: &[AttributeDecod
 ///
 /// All announced IPv4 NLRIs are moved into `withdrawn`. Any `MP_REACH_NLRI`
 /// attributes are converted to `MP_UNREACH_NLRI` so that non-IPv4 prefixes are
-/// also withdrawn. All other attributes are dropped.
+/// also withdrawn, and `MP_UNREACH_NLRI` attributes already present are kept:
+/// the withdrawals the UPDATE carries still apply. All other attributes are
+/// dropped. An `MP_UNREACH_NLRI` with no prefixes is dropped too, so the
+/// result cannot be read as an End-of-RIB marker the peer did not send.
 pub(crate) fn make_treat_as_withdraw(update: UpdateMessage) -> UpdateMessage {
     let mut withdrawn = update.withdrawn;
     withdrawn.extend(update.announced);
 
-    // Convert any decoded MP_REACH_NLRI → MP_UNREACH_NLRI.
     let mp_unreaches: Vec<PathAttribute> = update
         .attributes
         .into_iter()
-        .filter_map(|attr| {
-            if let PathAttribute::MpReachNlri(mp) = attr {
-                Some(PathAttribute::MpUnreachNlri(MpUnreachNlri {
-                    afi_safi: mp.afi_safi,
-                    prefixes: mp.prefixes,
-                }))
-            } else {
-                None
+        .filter_map(|attr| match attr {
+            PathAttribute::MpReachNlri(mp) => Some(PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                afi_safi: mp.afi_safi,
+                prefixes: mp.prefixes,
+            })),
+            PathAttribute::MpUnreachNlri(mp) if !mp.prefixes.is_empty() => {
+                Some(PathAttribute::MpUnreachNlri(mp))
             }
+            _ => None,
         })
         .collect();
 
@@ -281,6 +283,43 @@ mod tests {
             "expected MpUnreachNlri after conversion"
         );
         assert!(result.announced.is_empty());
+    }
+
+    /// RFC 7606 §2: treat-as-withdraw handles the routes the UPDATE
+    /// *contains* as withdrawn. Routes it already withdraws through
+    /// `MP_UNREACH_NLRI` stay withdrawn: losing them would leave the peer's
+    /// older route installed for ever.
+    #[test]
+    fn test_make_treat_as_withdraw_keeps_explicit_mp_unreach() {
+        use std::net::Ipv6Addr;
+
+        use crate::message::{MpReachNlri, Prefix};
+        use pathvector_types::{AfiSafi, NextHop, Nlri};
+
+        let announced: Nlri<Ipv6Addr> = "2001:db8:1::/48".parse().unwrap();
+        let withdrawn: Nlri<Ipv6Addr> = "2001:db8:2::/48".parse().unwrap();
+        let unreach = |p| {
+            PathAttribute::MpUnreachNlri(MpUnreachNlri {
+                afi_safi: AfiSafi::IPV6_UNICAST,
+                prefixes: vec![Prefix::V6(p)],
+            })
+        };
+        let result = super::make_treat_as_withdraw(UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::MpReachNlri(MpReachNlri {
+                    afi_safi: AfiSafi::IPV6_UNICAST,
+                    next_hop: NextHop::V6("2001:db8::1".parse().unwrap()),
+                    prefixes: vec![Prefix::V6(announced)],
+                }),
+                unreach(withdrawn),
+            ],
+            announced: vec![],
+        });
+        assert_eq!(
+            result.attributes,
+            vec![unreach(announced), unreach(withdrawn)]
+        );
     }
 
     #[test]

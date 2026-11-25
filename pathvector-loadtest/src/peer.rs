@@ -39,7 +39,6 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Observations about one session, shared between the peer's tasks and the
 /// scenario code reading them.
-#[derive(Default)]
 pub struct PeerStats {
     pub updates_rx: AtomicU64,
     pub keepalives_rx: AtomicU64,
@@ -48,17 +47,35 @@ pub struct PeerStats {
     closed_at: Mutex<Option<Instant>>,
     /// `(error code, subcode)` of a NOTIFICATION the daemon sent us.
     notification: Mutex<Option<(u8, u8)>>,
-    /// Arrival time of every message, when `record_arrivals` is on.
+    /// Arrival time of every message after the handshake, when
+    /// `record_arrivals` is on.
     arrivals: Mutex<Vec<Instant>>,
     record_arrivals: bool,
+    /// When the handshake completed.
+    established_at: Instant,
 }
 
 impl PeerStats {
+    /// Created as the handshake completes, which fixes
+    /// [`established_at`](Self::established_at).
     fn new(record_arrivals: bool) -> Self {
         Self {
+            updates_rx: AtomicU64::new(0),
+            keepalives_rx: AtomicU64::new(0),
+            bytes_rx: AtomicU64::new(0),
+            closed_at: Mutex::new(None),
+            notification: Mutex::new(None),
+            arrivals: Mutex::new(Vec::new()),
             record_arrivals,
-            ..Self::default()
+            established_at: Instant::now(),
         }
+    }
+
+    /// When the KEEPALIVE that completed the handshake arrived: the point from
+    /// which the daemon's silence is measured.
+    #[must_use]
+    pub fn established_at(&self) -> Instant {
+        self.established_at
     }
 
     /// Whether the session has ended.
@@ -93,19 +110,17 @@ impl PeerStats {
     }
 }
 
-enum Cmd {
-    Send {
-        msgs: Arc<Vec<Vec<u8>>>,
-        done: oneshot::Sender<io::Result<Duration>>,
-    },
-    Close,
+/// A bulk send queued for the writer task.
+struct SendJob {
+    msgs: Arc<Vec<Vec<u8>>>,
+    done: oneshot::Sender<io::Result<Duration>>,
 }
 
 /// A live simulated peer session.
 pub struct PeerHandle {
     pub name: String,
     pub stats: Arc<PeerStats>,
-    tx: mpsc::Sender<Cmd>,
+    tx: mpsc::Sender<SendJob>,
     writer: JoinHandle<()>,
     reader: JoinHandle<()>,
 }
@@ -167,21 +182,43 @@ impl PeerHandle {
     ///
     /// # Errors
     ///
-    /// Returns the write error if the session died mid-send.
-    pub async fn send_all(&self, msgs: Arc<Vec<Vec<u8>>>) -> io::Result<Duration> {
-        let (done, rx) = oneshot::channel();
-        self.tx
-            .send(Cmd::Send { msgs, done })
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "peer writer task ended"))?;
-        rx.await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "peer writer task ended"))?
+    /// Returns the write error if the session died mid-send, or `TimedOut` if
+    /// the send is not finished within `deadline` — a daemon that has stopped
+    /// reading would otherwise park the write forever. The session is unusable
+    /// after a timeout.
+    pub async fn send_all(
+        &self,
+        msgs: Arc<Vec<Vec<u8>>>,
+        deadline: Duration,
+    ) -> io::Result<Duration> {
+        let send = async {
+            let ended = || io::Error::new(io::ErrorKind::BrokenPipe, "peer writer task ended");
+            let (done, rx) = oneshot::channel();
+            self.tx
+                .send(SendJob { msgs, done })
+                .await
+                .map_err(|_| ended())?;
+            rx.await.map_err(|_| ended())?
+        };
+        if let Ok(result) = timeout(deadline, send).await {
+            return result;
+        }
+        // The writer is stuck inside `write_all` and may have sent part of a
+        // message, so nothing more can be written on this session.
+        self.writer.abort();
+        self.stats.mark_closed();
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("send timed out after {deadline:?}: the daemon stopped reading this session"),
+        ))
     }
 
     /// Drops the TCP connection without any NOTIFICATION — the abrupt
     /// teardown a crashed peer or severed link produces.
     pub async fn close_abruptly(self) {
-        let _ = self.tx.send(Cmd::Close).await;
+        // Abort rather than ask: a writer blocked on a daemon that is not
+        // reading would never see a request to close.
+        self.writer.abort();
         let _ = self.writer.await;
         self.reader.abort();
         self.stats.mark_closed();
@@ -284,7 +321,7 @@ async fn reader_task(mut rd: OwnedReadHalf, stats: Arc<PeerStats>) {
 /// (unless the socket itself is back-pressured, which is the daemon's doing).
 async fn writer_task(
     mut wr: OwnedWriteHalf,
-    mut rx: mpsc::Receiver<Cmd>,
+    mut rx: mpsc::Receiver<SendJob>,
     ka_interval: Duration,
     stats: Arc<PeerStats>,
 ) {
@@ -293,33 +330,33 @@ async fn writer_task(
 
     loop {
         tokio::select! {
-            cmd = rx.recv() => match cmd {
-                None | Some(Cmd::Close) => return,
-                Some(Cmd::Send { msgs, done }) => {
-                    let started = Instant::now();
-                    let mut result = Ok(());
-                    for m in msgs.iter() {
-                        if last_write.elapsed() >= ka_interval {
-                            if let Err(e) = wr.write_all(&keepalive).await {
-                                result = Err(e);
-                                break;
-                            }
-                            last_write = tokio::time::Instant::now();
-                        }
-                        if let Err(e) = wr.write_all(m).await {
+            job = rx.recv() => {
+                let Some(SendJob { msgs, done }) = job else {
+                    return;
+                };
+                let started = Instant::now();
+                let mut result = Ok(());
+                for m in msgs.iter() {
+                    if last_write.elapsed() >= ka_interval {
+                        if let Err(e) = wr.write_all(&keepalive).await {
                             result = Err(e);
                             break;
                         }
                         last_write = tokio::time::Instant::now();
                     }
-                    let failed = result.is_err();
-                    let _ = done.send(result.map(|()| started.elapsed()));
-                    if failed {
-                        stats.mark_closed();
-                        return;
+                    if let Err(e) = wr.write_all(m).await {
+                        result = Err(e);
+                        break;
                     }
+                    last_write = tokio::time::Instant::now();
                 }
-            },
+                let failed = result.is_err();
+                let _ = done.send(result.map(|()| started.elapsed()));
+                if failed {
+                    stats.mark_closed();
+                    return;
+                }
+            }
             () = sleep_until(last_write + ka_interval) => {
                 if wr.write_all(&keepalive).await.is_err() {
                     stats.mark_closed();

@@ -5,6 +5,7 @@ use std::{
 
 use pathvector_policy::DefaultAction;
 use pathvector_session::transport::tcp_md5::{Md5Enforcement, TcpMd5Key, TcpMd5KeyError};
+use pathvector_types::SpeakerAsn;
 use serde::{Deserialize, Serialize};
 
 /// Top-level daemon configuration.
@@ -37,6 +38,8 @@ pub struct Config {
 
 #[derive(Deserialize)]
 pub struct DaemonConfig {
+    /// This speaker's AS number. AS 0 is refused (RFC 7607).
+    #[serde(deserialize_with = "speaker_as")]
     pub local_as: u32,
     pub bgp_id: Ipv4Addr,
     #[serde(default = "default_hold_time")]
@@ -128,7 +131,7 @@ pub struct DaemonConfig {
     /// bgp_id           = "10.0.0.1"
     /// confederation_id = 64500    # AS number advertised to the outside world
     /// ```
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_speaker_as")]
     pub confederation_id: Option<u32>,
     /// Linux routing table into which BGP routes are installed (default: 254 = main).
     ///
@@ -275,6 +278,19 @@ pub struct DaemonConfig {
     /// ```
     #[serde(default)]
     pub tcp_md5_enforcement: TcpMd5EnforcementConfig,
+}
+
+/// A configured AS number that identifies a BGP speaker: AS 0 is refused
+/// (RFC 7607 §2, via [`SpeakerAsn`]), since no session could use it.
+fn speaker_as<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    SpeakerAsn::try_from(u32::deserialize(d)?)
+        .map(SpeakerAsn::as_u32)
+        .map_err(serde::de::Error::custom)
+}
+
+/// [`speaker_as`] for an optional field.
+fn optional_speaker_as<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    speaker_as(d).map(Some)
 }
 
 /// RTR server connection settings for RPKI Route Origin Validation.
@@ -442,6 +458,7 @@ pub struct PeerConfig {
     pub address: IpAddr,
     #[serde(default = "default_bgp_port")]
     pub port: u16,
+    #[serde(deserialize_with = "speaker_as")]
     pub remote_as: u32,
     /// Default action when no import policy term matches for IPv4 routes.
     ///
@@ -1799,5 +1816,62 @@ remote_as = 65001
                 "{bad} must be rejected"
             );
         }
+    }
+}
+
+/// RFC 7607 §2: "A router MUST NOT initiate a connection claiming to be AS 0",
+/// and AS 0 as a peer AS is Bad Peer AS — so AS 0 in a configuration could
+/// never produce a session. It is refused when the file is read (issue #111).
+#[cfg(test)]
+mod as_zero_tests {
+    use super::*;
+
+    fn parse(daemon: &str, peer: &str) -> Result<(), String> {
+        let text = format!(
+            "[daemon]\nbgp_id = \"10.0.0.1\"\n{daemon}\n\n[[peers]]\naddress = \"10.0.0.2\"\n{peer}\n"
+        );
+        toml::from_str::<Config>(&text)
+            .map(|_| ())
+            .map_err(|e| describe_toml_error(&e, Some(&text)))
+    }
+
+    #[test]
+    fn as_zero_is_refused_in_every_identity_field() {
+        for (daemon, peer) in [
+            ("local_as = 0", "remote_as = 65002"),
+            (
+                "local_as = 65001\nconfederation_id = 0",
+                "remote_as = 65002",
+            ),
+            ("local_as = 65001", "remote_as = 0"),
+        ] {
+            let err = parse(daemon, peer).expect_err(daemon);
+            assert!(err.contains("AS 0"), "{err}");
+        }
+    }
+
+    #[test]
+    fn non_zero_identities_parse() {
+        parse(
+            "local_as = 4294967295\nconfederation_id = 1",
+            "remote_as = 131072",
+        )
+        .unwrap();
+    }
+
+    /// A persisted dynamic peer with AS 0 is not loaded, and the others are.
+    #[test]
+    fn sidecar_entry_with_as_zero_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dynamic_peers.toml");
+        std::fs::write(
+            &path,
+            "[[peers]]\naddress = \"10.0.0.2\"\nremote_as = 0\n\n\
+             [[peers]]\naddress = \"10.0.0.3\"\nremote_as = 65003\n",
+        )
+        .unwrap();
+        let loaded = DynamicPeerStore::new(path).load();
+        let addresses: Vec<_> = loaded.iter().map(|p| p.address.to_string()).collect();
+        assert_eq!(addresses, ["10.0.0.3"]);
     }
 }

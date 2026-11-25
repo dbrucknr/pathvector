@@ -55,6 +55,8 @@ mod ingress;
 // Issue #138: announcements dropped before import policy still withdraw the
 // peer's older route.
 #[cfg(test)]
+mod as_content_tests;
+#[cfg(test)]
 mod ingress_drop_tests;
 #[cfg(test)]
 mod last_feasible_tests;

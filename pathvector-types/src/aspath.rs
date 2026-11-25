@@ -4,6 +4,14 @@
 /// you encounter in practice have a single `Sequence` segment, but aggregation
 /// and confederations introduce the other types.
 ///
+/// # Representation is not permission
+///
+/// `Set` and `ConfedSet` are deprecated: RFC 9774 forbids advertising them and
+/// requires a received one to be treated as a withdrawal. These types still
+/// represent them, so historical data and offending messages can be decoded and
+/// inspected; the live session and the speaker enforce the rule. Likewise any
+/// segment can hold AS 0, which RFC 7607 prohibits on the wire.
+///
 /// # Segment types
 ///
 /// | Variant | Wire type | Meaning |
@@ -102,6 +110,19 @@ impl AsPathSegment {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.asns().is_empty()
+    }
+
+    /// Returns `true` for `AS_SET` and `AS_CONFED_SET`, the two segment types
+    /// RFC 9774 deprecates.
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        matches!(self, Self::Set(_) | Self::ConfedSet(_))
+    }
+
+    /// Returns `true` for `AS_CONFED_SEQUENCE` and `AS_CONFED_SET` (RFC 5065).
+    #[must_use]
+    pub fn is_confed(&self) -> bool {
+        matches!(self, Self::ConfedSequence(_) | Self::ConfedSet(_))
     }
 }
 
@@ -298,6 +319,27 @@ impl AsPath {
         self.segments.iter().any(|seg| seg.contains(asn))
     }
 
+    /// Returns `true` if this path holds an `AS_SET` or `AS_CONFED_SET`
+    /// segment.
+    ///
+    /// RFC 9774 §3: unless an operator configures otherwise, a speaker must
+    /// not advertise such a path and must treat a received one as a
+    /// withdrawal.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pathvector_types::{Asn, AsPath, AsPathSegment};
+    ///
+    /// assert!(!AsPath::from_sequence(vec![Asn::new(65001)]).contains_as_set());
+    /// let aggregated = AsPath::from_segments(vec![AsPathSegment::Set(vec![Asn::new(65001)])]);
+    /// assert!(aggregated.contains_as_set());
+    /// ```
+    #[must_use]
+    pub fn contains_as_set(&self) -> bool {
+        self.segments.iter().any(AsPathSegment::is_set)
+    }
+
     /// Returns the BGP path length used in best-path selection.
     ///
     /// This is the sum of each segment's [`AsPathSegment::path_length`] —
@@ -416,7 +458,9 @@ impl AsPath {
     /// Creates an AS path from an explicit list of segments.
     ///
     /// Use this when constructing paths with mixed segment types, such as
-    /// a sequence followed by a set (common in aggregated routes).
+    /// a sequence followed by a set — the shape of historical aggregated
+    /// routes, which RFC 9774 no longer lets a live speaker advertise or
+    /// accept (see [`Self::contains_as_set`]).
     ///
     /// # Examples
     ///
@@ -435,73 +479,68 @@ impl AsPath {
         Self { segments }
     }
 
-    /// Produces the wire representation for a 2-byte-only peer (RFC 6793 §4).
+    /// Produces what a NEW speaker sends a two-octet (OLD) peer for this path
+    /// (RFC 6793 §4.2.2): the two-octet `AS_PATH` and, when one is required,
+    /// the accompanying [`As4Path`].
     ///
-    /// Returns `(downgraded, Some(original))` when at least one 4-byte ASN was
-    /// replaced, so the caller can attach the original as `AS4_PATH`. Returns
-    /// `(original_clone, None)` when all ASNs fit in 16 bits (no downgrade needed).
-    ///
-    /// Confederation segments are treated like ordinary Sequence/Set segments for
-    /// the purpose of downgrade — they are not stripped here; stripping is a
-    /// separate concern.
+    /// - The `AS_PATH` keeps every segment, confederation segments included,
+    ///   with `AS_TRANS` standing in for each non-mappable ASN.
+    /// - The [`As4Path`] is *not* a copy of this path: it is built by
+    ///   [`As4Path::for_two_byte_peer`], which excludes confederation segments
+    ///   and returns `None` when `AS4_PATH` must not be sent.
     ///
     /// # Examples
     ///
     /// ```
-    /// use pathvector_types::{Asn, AsPath};
+    /// use pathvector_types::{Asn, AsPath, AsPathSegment};
     ///
-    /// // All 2-byte → no AS4_PATH produced.
+    /// // All mappable → unchanged, no AS4_PATH.
     /// let path = AsPath::from_sequence(vec![Asn::new(65001)]);
     /// let (down, as4) = path.downgrade_for_two_byte_peer();
+    /// assert_eq!(down, path);
     /// assert!(as4.is_none());
     ///
-    /// // 4-byte ASN → downgrade substitutes AS_TRANS and returns original.
-    /// let path4 = AsPath::from_sequence(vec![Asn::new(131_072), Asn::new(65001)]);
-    /// let (down4, as4_path) = path4.downgrade_for_two_byte_peer();
-    /// assert_eq!(down4.segments()[0].asns()[0], Asn::TRANS);
-    /// assert!(as4_path.is_some());
+    /// // A non-mappable ASN → AS_TRANS in AS_PATH, the real value in AS4_PATH,
+    /// // which never carries the confederation segment.
+    /// let path = AsPath::from_segments(vec![
+    ///     AsPathSegment::ConfedSequence(vec![Asn::new(65010)]),
+    ///     AsPathSegment::Sequence(vec![Asn::new(131_072)]),
+    /// ]);
+    /// let (down, as4) = path.downgrade_for_two_byte_peer();
+    /// assert_eq!(down.segments()[0], path.segments()[0]);
+    /// assert_eq!(down.segments()[1].asns(), &[Asn::TRANS]);
+    /// assert_eq!(
+    ///     as4.unwrap().into_path(),
+    ///     AsPath::from_sequence(vec![Asn::new(131_072)]),
+    /// );
     /// ```
     #[must_use]
-    pub fn downgrade_for_two_byte_peer(&self) -> (Self, Option<Self>) {
-        let mut needs_downgrade = false;
-        for seg in &self.segments {
-            if seg.asns().iter().any(|a| a.is_four_byte()) {
-                needs_downgrade = true;
-                break;
-            }
-        }
-        if !needs_downgrade {
+    pub fn downgrade_for_two_byte_peer(&self) -> (Self, Option<As4Path>) {
+        if !self.has_non_mappable_asn() {
             return (self.clone(), None);
         }
-        let downgraded_segments: Vec<AsPathSegment> = self
+        let to_two_octet = |asns: &[crate::Asn]| -> Vec<crate::Asn> {
+            asns.iter()
+                .map(|&a| {
+                    if a.is_four_byte() {
+                        crate::Asn::TRANS
+                    } else {
+                        a
+                    }
+                })
+                .collect()
+        };
+        let segments = self
             .segments
             .iter()
-            .map(|seg| {
-                let downgraded: Vec<crate::Asn> = seg
-                    .asns()
-                    .iter()
-                    .map(|&a| {
-                        if a.is_four_byte() {
-                            crate::Asn::TRANS
-                        } else {
-                            a
-                        }
-                    })
-                    .collect();
-                match seg {
-                    AsPathSegment::Sequence(_) => AsPathSegment::Sequence(downgraded),
-                    AsPathSegment::Set(_) => AsPathSegment::Set(downgraded),
-                    AsPathSegment::ConfedSequence(_) => AsPathSegment::ConfedSequence(downgraded),
-                    AsPathSegment::ConfedSet(_) => AsPathSegment::ConfedSet(downgraded),
-                }
+            .map(|seg| match seg {
+                AsPathSegment::Sequence(a) => AsPathSegment::Sequence(to_two_octet(a)),
+                AsPathSegment::Set(a) => AsPathSegment::Set(to_two_octet(a)),
+                AsPathSegment::ConfedSequence(a) => AsPathSegment::ConfedSequence(to_two_octet(a)),
+                AsPathSegment::ConfedSet(a) => AsPathSegment::ConfedSet(to_two_octet(a)),
             })
             .collect();
-        (
-            Self {
-                segments: downgraded_segments,
-            },
-            Some(self.clone()),
-        )
+        (Self { segments }, As4Path::for_two_byte_peer(self))
     }
 
     /// Returns `true` if any ASN in this path (in any segment type) is
@@ -653,15 +692,62 @@ impl AsPath {
         let segments = self
             .segments
             .iter()
-            .filter(|seg| {
-                !matches!(
-                    seg,
-                    AsPathSegment::ConfedSequence(_) | AsPathSegment::ConfedSet(_)
-                )
-            })
+            .filter(|seg| !seg.is_confed())
             .cloned()
             .collect();
         Self { segments }
+    }
+}
+
+/// An `AS4_PATH` value that is valid to send to a two-octet peer
+/// (RFC 6793 §4.2.2).
+///
+/// [`Self::for_two_byte_peer`] is the only constructor, so every value holds:
+///
+/// - no `AS_CONFED_SEQUENCE` / `AS_CONFED_SET` segment — "declared invalid for
+///   the `AS4_PATH` attribute and MUST NOT be included" (§3);
+/// - at least one non-mappable AS number — otherwise "the NEW BGP speaker MUST
+///   NOT send the `AS4_PATH` attribute" (§4.2.2). It is therefore never empty.
+///
+/// A *received* `AS4_PATH` is raw wire data that may violate both, and stays an
+/// [`AsPath`].
+///
+/// # Examples
+///
+/// ```
+/// use pathvector_types::{As4Path, Asn, AsPath};
+///
+/// let mappable = AsPath::from_sequence(vec![Asn::new(65001)]);
+/// assert!(As4Path::for_two_byte_peer(&mappable).is_none());
+///
+/// let wide = AsPath::from_sequence(vec![Asn::new(131_072)]);
+/// assert_eq!(As4Path::for_two_byte_peer(&wide).unwrap().as_path(), &wide);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct As4Path(AsPath);
+
+impl As4Path {
+    /// Constructs the `AS4_PATH` for `path`, or `None` when none may be sent.
+    ///
+    /// Allocates only when it returns `Some`.
+    #[must_use]
+    pub fn for_two_byte_peer(path: &AsPath) -> Option<Self> {
+        path.segments
+            .iter()
+            .any(|seg| !seg.is_confed() && seg.asns().iter().any(|a| a.is_four_byte()))
+            .then(|| Self(path.strip_confed_segments()))
+    }
+
+    /// The path this `AS4_PATH` carries.
+    #[must_use]
+    pub fn as_path(&self) -> &AsPath {
+        &self.0
+    }
+
+    /// Consumes the value, returning the path it carries.
+    #[must_use]
+    pub fn into_path(self) -> AsPath {
+        self.0
     }
 }
 
@@ -1023,9 +1109,9 @@ mod tests {
         let path = AsPath::from_sequence(vec![Asn::new(65001), Asn::new(131_072), Asn::new(65002)]);
         let (downgraded, orig) = path.downgrade_for_two_byte_peer();
         assert!(orig.is_some(), "substitution occurred");
-        // Original preserved intact.
+        // No confederation segments here, so AS4_PATH carries the whole path.
         let orig = orig.unwrap();
-        assert_eq!(orig.segments(), path.segments());
+        assert_eq!(orig.as_path(), &path);
         // Downgraded has AS_TRANS in place of 131072.
         let segs = downgraded.segments();
         assert_eq!(segs.len(), 1);
@@ -1215,6 +1301,67 @@ mod tests {
         let asns = downgraded.segments()[0].asns();
         assert_eq!(asns[0], Asn::TRANS);
         assert_eq!(asns[1], Asn::new(65002));
+    }
+
+    // ── AS4_PATH construction (RFC 6793 §§3, 4.2.2; issue #109) ─────────────
+
+    /// The `AS4_PATH` payload `path` produces toward a two-octet peer.
+    fn as4_of(path: &AsPath) -> Option<AsPath> {
+        path.downgrade_for_two_byte_peer().1.map(As4Path::into_path)
+    }
+
+    /// RFC 6793 §4.2.2: "Whenever the AS path information contains the
+    /// `AS_CONFED_SEQUENCE` or `AS_CONFED_SET` path segment, the NEW BGP speaker
+    /// MUST exclude such path segments from the `AS4_PATH` attribute being
+    /// constructed." The two-octet `AS_PATH` keeps them.
+    #[test]
+    fn as4_path_excludes_confed_segments_but_as_path_keeps_them() {
+        let path = AsPath::from_segments(vec![cseq(&[65010, 200_000]), seq(&[131_072, 65001])]);
+        assert_eq!(
+            as4_of(&path),
+            Some(AsPath::from_segments(vec![seq(&[131_072, 65001])]))
+        );
+        assert_eq!(
+            path.downgrade_for_two_byte_peer().0,
+            AsPath::from_segments(vec![cseq(&[65010, 23456]), seq(&[23456, 65001])])
+        );
+    }
+
+    /// RFC 6793 §3 declares `AS_CONFED_SET` invalid in `AS4_PATH` as well.
+    /// (RFC 9774 additionally forbids advertising it at all; that is the
+    /// speaker's export rule, not this construction rule.)
+    #[test]
+    fn as4_path_excludes_confed_set() {
+        let path = AsPath::from_segments(vec![
+            AsPathSegment::ConfedSet(vec![Asn::new(65010)]),
+            seq(&[131_072]),
+        ]);
+        assert_eq!(
+            as4_of(&path),
+            Some(AsPath::from_segments(vec![seq(&[131_072])]))
+        );
+    }
+
+    /// Nothing is left to carry once confederation segments are excluded: no
+    /// `AS4_PATH` at all, never an empty one (RFC 6793 §6 calls an `AS4_PATH`
+    /// shorter than 6 octets malformed).
+    #[test]
+    fn confed_only_path_has_no_as4_path() {
+        let path = AsPath::from_segments(vec![cseq(&[200_000, 65010])]);
+        assert_eq!(as4_of(&path), None);
+    }
+
+    /// The only non-mappable AS sits in a confederation segment, which
+    /// `AS4_PATH` may not carry: what remains is all mappable, so "the NEW BGP
+    /// speaker MUST NOT send the `AS4_PATH` attribute" (§4.2.2).
+    #[test]
+    fn non_mappable_asn_only_in_confed_segment_has_no_as4_path() {
+        let path = AsPath::from_segments(vec![cseq(&[200_000]), seq(&[65001])]);
+        assert_eq!(as4_of(&path), None);
+        assert_eq!(
+            path.downgrade_for_two_byte_peer().0,
+            AsPath::from_segments(vec![cseq(&[23456]), seq(&[65001])])
+        );
     }
 
     // ── neighboring_as (RFC 4271 §9.1 step 6 — MED comparison) ───────────────

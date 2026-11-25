@@ -894,6 +894,25 @@ Still open from the same review, deliberately not touched here: #89
 (duplicate announcement / unknown withdrawal, Error Codes 6/7), #93 (stalled-query
 deadlines, retry timing across reconnects), #94 (coverage-claim documentation).
 
+**Update 2026-11-25 — #89 and #91 fixed.** Clauses re-read from rfc-editor.org
+(RFC 8210 §§5, 5.1, 5.6, 5.7, 5.11, 12; RFC 6810 §§5, 5.1, 10; RFC 6811 §2;
+no errata or updating RFC changes them), and the 8210bis-29 draft consulted.
+
+| Area | What was wrong | Resolution |
+|---|---|---|
+| §5.1 Length-delimited framing | The original audit never considered *when* a read can be abandoned: the idle `select!` dropped a half-finished `read_exact`, losing consumed bytes (#89). Tests only ever wrote whole PDUs. | Framing state moved into a pure decoder (`frame.rs`) owned by the connection; black-box tests split a Serial Notify at every offset while the timer fires. |
+| §5.1/§5.6/§5.7 field ranges | "PDU length bound … confirmed correct" covered the PDU's size only. Prefix Length and Max Length were never range-checked: Max Length < Prefix Length was installed and, being *covering* under RFC 6811 §2, turned routes `Invalid` (#91). | Valid-by-construction `Vrp<A>`; violations are Error Report 0 and drop the session. |
+
+Design points the RFCs leave open, recorded so they are not mistaken for
+requirements: address bits beyond the Prefix Length are cleared rather than
+refused (8210bis would refuse them, for protocol version 2 only; note that
+draft names the code "1 (Corrupt Data)" although Corrupt Data is 0), and the
+resume serial is forgotten after a refused record.
+
+Noticed and not fixed: RFC 8210 §12 also defines codes 4 and 5 (and 0) for an
+unsupported protocol version, an unsupported PDU type and a corrupt Length; the
+client ends the session for these without sending a report (`TODO.md` 21a).
+
 ---
 
 # RFC 6811 — BGP Prefix Origin Validation
@@ -1008,6 +1027,35 @@ gaps, and a possible future pass specifically hunting for more
 
 ---
 
+# AS-number rules: RFC 6793, 7607, 9774 (issues #109–#111)
+
+**Audited and fixed:** 2026-11-25
+**Method:** Each clause re-read from the RFC text (7607, 9774, 6793, 7606, and
+5492 §4 for repeated capabilities); tests written from the text and run against
+the unfixed code first.
+
+| Clause | Finding | Resolution |
+|---|---|---|
+| RFC 6793 §4.2.2: confed segments MUST be excluded from AS4_PATH | Public helper returned a copy of the whole path. The daemon builders stripped them already | `As4Path` type, one constructor |
+| RFC 7607 §2: zero peer AS in OPEN → Bad Peer AS | Accepted when `peer_as` was unset, or set to 0 | Checked before the expected-AS match |
+| RFC 7607 §2: MUST NOT initiate a connection claiming AS 0 | Not enforced | FSM and config |
+| RFC 7607 §2: AS 0 in AGGREGATOR / AS4_PATH / AS4_AGGREGATOR is malformed | Accepted | Attribute discard |
+| RFC 7607 §2: MUST NOT originate or propagate | Not enforced on send | `egress.rs` |
+| RFC 7607 index entry (2026-07-16, "genuinely implemented") | **Overclaimed**: that audit checked only configured `remote_as` and received AS_PATH, and marked the RFC ✅ | Corrected |
+| RFC 9774 §3 (published 2025; no earlier audit covered it) | Not implemented in either direction | Receive and send defaults; no operator exception |
+| RFC 7606 §2: treat-as-withdraw covers the UPDATE's routes | `make_treat_as_withdraw` dropped existing MP_UNREACH_NLRI | Kept |
+
+**Interpretations, where the text does not settle it:**
+- RFC 9774 §3 against RFC 6793: a set in AS4_PATH withdraws even where 6793
+  alone would discard the attribute (four-octet session) or the segment
+  (AS_CONFED_SET), by RFC 7606 §3(h).
+- Differing repeated FourByteAsn capabilities: no RFC says which counts; any
+  zero instance is refused. Differing non-zero instances still use the first
+  (see `TODO.md`).
+- A non-mappable AS only inside a confederation segment yields no AS4_PATH.
+
+---
+
 ## Timer supervision (RFC 4271 §4.4/§8.2.2/§10) and RFC 9687 (2026-11-25, issue #102)
 
 **Method:** read RFC 4271 §4.4, §8.2.2, §10, RFC 9687 in full and RFC 8538
@@ -1024,4 +1072,3 @@ whether they are ever delivered while the session is busy.
 | RFC 9687 (`SendHoldTimer`) not implemented at all | Confirmed gap | Implemented; see `pathvector-session/RFC.md` |
 | §10 jitter SHOULD on KeepaliveTimer / ConnectRetryTimer | Confirmed gap (read from code) | Open, `TODO.md` |
 | Hold Timer expiry is reported as `Unclean`, so the daemon retains a GR peer's routes without the N bit, although this side sent a NOTIFICATION and RFC 8538 §4 describes retention after Hold Timer expiry for N-bit speakers | Needs investigation (read from code, not tested) | Open, `TODO.md`; unchanged here |
-

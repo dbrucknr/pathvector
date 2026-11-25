@@ -33,6 +33,11 @@ pub(crate) enum IngressDrop {
     /// AS 0 in AS_PATH. RFC 7607 §2 prohibits it and delegates the handling
     /// of such an UPDATE to RFC 7606, i.e. treat-as-withdraw.
     AsZero,
+    /// An AS_SET or AS_CONFED_SET in AS_PATH. RFC 9774 §3: "MUST use the
+    /// "treat-as-withdraw" error handling behavior". The session decoder
+    /// already does this for wire input; the daemon holds the rule too for a
+    /// session implementation that does not use that decoder.
+    AsSet,
     /// The local AS, or the local AS Confederation Identifier, appears in
     /// AS_PATH. RFC 4271 §9.1.2: "the BGP route should be excluded from the
     /// Phase 2 decision function"; RFC 5065 §4: the Confederation Identifier
@@ -67,7 +72,7 @@ impl IngressDrop {
     /// The treatment this reason requires.
     pub(crate) const fn disposition(self) -> Disposition {
         match self {
-            Self::AsZero | Self::NextHopSyntax => Disposition::TreatAsWithdraw,
+            Self::AsZero | Self::AsSet | Self::NextHopSyntax => Disposition::TreatAsWithdraw,
             Self::AsLoop | Self::NextHopOwnAddress => Disposition::Ineligible,
         }
     }
@@ -76,6 +81,7 @@ impl IngressDrop {
     pub(crate) const fn describe(self) -> &'static str {
         match self {
             Self::AsZero => "AS_PATH contains reserved AS 0 (RFC 7607)",
+            Self::AsSet => "AS_PATH contains AS_SET or AS_CONFED_SET (RFC 9774)",
             Self::AsLoop => {
                 "AS_PATH contains the local AS or confederation ID (RFC 4271 §9.1.2 / RFC 5065 §4)"
             }
@@ -132,11 +138,14 @@ impl IngressGate {
     }
 
     /// Checks an AS_PATH. Shared by every NLRI of an UPDATE, so
-    /// `handle_update` evaluates it once per UPDATE. AS 0 takes precedence
-    /// over a loop: it is the stronger (treat-as-withdraw) verdict.
+    /// `handle_update` evaluates it once per UPDATE. AS 0 and set segments
+    /// take precedence over a loop: theirs is the stronger
+    /// (treat-as-withdraw) verdict.
     pub(crate) fn check_as_path(&self, as_path: &AsPath) -> Option<IngressDrop> {
-        if as_path.contains(Asn::new(0)) {
+        if as_path.contains(Asn::ZERO) {
             Some(IngressDrop::AsZero)
+        } else if as_path.contains_as_set() {
+            Some(IngressDrop::AsSet)
         } else if as_path.contains(self.local_as)
             || self.confederation_id.is_some_and(|id| as_path.contains(id))
         {
@@ -256,6 +265,23 @@ mod tests {
         assert_eq!(
             gate().check_as_path(&path(&[0, LOCAL_AS])),
             Some(IngressDrop::AsZero)
+        );
+    }
+
+    /// RFC 9774 §3: either set type, treat-as-withdraw, outranking a loop.
+    #[test]
+    fn as_sets_are_treat_as_withdraw() {
+        use pathvector_types::AsPathSegment;
+        for segment in [
+            AsPathSegment::Set(vec![Asn::new(LOCAL_AS)]),
+            AsPathSegment::ConfedSet(vec![Asn::new(65002)]),
+        ] {
+            let verdict = gate().check_as_path(&AsPath::from_segments(vec![segment]));
+            assert_eq!(verdict, Some(IngressDrop::AsSet));
+        }
+        assert_eq!(
+            IngressDrop::AsSet.disposition(),
+            Disposition::TreatAsWithdraw
         );
     }
 

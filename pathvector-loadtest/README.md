@@ -20,8 +20,13 @@ Each scenario is a *window*: `/metrics` is scraped at both ends and the
 histograms are diffed, so every report covers exactly that scenario's work.
 The control peer's verdict is **OK** (keepalives on cadence), **LATE**
 (keepalives arrived, but later than 1.5× the cadence) or **FAILED** (silence
-exceeded the hold time, or the session was lost). The process exits non-zero
-on any FAILED window or aborted scenario.
+exceeded the hold time, or the session was lost). Silence is measured from the
+last message heard, starting with the one that completed the handshake. The
+process exits non-zero on any FAILED window or aborted scenario.
+
+Every step that waits on the daemon — a bulk send, a gRPC call, settling — has
+a deadline of `--timeout-secs` (300 by default). A daemon that stops reading or
+answering aborts the run with that step named.
 
 `event_send_blocked` is how long events waited for the daemon's event loop,
 one sample per blocked episode. Since issue #102 the session task is not parked
