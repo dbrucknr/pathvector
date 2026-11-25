@@ -69,7 +69,7 @@ operator's prefix unmasked.
   the masking removed from `CanonicalNlri::new` also measured ~59.5 µs, so the mask
   arithmetic is not the cause; code generation or memory layout is a guess, not verified.
   It does not show at 10 k or for IPv6. `outbound_pipeline` does not settle whether the
-  daemon sees it: it inserts into empty tables, never one of this size.
+  daemon sees it: it inserts into empty tables, never one of this size. Tracked in issue #155.
 
 ---
 
