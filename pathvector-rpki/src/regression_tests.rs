@@ -24,8 +24,8 @@ use tokio::{
 
 use crate::{
     RoaValidity, RtrClient, RtrConfig, RtrHandle, RtrVersion,
-    client::{read_pdu, write_pdu},
-    pdu::{EndOfDataIntervals, Pdu, PrefixFlags},
+    pdu::{EndOfDataIntervals, Pdu},
+    transport::{read_pdu, write_pdu},
 };
 
 // ── Harness ──────────────────────────────────────────────────────────────
@@ -132,13 +132,7 @@ async fn send(stream: &mut TcpStream, version: RtrVersion, pdu: Pdu) {
 }
 
 fn v4(prefix: &str, len: u8, asn: u32) -> Pdu {
-    Pdu::Ipv4Prefix {
-        flags: PrefixFlags { announce: true },
-        prefix_len: len,
-        max_len: len,
-        prefix: prefix.parse().unwrap(),
-        asn,
-    }
+    Pdu::announce_v4(prefix.parse().unwrap(), len, len, asn)
 }
 
 fn eod(session_id: u16, serial: u32) -> Pdu {
@@ -789,45 +783,11 @@ fn assert_matches_serial_query(pdu: Option<&Pdu>) {
 // ── #88: data, serial state and notifications stay consistent ────────────
 
 fn v6(prefix: &str, len: u8, asn: u32) -> Pdu {
-    Pdu::Ipv6Prefix {
-        flags: PrefixFlags { announce: true },
-        prefix_len: len,
-        max_len: len,
-        prefix: prefix.parse().unwrap(),
-        asn,
-    }
+    Pdu::announce_v6(prefix.parse().unwrap(), len, len, asn)
 }
 
 fn withdraw(pdu: Pdu) -> Pdu {
-    match pdu {
-        Pdu::Ipv4Prefix {
-            prefix_len,
-            max_len,
-            prefix,
-            asn,
-            ..
-        } => Pdu::Ipv4Prefix {
-            flags: PrefixFlags { announce: false },
-            prefix_len,
-            max_len,
-            prefix,
-            asn,
-        },
-        Pdu::Ipv6Prefix {
-            prefix_len,
-            max_len,
-            prefix,
-            asn,
-            ..
-        } => Pdu::Ipv6Prefix {
-            flags: PrefixFlags { announce: false },
-            prefix_len,
-            max_len,
-            prefix,
-            asn,
-        },
-        other => panic!("not a prefix PDU: {other:?}"),
-    }
+    pdu.withdrawn()
 }
 
 fn a6() -> std::net::Ipv6Addr {
@@ -1627,4 +1587,548 @@ async fn incremental_transfer_in_flight_at_expiry_is_not_applied_to_the_flushed_
         !handle.status().expired,
         "a completed sync clears `expired`"
     );
+}
+
+// ── #89: a refresh must not lose the bytes of a partially received PDU ───
+
+/// The cache writes the first `split` bytes of a Serial Notify while the
+/// router is idle, and the rest only after the router's *timer-driven* Serial
+/// Query arrives — so the refresh timer provably fired with exactly `split`
+/// bytes of a frame already received. TCP guarantees only the byte stream, so
+/// the router must reassemble the Notify and carry on in the same session.
+///
+/// RFC 8210 §5.2 lets a cache send Serial Notify at any time, and §5.1 makes
+/// the Length field, not the transport's segmentation, delimit a PDU.
+async fn refresh_with_partial_notify_keeps_the_session(version: RtrVersion, split: usize) {
+    const SESSION: u16 = 7;
+    let end_of_data = move |serial: u32| match version {
+        RtrVersion::V0 => Pdu::EndOfData {
+            session_id: SESSION,
+            serial,
+            intervals: None,
+        },
+        // 1 s is the smallest Refresh Interval §6 allows a cache to advertise.
+        RtrVersion::V1 => eod_with(SESSION, serial, 1, 600, 7200),
+    };
+    let mut cache = MockCache::spawn(move |conn, mut s, tap| async move {
+        use tokio::io::AsyncWriteExt;
+        if conn != 0 {
+            hold_open().await;
+        }
+        tap.read(&mut s).await; // Reset Query
+        send(
+            &mut s,
+            version,
+            Pdu::CacheResponse {
+                session_id: SESSION,
+            },
+        )
+        .await;
+        send(&mut s, version, end_of_data(1)).await;
+        let notify = crate::pdu::encode(
+            version,
+            &Pdu::SerialNotify {
+                session_id: SESSION,
+                serial: 2,
+            },
+        );
+        s.write_all(&notify[..split]).await.unwrap();
+        tap.read(&mut s).await; // Serial Query, sent because the timer fired
+        s.write_all(&notify[split..]).await.unwrap();
+        send(
+            &mut s,
+            version,
+            Pdu::CacheResponse {
+                session_id: SESSION,
+            },
+        )
+        .await;
+        send(&mut s, version, end_of_data(2)).await;
+        // Anything further (an Error Report in particular) is reported.
+        while tap.read(&mut s).await.is_some() {}
+        hold_open().await;
+    })
+    .await;
+    cache.config.initial_version = version;
+    // v0 End of Data carries no intervals, so the configured one applies.
+    if version == RtrVersion::V0 {
+        cache.config.refresh_interval = Duration::from_millis(200);
+    }
+
+    let (handle, join) = RtrClient::spawn(cache.config.clone());
+    let ctx = format!("{version:?}, split at byte {split}");
+    cache.next_seen("Reset Query").await;
+    let query = cache.next_seen("timer-driven Serial Query").await;
+    assert_eq!(
+        query.pdu,
+        Pdu::SerialQuery {
+            session_id: SESSION,
+            serial: 1
+        },
+        "{ctx}"
+    );
+    wait_for(&format!("the refresh to complete ({ctx})"), || {
+        handle.status().serial == Some(2) || !handle.status().connected
+    })
+    .await;
+    let status = handle.status();
+    assert_eq!(
+        (status.connected, status.serial, status.last_error),
+        (true, Some(2), None),
+        "{ctx}: the refresh must complete on the original session"
+    );
+    assert_eq!(cache.accepted(), 1, "{ctx}: no reconnect");
+    join.abort();
+}
+
+/// Every proper split point of the 12-byte Serial Notify: all seven partial
+/// headers, the exact header boundary, and all partial bodies.
+async fn every_split_of_a_notify(version: RtrVersion) {
+    let cases: Vec<_> = (1..12)
+        .map(|split| {
+            tokio::spawn(refresh_with_partial_notify_keeps_the_session(
+                version, split,
+            ))
+        })
+        .collect();
+    let mut failed = Vec::new();
+    for (split, case) in (1..12).zip(cases) {
+        if case.await.is_err() {
+            failed.push(split);
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{version:?}: lost bytes at splits {failed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refresh_timer_mid_notify_loses_no_bytes_v1() {
+    every_split_of_a_notify(RtrVersion::V1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refresh_timer_mid_notify_loses_no_bytes_v0() {
+    every_split_of_a_notify(RtrVersion::V0).await;
+}
+
+// ── #91: prefix tuple bounds ─────────────────────────────────────────────
+//
+// RFC 8210 §5.1: Max Length "MUST NOT be less than the Prefix Length
+// element." §5.6 / §5.7: Prefix Length and Max Length are 0..32 for IPv4 and
+// 0..128 for IPv6 (RFC 6810 §5 says the same for version 0). §12 code 0,
+// "Corrupt Data (fatal)": "The receiver believes the received PDU to be
+// corrupt in a manner not specified by another error code", and "Errors which
+// are considered fatal MUST cause the session to be dropped." §5.11: the
+// Error Report carries the erroneous PDU.
+//
+// The PDUs are written as raw bytes: a conforming encoder must not be able to
+// produce them.
+
+#[derive(Debug, Clone, Copy)]
+struct RawPrefix {
+    v6: bool,
+    flags: u8,
+    prefix_len: u8,
+    max_len: u8,
+    asn: u32,
+}
+
+impl RawPrefix {
+    /// Bytes of an IPv4 (192.0.2.0) or IPv6 (`2001:db8::`) Prefix PDU.
+    fn bytes(self, version: RtrVersion) -> Vec<u8> {
+        let address: Vec<u8> = if self.v6 {
+            "2001:db8::"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+                .to_vec()
+        } else {
+            "192.0.2.0".parse::<Ipv4Addr>().unwrap().octets().to_vec()
+        };
+        let mut out = vec![u8::from(version == RtrVersion::V1)];
+        out.push(if self.v6 { 6 } else { 4 });
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&(if self.v6 { 32u32 } else { 20 }).to_be_bytes());
+        out.extend_from_slice(&[self.flags, self.prefix_len, self.max_len, 0]);
+        out.extend_from_slice(&address);
+        out.extend_from_slice(&self.asn.to_be_bytes());
+        out
+    }
+}
+
+/// `(v6, prefix_len, max_len)` tuples the RFC forbids.
+const IMPOSSIBLE_TUPLES: &[(bool, u8, u8)] = &[
+    (false, 24, 16), // Max Length below Prefix Length
+    (false, 32, 31), // ... by one, at the family limit
+    (false, 33, 33), // Prefix Length above 32
+    (false, 24, 33), // Max Length above 32
+    (false, 0, 255), // ... at the field's limit
+    (false, 255, 255),
+    (true, 48, 32), // Max Length below Prefix Length
+    (true, 128, 127),
+    (true, 129, 129), // Prefix Length above 128
+    (true, 64, 129),  // Max Length above 128
+    (true, 255, 255),
+];
+
+/// Initial sync of one VRP, then an incremental update that carries one
+/// valid record followed by `bad`.
+async fn corrupt_record_in_an_update(version: RtrVersion, bad: RawPrefix) {
+    let go = Gate::new();
+    let go_s = go.clone();
+    let end_of_data = move |serial: u32| match version {
+        RtrVersion::V0 => Pdu::EndOfData {
+            session_id: 1,
+            serial,
+            intervals: None,
+        },
+        RtrVersion::V1 => eod(1, serial),
+    };
+    let mut cache = MockCache::spawn(move |conn, mut s, tap| {
+        let go = go_s.clone();
+        async move {
+            use tokio::io::AsyncWriteExt;
+            tap.read(&mut s).await;
+            if conn != 0 {
+                hold_open().await;
+            }
+            send(&mut s, version, Pdu::CacheResponse { session_id: 1 }).await;
+            send(&mut s, version, v4("192.0.2.0", 24, 65001)).await;
+            send(&mut s, version, end_of_data(1)).await;
+            go.wait().await;
+            send(
+                &mut s,
+                version,
+                Pdu::SerialNotify {
+                    session_id: 1,
+                    serial: 2,
+                },
+            )
+            .await;
+            tap.read(&mut s).await; // Serial Query
+            send(&mut s, version, Pdu::CacheResponse { session_id: 1 }).await;
+            send(&mut s, version, v4("198.51.100.0", 24, 65020)).await;
+            s.write_all(&bad.bytes(version)).await.unwrap();
+            // The router may already have dropped the connection.
+            let _ = s
+                .write_all(&crate::pdu::encode(version, &end_of_data(2)))
+                .await;
+            tap.read(&mut s).await; // the Error Report
+            hold_open().await;
+        }
+    })
+    .await;
+    cache.config.initial_version = version;
+
+    let ctx = format!("{version:?} {bad:?}");
+    let (handle, join) = RtrClient::spawn(cache.config.clone());
+    let changed = handle.subscribe();
+    cache.next_seen("Reset Query").await;
+    wait_for("first sync", || handle.status().serial == Some(1)).await;
+    let before = generation(&changed);
+    go.open();
+    cache.next_seen("Serial Query").await;
+
+    wait_for(&format!("the session to be dropped ({ctx})"), || {
+        !handle.status().connected || handle.status().serial == Some(2)
+    })
+    .await;
+    assert!(
+        !handle.status().connected,
+        "{ctx}: corrupt data was committed"
+    );
+
+    // Nothing of the failed update is visible, and the old data is intact.
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::Valid, "{ctx}");
+    assert_eq!(
+        validate(&handle, b(), 65020),
+        RoaValidity::NotFound,
+        "{ctx}"
+    );
+    assert_eq!(handle.status().roa_count, 1, "{ctx}");
+    assert_eq!(generation(&changed), before, "{ctx}: nothing completed");
+
+    let report = cache.next_seen("Error Report").await;
+    assert_eq!(report.conn, 0, "{ctx}");
+    assert_eq!(report.version, version, "{ctx}");
+    assert_eq!(error_report(&report), (0, bad.bytes(version)), "{ctx}");
+
+    // The refused delta would be refused again: ask for the full set.
+    let reconnect = cache.next_seen("first PDU after reconnect").await;
+    assert_eq!(
+        (reconnect.conn, reconnect.pdu),
+        (1, Pdu::ResetQuery),
+        "{ctx}"
+    );
+    join.abort();
+}
+
+#[tokio::test]
+async fn impossible_prefix_tuples_are_corrupt_data_v1() {
+    for &(v6, prefix_len, max_len) in IMPOSSIBLE_TUPLES {
+        for flags in [1, 0] {
+            let bad = RawPrefix {
+                v6,
+                flags,
+                prefix_len,
+                max_len,
+                asn: 65020,
+            };
+            corrupt_record_in_an_update(RtrVersion::V1, bad).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn impossible_prefix_tuples_are_corrupt_data_v0() {
+    for &(v6, prefix_len, max_len) in IMPOSSIBLE_TUPLES {
+        let bad = RawPrefix {
+            v6,
+            flags: 1,
+            prefix_len,
+            max_len,
+            asn: 65020,
+        };
+        corrupt_record_in_an_update(RtrVersion::V0, bad).await;
+    }
+}
+
+/// The boundaries of the legal ranges are accepted, as are set reserved Flags
+/// bits and a non-zero reserved octet (§5: reserved fields "MUST be ignored
+/// on receipt").
+#[tokio::test]
+async fn boundary_prefix_tuples_and_reserved_bits_are_accepted() {
+    let cases = [
+        (false, 0, 0),
+        (false, 0, 32),
+        (false, 32, 32),
+        (true, 0, 0),
+        (true, 0, 128),
+        (true, 128, 128),
+    ];
+    let mut cache = MockCache::spawn(move |_, mut s, tap| async move {
+        use tokio::io::AsyncWriteExt;
+        tap.read(&mut s).await;
+        send(&mut s, RtrVersion::V1, Pdu::CacheResponse { session_id: 1 }).await;
+        for (i, (v6, prefix_len, max_len)) in (0u32..).zip(cases) {
+            let mut bytes = RawPrefix {
+                v6,
+                flags: 0xff, // announce, with every reserved bit set
+                prefix_len,
+                max_len,
+                asn: 64500 + i,
+            }
+            .bytes(RtrVersion::V1);
+            bytes[11] = 0xff; // the reserved "zero" octet
+            s.write_all(&bytes).await.unwrap();
+        }
+        send(&mut s, RtrVersion::V1, eod(1, 1)).await;
+        hold_open().await;
+    })
+    .await;
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    cache.next_seen("Reset Query").await;
+    wait_for("the sync", || handle.status().serial == Some(1)).await;
+    assert_eq!(handle.status().roa_count, cases.len());
+    // The /32 and /128 VRPs match exactly their own host route.
+    assert_eq!(
+        handle.validate_v4("192.0.2.0".parse().unwrap(), 32, 64502),
+        RoaValidity::Valid
+    );
+    assert_eq!(
+        handle.validate_v6("2001:db8::".parse().unwrap(), 128, 64505),
+        RoaValidity::Valid
+    );
+}
+
+/// The same for the very first (Reset Query) load: nothing at all becomes
+/// visible. Before the bounds were checked, the 192.0.2.0/24 "max length 16"
+/// record below was installed and made every route under it `Invalid`
+/// (RFC 6811 §2: covered, never matched).
+#[tokio::test]
+async fn impossible_tuple_in_the_initial_load_publishes_nothing() {
+    let bad = RawPrefix {
+        v6: false,
+        flags: 1,
+        prefix_len: 24,
+        max_len: 16,
+        asn: 65001,
+    };
+    let mut cache = MockCache::spawn(move |conn, mut s, tap| async move {
+        use tokio::io::AsyncWriteExt;
+        tap.read(&mut s).await;
+        if conn != 0 {
+            hold_open().await;
+        }
+        send(&mut s, RtrVersion::V1, Pdu::CacheResponse { session_id: 1 }).await;
+        s.write_all(&bad.bytes(RtrVersion::V1)).await.unwrap();
+        tap.read(&mut s).await; // the Error Report
+        hold_open().await;
+    })
+    .await;
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    cache.next_seen("Reset Query").await;
+    let report = cache.next_seen("Error Report").await;
+    assert_eq!(error_report(&report), (0, bad.bytes(RtrVersion::V1)));
+    wait_for("the session to be dropped", || {
+        handle.status().last_error.is_some()
+    })
+    .await;
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::NotFound);
+    let status = handle.status();
+    assert_eq!((status.roa_count, status.serial), (0, None));
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some("RTR PDU error: invalid Prefix PDU: Max Length 16 is less than Prefix Length 24")
+    );
+}
+
+/// A corrupt PDU is corrupt whenever it arrives, including between exchanges.
+#[tokio::test]
+async fn impossible_tuple_while_idle_is_reported_as_corrupt_data() {
+    let bad = RawPrefix {
+        v6: true,
+        flags: 1,
+        prefix_len: 129,
+        max_len: 129,
+        asn: 65001,
+    };
+    let mut cache = MockCache::spawn(move |conn, mut s, tap| async move {
+        use tokio::io::AsyncWriteExt;
+        tap.read(&mut s).await;
+        if conn != 0 {
+            hold_open().await;
+        }
+        send(&mut s, RtrVersion::V1, Pdu::CacheResponse { session_id: 1 }).await;
+        send(&mut s, RtrVersion::V1, v4("192.0.2.0", 24, 65001)).await;
+        send(&mut s, RtrVersion::V1, eod(1, 1)).await;
+        s.write_all(&bad.bytes(RtrVersion::V1)).await.unwrap();
+        tap.read(&mut s).await; // the Error Report
+        hold_open().await;
+    })
+    .await;
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    cache.next_seen("Reset Query").await;
+    let report = cache.next_seen("Error Report").await;
+    assert_eq!(error_report(&report), (0, bad.bytes(RtrVersion::V1)));
+    assert_eq!(
+        validate(&handle, a(), 65001),
+        RoaValidity::Valid,
+        "completed data stays"
+    );
+}
+
+/// Address bits beyond the Prefix Length are not part of the Prefix (RFC 6811
+/// §2), so they distinguish neither the VRP nor its withdrawal.
+#[tokio::test]
+async fn trailing_address_bits_do_not_affect_a_vrp_or_its_withdrawal() {
+    let go = Gate::new();
+    let go_s = go.clone();
+    let mut cache = MockCache::spawn(move |_, mut s, tap| {
+        let go = go_s.clone();
+        async move {
+            tap.read(&mut s).await;
+            send(&mut s, RtrVersion::V1, Pdu::CacheResponse { session_id: 1 }).await;
+            send(&mut s, RtrVersion::V1, v4("192.0.2.99", 24, 65001)).await;
+            send(&mut s, RtrVersion::V1, eod(1, 1)).await;
+            go.wait().await;
+            notify(&mut s, RtrVersion::V1, 1, 2).await;
+            tap.read(&mut s).await;
+            send(&mut s, RtrVersion::V1, Pdu::CacheResponse { session_id: 1 }).await;
+            send(
+                &mut s,
+                RtrVersion::V1,
+                withdraw(v4("192.0.2.200", 24, 65001)),
+            )
+            .await;
+            send(&mut s, RtrVersion::V1, eod(1, 2)).await;
+            hold_open().await;
+        }
+    })
+    .await;
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    cache.next_seen("Reset Query").await;
+    wait_for("first sync", || handle.status().serial == Some(1)).await;
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::Valid);
+    go.open();
+    wait_for("withdrawal", || handle.status().serial == Some(2)).await;
+    assert_eq!(validate(&handle, a(), 65001), RoaValidity::NotFound);
+    assert_eq!(handle.status().roa_count, 0);
+}
+
+// ── Cost report ──────────────────────────────────────────────────────────
+
+/// Full-load wall time, from the router's Reset Query reaching the cache to
+/// the completed-sync notification, over loopback TCP with the whole response
+/// written at once. Run with
+/// `cargo test --release -p pathvector-rpki -- --ignored --nocapture sync_cost`.
+///
+/// Each run opens ~600 short connections; many back-to-back runs exhaust the
+/// ephemeral port range (reported as a stall with the connect error).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmark: prints timings, asserts nothing"]
+async fn sync_cost_report() {
+    use tokio::io::AsyncWriteExt;
+
+    for (records, iterations) in [(100u32, 301), (1_000, 201), (10_000, 101)] {
+        let mut response =
+            crate::pdu::encode(RtrVersion::V1, &Pdu::CacheResponse { session_id: 1 });
+        for i in 0..records {
+            let address = Ipv4Addr::from(0x0a00_0000 + (i << 8));
+            response.extend(crate::pdu::encode(
+                RtrVersion::V1,
+                &v4(&address.to_string(), 24, 64500),
+            ));
+        }
+        response.extend(crate::pdu::encode(RtrVersion::V1, &eod(1, 1)));
+        let response = Arc::new(response);
+
+        let mut samples = Vec::new();
+        for _ in 0..iterations {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let response = Arc::clone(&response);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                read_pdu(&mut s).await.unwrap();
+                let _ = started_tx.send(std::time::Instant::now());
+                s.write_all(&response).await.unwrap();
+                hold_open().await;
+            });
+            let (handle, join) = RtrClient::spawn(RtrConfig {
+                port,
+                ..Default::default()
+            });
+            let mut changed = handle.subscribe();
+            // A failed attempt would sit out the 600 s retry interval: say why
+            // instead.
+            let stalled = |handle: &RtrHandle| -> ! {
+                panic!("sync stalled: {:?}", handle.status().last_error)
+            };
+            let limit = Duration::from_secs(5);
+            let Ok(started) = tokio::time::timeout(limit, started_rx).await else {
+                stalled(&handle)
+            };
+            let started = started.unwrap();
+            if tokio::time::timeout(limit, changed.changed())
+                .await
+                .is_err()
+            {
+                stalled(&handle)
+            }
+            samples.push(started.elapsed());
+            assert_eq!(handle.status().roa_count, records as usize);
+            join.abort();
+            server.abort();
+        }
+        samples.sort();
+        println!(
+            "full sync of {records:>6} VRPs: median {:?} (min {:?}, {iterations} runs)",
+            samples[samples.len() / 2],
+            samples[0]
+        );
+    }
 }
