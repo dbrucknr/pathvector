@@ -4,27 +4,127 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
-## 2026-11-25 (pathvectord: route-reflector non-client split-horizon on every send path)
+## 2026-11-25 (pathvector-rib: one destination, one key — issue #71)
 
-On a route reflector, a route from a non-client iBGP peer goes to clients only (RFC 4456 §6).
-Only incremental propagation and the opening table dump applied that rule (issue #168):
+RFC 4271 §4.3 says of the bits that pad a prefix to an octet boundary that "the value of
+[the] trailing bits is irrelevant" (RFC 4760 §5 repeats it for the multiprotocol
+attributes). `Nlri` keeps whatever bits it is built with, and `LocRib`, `AdjRibIn` and
+`AdjRibOut` keyed their hash maps on that raw value while the best-path prefix tree masked
+it. Inserting `10.1.2.3/8` left `longest_match(10.9.8.7)` returning `None` and
+`best_routes()` empty beside `len() == 1`; two spellings of one destination became two
+entries that never competed in best-path selection. The session decoders mask, so wire
+ingestion was not affected, but the management API was: `OriginateRoute` parses the
+operator's prefix unmasked.
 
-- Session loss, Graceful Restart stale marking, End-of-RIB prune, deadline expiry and
-  export-policy changes reflected one non-client's route to another.
-- A non-client holding a client's route was sent no withdrawal when a non-client's path took over
-  as best, and kept the old route. RFC 4271 §9.1.3: "the previously advertised route in that
-  Adj-RIB-Out MUST be withdrawn from service".
-- The rule looked up the source's live session, so a peer connecting while a non-client's routes
-  were retained for Graceful Restart was sent them.
-- The rule was skipped when the source peer was reached over IPv6.
+- `pathvector-rib`: new crate-private `CanonicalNlri` whose only constructor masks. Every
+  RIB map and `BestTable` is declared in terms of it, so a non-canonical key cannot be
+  stored. It implements neither `Borrow<Nlri>` nor `Deref`, so a map cannot be probed with
+  a raw `Nlri`. Public signatures are unchanged. (`ipnetx` 0.3.0 provides
+  `IpPrefix::masked`, used underneath, but no canonical-prefix type.)
+- `pathvectord`: `originate_routes` / `withdraw_originated_routes` (IPv4 and IPv6) mask at
+  the boundary, so `originated_routes`, route events and UPDATEs carry one spelling.
+  `GetBestRoute` and `ListCandidates` label results with the stored NLRI.
+- Behavior change: `Route::nlri`, iterator keys and `BestPathChange` prefixes are always
+  canonical, whatever was supplied.
+- Docs: `LocRib`'s rustdoc had been attached to the `RibView` trait declared below it; the
+  trait now sits above.
+- Proof: `pathvector-rib/tests/canonical_prefix.rs` — the reported reproductions, host-bit
+  variants at non-octet-aligned lengths (including /0, /31) through every entry point in
+  both families, and properties comparing the hash-keyed and prefix-tree views with an
+  independently masked model after every step of random operation sequences. 16 of its 17
+  tests failed before the fix (the other guards that host routes are *not* merged), as did
+  the three `issue_71_*` daemon tests. `canonical::tests` checks every length of both
+  families.
+- Benchmarks (Apple M2 Max, release, jemalloc; old → new; minimum of five rounds that
+  alternated the two binaries, because other work was loading the machine). The new
+  `prefix_keyed_ops` bench times one pass over all `n` prefixes:
 
-The rule now lives in `propagate_prefix` / `propagate_prefix_v6`, which every send path goes
-through, and an excluded route yields a withdrawal if it was advertised before. It reads the
-source's peer type from the route itself, so it still holds once the session is gone.
+  | IPv4 | 100 | 1 k | 10 k | Takeaway |
+  |---|---|---|---|---|
+  | `LocRib::insert` | 29.9 → 29.9 µs | 300 → 299 µs | 3.16 → 3.14 ms | unchanged |
+  | `LocRib::best` | 2.45 → 2.43 µs | 24.8 → 24.1 µs | 264 → 252 µs | unchanged |
+  | `LocRib::longest_match` | 3.04 → 3.00 µs | 30.4 → 29.5 µs | 314 → 313 µs | unchanged |
+  | `LocRib::withdraw` | 28.4 → 28.4 µs | 299 → 300 µs | 3.21 → 3.25 ms | unchanged |
+  | `AdjRibIn` insert + get + withdraw | 2.90 → 3.13 µs | 32.1 → 34.4 µs | 374 → 396 µs | +6–8 %, about 2 ns per prefix for three canonicalizations |
+  | `AdjRibOut` insert + get + withdraw | 3.66 → 5.86 µs | 41.8 → 60.6 µs | 467 → 450 µs | see below |
 
-Tests: `daemon/rr_split_horizon_tests.rs`. IPv6 session loss without Graceful Restart still sends
-nothing (issue #160), so the IPv6 teardown cases use the flush of a family not covered by the
-Graceful Restart capability.
+  | IPv6 | 100 | 1 k | 10 k | Takeaway |
+  |---|---|---|---|---|
+  | `LocRib::insert` | 38.8 → 38.0 µs | 391 → 387 µs | 3.97 → 4.00 ms | unchanged |
+  | `LocRib::best` | 5.54 → 5.53 µs | 59.2 → 59.3 µs | 568 → 560 µs | unchanged |
+  | `LocRib::longest_match` | 6.74 → 6.63 µs | 70.3 → 69.9 µs | 710 → 700 µs | unchanged (was +10–19 % until tree reads stopped re-masking) |
+  | `LocRib::withdraw` | 37.8 → 37.4 µs | 372 → 374 µs | 3.92 → 3.85 ms | unchanged |
+  | `AdjRibIn` insert + get + withdraw | 3.52 → 3.66 µs | 37.8 → 40.5 µs | 464 → 470 µs | +1–7 % |
+  | `AdjRibOut` insert + get + withdraw | 4.20 → 4.22 µs | 45.6 → 48.5 µs | 517 → 546 µs | 0–6 % |
+
+  Existing benches: `loc_rib_insert_steady` (best-path hot path) `hot` 534 → 511 ns,
+  538 → 505 ns, 538 → 508 ns and `scattered` 600 → 599 ns, 1.20 → 1.07 µs, 1.36 → 1.42 µs at
+  10 k / 100 k / 500 k; `outbound_pipeline` (`AdjRibOut::insert` into empty tables) 1–4 % faster at
+  1 / 10 / 50 peers; `peer_win_count/scan` (the pre-#106 scan, no longer a daemon path)
+  4–11 % slower, because `best_peer` now canonicalizes its argument.
+
+  The `AdjRibOut` IPv4 figures at 100 and 1 k are unexplained. The old binary varies a lot
+  from run to run (1 k: 42–58 µs) while the new one sits near 60 µs, so the new code is
+  slower in most runs, by anything from a few percent to about 45 %. A throwaway build with
+  the masking removed from `CanonicalNlri::new` also measured ~59.5 µs, so the mask
+  arithmetic is not the cause; code generation or memory layout is a guess, not verified.
+  It does not show at 10 k or for IPv6. `outbound_pipeline` does not settle whether the
+  daemon sees it: it inserts into empty tables, never one of this size. Tracked in issue #155.
+
+---
+
+## 2026-11-25 (a session the daemon resets reconnects; a prefix limit keeps it down unless told to restart)
+
+`pathvectord` reset sessions with `SessionCommand::Stop` and `SessionCommand::Notification`, both of
+which the session treats as an operator stop: it goes to Idle with no ConnectRetry timer, and the
+daemon only sends `Start` when a peer is added. That is right for some of the daemon's resets and
+wrong for others. A reset for a full outbound UPDATE channel (whose log line said the session would
+re-establish) or for an UPDATE error the daemon detects, such as RFC 7606 §5.2, left the peer down
+until an operator acted. So did a maximum-prefix Cease even with `max_prefixes_restart` set, as the
+idle-hold expiry only removed its own deadline.
+
+**Behaviour changes**
+
+- A stalled peer and a daemon-detected UPDATE error now reconnect after `connect_retry_time`, using
+  the new `SessionCommand::AutomaticStop(notification)`.
+- Maximum-prefix, `max_prefixes_restart` absent or `0`: the session stays down, as it did before. It
+  neither dials nor accepts a connection, and no other daemon reset brings it back. Clear it by
+  restarting the daemon, or with `RemovePeer` then `AddPeer`. A peer re-added that way has only the
+  settings `AddPeer` carries, which do not include a prefix limit, until a daemon restart. The config
+  documentation used to say such a peer would reconnect.
+- Maximum-prefix, positive `max_prefixes_restart`: the session is started that many seconds after
+  the Cease, whether that is shorter or longer than `connect_retry_time`. It does not dial or accept
+  connections in between.
+- `RemovePeer` now completes for a peer held down by its prefix limit. It used to leave the peer in
+  `pending_removal` for good, so a following `AddPeer` was dropped.
+- Cease subcodes: a stalled peer gets Out of Resources (was Administrative Shutdown). A session
+  refused while held down gets Connection Rejected.
+- An Idle session now closes an inbound connection. It used to take the socket and ignore it, which
+  left the peer's connection open and unanswered.
+- `Stop` and `Notification` sent while a reconnect is pending now cancel it, and `Notification` now
+  stops the session from every state. Both used to be ignored in places, and the session dialled
+  again.
+- A teardown now completes when its NOTIFICATION cannot be written. The session used to abandon
+  the rest of the teardown: no `Terminated` event, so the daemon was never told the session had
+  ended, and no reconnect timer. This also affected hold timer expiry and `Stop` before this change.
+- `FsmInput::ProtocolErrorNotificationToSend` is renamed to `FsmInput::AutomaticStop`. Nothing
+  outside the FSM's own tests constructed it.
+
+**RFC basis**
+
+RFC 4271 §8.1.2 defines Event 2 (ManualStop, by the administrator) and Event 8 (AutomaticStop, by the
+local system, with a maximum-prefix limit as its example). §8.2.2 leaves both in Idle. Whether and
+when to start again is local policy: §8.1.1 `AllowAutomaticStart`, and the `IdleHoldTimer` that
+holds a peer in Idle for a set time. §6.7 makes terminating on a prefix limit a matter of local
+configuration and requires the Cease. §8.2.2 Idle: "the BGP FSM refuses all incoming BGP
+connections for this peer."
+
+**Tests**
+
+`pathvectord/src/daemon/session_restart_tests.rs` runs a real session against the event loop and
+command processor. `pathvector-session/tests/stop_and_restart.rs` covers the session commands.
+`event_loop_idle_hold_blocks_reconnect` had been passing for the wrong reason: its fixture dropped
+the update receiver, so the `Stop` it saw was the stalled-peer one.
 
 ---
 

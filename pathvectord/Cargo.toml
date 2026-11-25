@@ -44,6 +44,7 @@ proptest          = { workspace = true }
 pathvector-client = { workspace = true }
 pathvector-rpki   = { workspace = true, features = ["test-util"] }
 tempfile          = "3"
+tokio-util        = { workspace = true }
 tokio             = { workspace = true, features = ["test-util"] }
 metrics-util      = "0.19"
 

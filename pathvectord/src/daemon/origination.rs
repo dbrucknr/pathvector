@@ -17,7 +17,11 @@ impl DaemonState {
     /// Export policy still applies on the outbound side.
     pub(crate) fn originate_routes(&mut self, routes: Vec<Route<Ipv4Addr>>) {
         let mut nlris = Vec::with_capacity(routes.len());
-        for route in routes {
+        for mut route in routes {
+            // Bits beyond the prefix length are irrelevant (RFC 4271 §4.3):
+            // track, report and advertise the one canonical spelling, which
+            // is also what the RIB stores.
+            route.nlri = route.nlri.masked();
             let nlri = route.nlri;
             self.rib_mut().originated_routes.insert(nlri);
             // Borrow for the event before moving into rib_insert_v4.
@@ -50,7 +54,8 @@ impl DaemonState {
     /// them in a single pass (one `propagate_to_all_peers_v6` call).
     pub(crate) fn originate_routes_v6(&mut self, routes: Vec<Route<Ipv6Addr>>) {
         let mut nlris = Vec::with_capacity(routes.len());
-        for route in routes {
+        for mut route in routes {
+            route.nlri = route.nlri.masked();
             let nlri = route.nlri;
             self.rib_mut().originated_routes_v6.insert(nlri);
             // Borrow for the event before moving into rib_insert_v6.
@@ -85,7 +90,8 @@ impl DaemonState {
     /// Withdraws a batch of locally originated routes in a single propagation
     /// pass.
     pub(crate) fn withdraw_originated_routes(&mut self, nlris: &[Nlri<Ipv4Addr>]) {
-        for nlri in nlris {
+        let nlris: Vec<_> = nlris.iter().map(|n| n.masked()).collect();
+        for nlri in &nlris {
             self.rib_mut().originated_routes.remove(nlri);
             let fib_change = self.rib_withdraw_v4(&PeerId::from(LOCAL_ORIGIN_PEER), nlri);
             self.program_fib_v4(RibEffects::from_best(vec![fib_change]));
@@ -95,7 +101,7 @@ impl DaemonState {
                 withdrawn_prefix: Some(nlri.to_string()),
             });
         }
-        self.propagate_to_all_peers(nlris);
+        self.propagate_to_all_peers(&nlris);
         self.flush_pending();
         crate::metrics::update_originated_routes(
             self.rib.originated_routes.len(),
@@ -113,7 +119,8 @@ impl DaemonState {
     /// Withdraws a batch of locally originated IPv6 routes in a single
     /// propagation pass.
     pub(crate) fn withdraw_originated_routes_v6(&mut self, nlris: &[Nlri<Ipv6Addr>]) {
-        for nlri in nlris {
+        let nlris: Vec<_> = nlris.iter().map(|n| n.masked()).collect();
+        for nlri in &nlris {
             self.rib_mut().originated_routes_v6.remove(nlri);
             let fib_change = self.rib_withdraw_v6(&PeerId::from(LOCAL_ORIGIN_PEER), nlri);
             self.program_fib_v6(RibEffects::from_best(vec![fib_change]));
@@ -123,7 +130,7 @@ impl DaemonState {
                 withdrawn_prefix: Some(nlri.to_string()),
             });
         }
-        self.propagate_to_all_peers_v6(nlris);
+        self.propagate_to_all_peers_v6(&nlris);
         self.flush_pending();
         crate::metrics::update_originated_routes(
             self.rib.originated_routes.len(),
@@ -315,6 +322,71 @@ mod tests {
             originated_routes_gauge(&snap, "ipv6"),
             Some(&DebugValue::Gauge(0.0.into())),
             "withdraw_originated_routes_v6 must update the gauge back to 0"
+        );
+    }
+
+    /// Issue #71: two spellings of one destination (RFC 4271 §4.3: trailing
+    /// bits are irrelevant) are one originated route — announced to peers with
+    /// the canonical prefix, tracked once, and withdrawable by any spelling.
+    #[test]
+    fn issue_71_originated_host_bit_variants_are_one_route_on_the_wire() {
+        let peer = IpAddr::V4(PEER_IP);
+        let (mut state, mut rxs) = make_state(LOCAL_AS, &[(peer, PEER_AS)]);
+        state.on_established(peer, PEER_IP, PeerType::External, PEER_AS, 90, &[], None);
+        let rx = rxs.get_mut(&peer).unwrap();
+        while rx.try_recv().is_ok() {}
+        let canonical: Nlri<Ipv4Addr> = "10.0.0.0/8".parse().unwrap();
+
+        state.originate_route(route_v4("10.1.2.3/8"));
+        state.originate_route(route_v4("10.200.0.1/8"));
+
+        let mut announced = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            announced.extend(msg.announced);
+        }
+        assert!(!announced.is_empty());
+        assert!(announced.iter().all(|n| *n == canonical), "{announced:?}");
+        assert_eq!(state.rib.originated_routes.len(), 1);
+        assert_eq!(state.rib.loc_rib.len(), 1);
+
+        state.withdraw_originated_route("10.9.9.9/8".parse().unwrap());
+
+        let mut withdrawn = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            withdrawn.extend(msg.withdrawn);
+        }
+        assert_eq!(withdrawn, vec![canonical]);
+        assert!(state.rib.originated_routes.is_empty());
+        assert!(state.rib.loc_rib.is_empty());
+    }
+
+    /// The IPv6 half of the above (RFC 4760 §5: "the value of trailing bits is
+    /// irrelevant"), observed at the FIB boundary.
+    #[test]
+    fn issue_71_originated_v6_host_bit_variants_are_one_route() {
+        let (mut state, _rxs) = make_state(LOCAL_AS, &[(IpAddr::V4(PEER_IP), PEER_AS)]);
+        let fib = with_recording_fib(&mut state);
+        let canonical: Nlri<Ipv6Addr> = "2001:db8:8::/45".parse().unwrap();
+
+        state.originate_route_v6(route_v6("2001:db8:9::1/45"));
+        state.originate_route_v6(route_v6("2001:db8:f:ffff::/45"));
+        assert_eq!(state.rib.originated_routes_v6.len(), 1);
+        assert_eq!(state.rib.loc_rib_v6.len(), 1);
+
+        state.withdraw_originated_route_v6("2001:db8:a::/45".parse().unwrap());
+        assert!(state.rib.originated_routes_v6.is_empty());
+        assert!(state.rib.loc_rib_v6.is_empty());
+
+        let changes = fib.v6.lock().unwrap().clone();
+        assert!(changes.iter().all(|c| match c {
+            BestPathChange::Announced(n, r) => *n == canonical && r.nlri == canonical,
+            BestPathChange::Withdrawn(n) => *n == canonical,
+            BestPathChange::Unchanged => true,
+        }));
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, BestPathChange::Withdrawn(_)))
         );
     }
 }
