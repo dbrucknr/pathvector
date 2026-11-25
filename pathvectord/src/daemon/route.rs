@@ -5,6 +5,18 @@ use crate::outbound::{DecisionKind, OutboundDecision};
 use pathvector_types::IpAddress;
 
 impl DaemonState {
+    /// Applies one UPDATE from `peer_ip`, returning the NOTIFICATION to send if
+    /// it requires the session to be reset.
+    ///
+    /// The UPDATE is ignored, with no effect on any table and no NOTIFICATION,
+    /// unless the session is registered: between [`on_established`] and
+    /// [`on_terminated`]. A session `run_event_loop` refused (max-prefix
+    /// idle-hold) is never registered, but its UPDATEs may already be queued
+    /// behind its `Established`. RFC 4271 §9: "An UPDATE message may be
+    /// received only in the Established state."
+    ///
+    /// [`on_established`]: DaemonState::on_established
+    /// [`on_terminated`]: DaemonState::on_terminated
     #[allow(clippy::similar_names)]
     pub(crate) fn on_route_update(
         &mut self,
@@ -18,6 +30,12 @@ impl DaemonState {
             attrs = msg.attributes.len(),
             "on_route_update called"
         );
+        // Must stay ahead of everything below, End-of-RIB handling included.
+        // `debug`, not `warn`: a refused session can have a full table queued.
+        let Some(peer_type) = self.rib.peer_types.get(&peer_ip).copied() else {
+            tracing::debug!(peer = %peer_ip, "ignoring UPDATE from an unregistered session");
+            return None;
+        };
         // RFC 4724 §2 — detect End-of-RIB markers before any other processing.
         // IPv4 EOR: minimum-length UPDATE (all fields empty).
         if msg.withdrawn.is_empty() && msg.attributes.is_empty() && msg.announced.is_empty() {
@@ -72,12 +90,6 @@ impl DaemonState {
         }
 
         let peer_id = PeerId::from(peer_ip);
-        let peer_type = self
-            .rib
-            .peer_types
-            .get(&peer_ip)
-            .copied()
-            .unwrap_or(PeerType::External);
         // RFC 4271 §9.1.2.2 (f): best-path step (f) needs the peer's BGP
         // Identifier, distinct from `peer_ip` (the session's transport
         // address) — see `Route::peer_bgp_id`'s doc comment. `None` if
