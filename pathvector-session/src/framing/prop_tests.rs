@@ -24,7 +24,7 @@ fn arb_ipv6() -> impl Strategy<Value = Ipv6Addr> {
 }
 
 fn arb_asn() -> impl Strategy<Value = Asn> {
-    any::<u32>().prop_map(Asn::new)
+    (1..=u32::MAX).prop_map(Asn::new)
 }
 
 fn arb_afi_safi() -> impl Strategy<Value = AfiSafi> {
@@ -41,13 +41,15 @@ fn arb_nlri_v6() -> impl Strategy<Value = Nlri<Ipv6Addr>> {
         .prop_map(|(addr, len)| Nlri::new(Ipv6Addr::from(addr), len).unwrap().masked())
 }
 
+/// Only what a clean UPDATE may carry: no AS 0 (RFC 7607) and no set segments
+/// (RFC 9774). `as_rules_tests` covers the rest.
 fn arb_as_path() -> impl Strategy<Value = AsPath> {
     prop_oneof![
         prop::collection::vec(arb_asn(), 1..5).prop_map(AsPath::from_sequence),
         prop::collection::vec(
             prop_oneof![
                 prop::collection::vec(arb_asn(), 1..4).prop_map(AsPathSegment::Sequence),
-                prop::collection::vec(arb_asn(), 1..4).prop_map(AsPathSegment::Set),
+                prop::collection::vec(arb_asn(), 1..4).prop_map(AsPathSegment::ConfedSequence),
             ],
             1..3,
         )

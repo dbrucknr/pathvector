@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use pathvector_session::message::{BgpMessage, PathAttribute, UpdateMessage};
-use pathvector_types::{AsPath, Asn, Nlri, Origin};
+use pathvector_types::{Aggregator, AsPath, Asn, Nlri, Origin};
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
 
@@ -69,6 +69,33 @@ fn bench_decode_update(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Benchmark: decode, attribute-heavy ───────────────────────────────────────
+
+/// One UPDATE, one prefix, with a realistic `AS_PATH` length and an `AGGREGATOR`:
+/// the per-UPDATE cost of attribute validation (RFC 7606 / 7607 / 9774) shows
+/// here rather than being hidden behind NLRI parsing.
+fn bench_decode_update_long_path(c: &mut Criterion) {
+    let mut group = c.benchmark_group("decode_update_path_len");
+
+    for len in [4u32, 32, 128] {
+        let mut msg = build_update(1);
+        msg.attributes[1] = PathAttribute::AsPath(AsPath::from_sequence(
+            (0..len).map(|i| Asn::new(65_000 + i)).collect(),
+        ));
+        msg.attributes
+            .push(PathAttribute::Aggregator(Aggregator::new(
+                Asn::new(65_000),
+                Ipv4Addr::new(192, 0, 2, 2),
+            )));
+        let wire = encode_update(&msg);
+        group.bench_with_input(BenchmarkId::from_parameter(len), &wire, |b, w| {
+            b.iter(|| BgpMessage::decode(w).unwrap());
+        });
+    }
+
+    group.finish();
+}
+
 // ── Benchmark: encode withdrawal ──────────────────────────────────────────────
 
 fn bench_encode_withdraw(c: &mut Criterion) {
@@ -95,6 +122,7 @@ criterion_group!(
     benches,
     bench_encode_update,
     bench_decode_update,
+    bench_decode_update_long_path,
     bench_encode_withdraw
 );
 criterion_main!(benches);
