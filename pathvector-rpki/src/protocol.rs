@@ -23,10 +23,13 @@
 //! Every way a cache can break the contract is a [`Violation`], which says in
 //! one value what to tell the cache (Error Report), what to do to the data
 //! ([`Consequence`]) and what error to surface — so the I/O loop cannot
-//! forget a part of the RFC-mandated reaction.
+//! forget a part of the RFC-mandated reaction. That includes bytes that never
+//! became a PDU: [`on_malformed`] turns the decoder's refusal into the same
+//! [`Violation`], or says to ignore it.
 
 use crate::{
     error::{PduError, RtrError, VrpError},
+    frame::FrameError,
     pdu::{EndOfDataIntervals, Pdu, RtrVersion},
 };
 
@@ -37,6 +40,8 @@ pub(crate) const ERROR_CODE_CORRUPT_DATA: u16 = 0;
 pub(crate) const ERROR_CODE_NO_DATA_AVAILABLE: u16 = 2;
 /// RFC 8210 §12 error code 4 ("Unsupported Protocol Version").
 pub(crate) const ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION: u16 = 4;
+/// RFC 8210 §12 error code 5 ("Unsupported PDU Type").
+pub(crate) const ERROR_CODE_UNSUPPORTED_PDU_TYPE: u16 = 5;
 /// RFC 8210 §12 error code 8 ("Unexpected Protocol Version").
 pub(crate) const ERROR_CODE_UNEXPECTED_PROTOCOL_VERSION: u16 = 8;
 
@@ -166,6 +171,11 @@ pub(crate) struct Violation {
 }
 
 impl Violation {
+    const UNEXPECTED_VERSION_REPORT: ErrorReportSpec = ErrorReportSpec {
+        code: ERROR_CODE_UNEXPECTED_PROTOCOL_VERSION,
+        text: "unexpected protocol version",
+    };
+
     /// RFC 8210 §5.1: Session ID mismatch ⇒ "MUST immediately terminate the
     /// session with an Error Report PDU with code 0 ("Corrupt Data"), and the
     /// router MUST flush all data learned from that cache."
@@ -188,10 +198,7 @@ impl Violation {
     fn unexpected_version(expected: RtrVersion, got: RtrVersion) -> Self {
         Self {
             error: RtrError::UnexpectedVersion { expected, got },
-            report: Some(ErrorReportSpec {
-                code: ERROR_CODE_UNEXPECTED_PROTOCOL_VERSION,
-                text: "unexpected protocol version",
-            }),
+            report: Some(Self::UNEXPECTED_VERSION_REPORT),
             consequence: Consequence::Drop,
         }
     }
@@ -215,32 +222,96 @@ impl Violation {
         }
     }
 
-    /// The peer sent bytes that are not a legal PDU.
+    /// The peer sent a PDU that cannot be decoded.
     ///
-    /// A Prefix PDU whose lengths RFC 8210 §§5.1, 5.6 and 5.7 forbid is §12
-    /// error 0, "Corrupt Data (fatal)": "The receiver believes the received
-    /// PDU to be corrupt in a manner not specified by another error code", and
-    /// "Errors which are considered fatal MUST cause the session to be
-    /// dropped" (RFC 6810 §10: SHOULD). The installed VRPs came from a
-    /// completed transfer and stay; the resume point is forgotten, because a
-    /// Serial Query from it would only be answered with the same refused
-    /// change set. (The RFCs do not say what to ask for next.)
-    pub(crate) fn malformed(error: PduError) -> Self {
-        let PduError::InvalidPrefix(invalid) = error else {
-            return Self::plain(RtrError::Pdu(error));
+    /// Which rule applies, in order:
+    ///
+    /// 1. §5.11: "An Error Report PDU MUST NOT be sent for an Error Report
+    ///    PDU. If an erroneous Error Report PDU is received, the session
+    ///    SHOULD be dropped." Nothing is said, and nothing is concluded about
+    ///    the cache's data.
+    /// 2. §7: once the version is agreed, a PDU "for a different Protocol
+    ///    Version" — known or not — drops the session with Error Report 8. Its
+    ///    type and Length belong to a version this session does not speak, so
+    ///    they are not judged.
+    /// 3. Otherwise the §12 code for what is wrong with it (see
+    ///    [`undecodable`](Self::undecodable)).
+    fn malformed(negotiation: Negotiation, bad: &FrameError) -> Self {
+        let mut violation = match (negotiation, bad.version()) {
+            (Negotiation::Agreed(expected), Some(got)) if got != expected => {
+                Self::unexpected_version(expected, got)
+            }
+            (Negotiation::Agreed(_), None) => Self {
+                error: RtrError::Pdu(bad.error.clone()),
+                report: Some(Self::UNEXPECTED_VERSION_REPORT),
+                consequence: Consequence::Drop,
+            },
+            _ => Self::undecodable(bad.error.clone()),
         };
-        let text = match invalid {
-            VrpError::PrefixLengthExceedsFamily { .. } => "Prefix Length out of range",
-            VrpError::MaxLengthExceedsFamily { .. } => "Max Length out of range",
-            VrpError::MaxLengthBelowPrefixLength { .. } => "Max Length less than Prefix Length",
+        if bad.is_error_report() {
+            violation.report = None;
+            violation.consequence = Consequence::Drop;
+        }
+        violation
+    }
+
+    /// The §12 reaction to what is wrong with a PDU. All of these codes are
+    /// fatal: "Errors which are considered fatal MUST cause the session to be
+    /// dropped" (RFC 6810 §10: SHOULD).
+    ///
+    /// * An unrecognised Protocol Version while negotiating is code 4; §7: the
+    ///   router "MUST either downgrade to a known version or terminate the
+    ///   connection, with an Error Report PDU". This client terminates. The
+    ///   data and resume point are not implicated.
+    /// * An unknown PDU type is code 5. A wrong Length, or Prefix lengths that
+    ///   §§5.1, 5.6 and 5.7 forbid, are code 0: "The receiver believes the
+    ///   received PDU to be corrupt in a manner not specified by another error
+    ///   code".
+    ///
+    /// For codes 0 and 5 the installed VRPs came from a completed transfer and
+    /// stay; the resume point is forgotten, because a Serial Query from it
+    /// would be answered with the same refused change set. (The RFCs do not
+    /// say what to ask for next.)
+    fn undecodable(error: PduError) -> Self {
+        let (code, text, consequence) = match &error {
+            PduError::UnknownVersion(_) => (
+                ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION,
+                "unsupported protocol version",
+                Consequence::Drop,
+            ),
+            PduError::UnknownPduType(_) => (
+                ERROR_CODE_UNSUPPORTED_PDU_TYPE,
+                "unsupported PDU type",
+                Consequence::ForgetResume,
+            ),
+            PduError::InvalidPrefix(invalid) => (
+                ERROR_CODE_CORRUPT_DATA,
+                match invalid {
+                    VrpError::PrefixLengthExceedsFamily { .. } => "Prefix Length out of range",
+                    VrpError::MaxLengthExceedsFamily { .. } => "Max Length out of range",
+                    VrpError::MaxLengthBelowPrefixLength { .. } => {
+                        "Max Length less than Prefix Length"
+                    }
+                },
+                Consequence::ForgetResume,
+            ),
+            PduError::InvalidLength { .. } => (
+                ERROR_CODE_CORRUPT_DATA,
+                "wrong PDU length",
+                Consequence::ForgetResume,
+            ),
+            // Only the inner fields of an Error Report produce these, and
+            // `malformed` never answers one.
+            PduError::Truncated { .. } | PduError::Utf8(_) => (
+                ERROR_CODE_CORRUPT_DATA,
+                "corrupt PDU",
+                Consequence::ForgetResume,
+            ),
         };
         Self {
             error: RtrError::Pdu(error),
-            report: Some(ErrorReportSpec {
-                code: ERROR_CODE_CORRUPT_DATA,
-                text,
-            }),
-            consequence: Consequence::ForgetResume,
+            report: Some(ErrorReportSpec { code, text }),
+            consequence,
         }
     }
 
@@ -503,6 +574,19 @@ impl Exchange {
     }
 }
 
+/// Decides about a PDU that could not be decoded. `Ok(())` means the protocol
+/// says to ignore it: skip it and keep reading.
+pub(crate) fn on_malformed(negotiation: Negotiation, bad: &FrameError) -> Result<(), Violation> {
+    // §7: "The router MUST ignore any Serial Notify PDUs it might receive from
+    // the cache during this initial startup period, regardless of the Protocol
+    // Version field in the Serial Notify PDU."
+    if matches!(negotiation, Negotiation::Proposed(_)) && bad.is_serial_notify_of_unknown_version()
+    {
+        return Ok(());
+    }
+    Err(Violation::malformed(negotiation, bad))
+}
+
 /// What an unsolicited PDU received while idle (between exchanges) means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Idle {
@@ -541,8 +625,43 @@ pub(crate) fn on_idle(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
-    use crate::error::{PduError, VrpError};
+    use crate::{
+        error::{PduError, VrpError},
+        frame::FrameDecoder,
+    };
+
+    /// What the decoder says about `bytes`.
+    fn refused(bytes: &[u8]) -> FrameError {
+        let mut decoder = FrameDecoder::new();
+        decoder.push(bytes);
+        decoder.next_frame().expect_err("bytes that do not decode")
+    }
+
+    /// A header declaring `len`, then zeros up to `len` bytes if that is a
+    /// usable length.
+    fn header(version: u8, pdu_type: u8, len: u32) -> Vec<u8> {
+        let mut bytes = vec![version, pdu_type, 0, 0];
+        bytes.extend_from_slice(&len.to_be_bytes());
+        if (8..=64 * 1024).contains(&len) {
+            bytes.resize(len as usize, 0);
+        }
+        bytes
+    }
+
+    const NEGOTIATIONS: [Negotiation; 4] = [
+        Negotiation::Proposed(RtrVersion::V0),
+        Negotiation::Proposed(RtrVersion::V1),
+        Negotiation::Agreed(RtrVersion::V0),
+        Negotiation::Agreed(RtrVersion::V1),
+    ];
+
+    fn outcome(negotiation: Negotiation, bytes: &[u8]) -> (Option<u16>, Consequence) {
+        let violation = on_malformed(negotiation, &refused(bytes)).expect_err("fatal");
+        (violation.report.map(|r| r.code), violation.consequence)
+    }
 
     /// RFC 8210 §12 code 0 for a forbidden prefix tuple: reported, fatal, and
     /// the resume point (not the data) is forgotten.
@@ -562,7 +681,7 @@ mod tests {
                 max_len: 16,
             },
         ] {
-            let violation = Violation::malformed(PduError::InvalidPrefix(invalid));
+            let violation = Violation::undecodable(PduError::InvalidPrefix(invalid));
             assert_eq!(
                 violation.report.map(|r| r.code),
                 Some(ERROR_CODE_CORRUPT_DATA)
@@ -571,12 +690,100 @@ mod tests {
         }
     }
 
-    /// Other malformed input keeps its previous handling (drop, no report).
+    /// §12 codes 5 and 0, in every state where the version rules of §7 do not
+    /// take precedence.
     #[test]
-    fn other_decode_errors_end_the_session_without_touching_the_cache() {
-        let violation = Violation::malformed(PduError::UnknownPduType(5));
-        assert_eq!(violation.report, None);
-        assert_eq!(violation.consequence, Consequence::Drop);
+    fn unknown_type_is_code_5_and_wrong_length_is_code_0() {
+        for negotiation in NEGOTIATIONS {
+            let v = u8::from(negotiation.version() == RtrVersion::V1);
+            assert_eq!(
+                outcome(negotiation, &header(v, 5, 8)),
+                (
+                    Some(ERROR_CODE_UNSUPPORTED_PDU_TYPE),
+                    Consequence::ForgetResume
+                )
+            );
+            for len in [7, 12, u32::MAX] {
+                assert_eq!(
+                    outcome(negotiation, &header(v, 8, len)),
+                    (Some(ERROR_CODE_CORRUPT_DATA), Consequence::ForgetResume),
+                    "{negotiation:?}, Cache Reset of Length {len}"
+                );
+            }
+        }
+    }
+
+    /// §7: code 4 for an unrecognised version while negotiating, code 8 for
+    /// any other version once agreed — whatever else is wrong with the PDU.
+    #[test]
+    fn version_rules_take_precedence() {
+        for (negotiation, code) in [
+            (
+                Negotiation::Proposed(RtrVersion::V1),
+                ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION,
+            ),
+            (
+                Negotiation::Agreed(RtrVersion::V1),
+                ERROR_CODE_UNEXPECTED_PROTOCOL_VERSION,
+            ),
+        ] {
+            for bytes in [header(2, 3, 8), header(2, 99, 8), header(2, 3, 3)] {
+                assert_eq!(
+                    outcome(negotiation, &bytes),
+                    (Some(code), Consequence::Drop),
+                    "{negotiation:?} {bytes:?}"
+                );
+            }
+        }
+        let agreed = Negotiation::Agreed(RtrVersion::V1);
+        for bytes in [header(0, 99, 8), header(0, 8, 12), header(0, 8, 3)] {
+            let violation = on_malformed(agreed, &refused(&bytes)).unwrap_err();
+            assert_eq!(violation.report, Some(Violation::UNEXPECTED_VERSION_REPORT));
+            assert!(matches!(
+                violation.error,
+                RtrError::UnexpectedVersion {
+                    expected: RtrVersion::V1,
+                    got: RtrVersion::V0
+                }
+            ));
+        }
+    }
+
+    /// §7 / §5.2: only during negotiation, and only a Serial Notify.
+    #[test]
+    fn serial_notify_of_unknown_version_is_ignored_only_while_negotiating() {
+        let notify = refused(&header(2, 0, 12));
+        for negotiation in NEGOTIATIONS {
+            assert_eq!(
+                on_malformed(negotiation, &notify).is_ok(),
+                matches!(negotiation, Negotiation::Proposed(_)),
+                "{negotiation:?}"
+            );
+        }
+    }
+
+    proptest! {
+        /// §5.11 / §7: whatever the bytes, state and fault, an Error Report is
+        /// never answered with one; every other refused PDU is, or is ignored.
+        #[test]
+        fn exactly_the_error_reports_go_unanswered(
+            version in prop_oneof![Just(0u8), Just(1), any::<u8>()],
+            pdu_type in prop_oneof![Just(10u8), 0u8..12, any::<u8>()],
+            len in prop_oneof![0u32..48, any::<u32>()],
+            body in prop::collection::vec(any::<u8>(), 40),
+            negotiation in prop::sample::select(NEGOTIATIONS.to_vec()),
+        ) {
+            let mut bytes = vec![version, pdu_type, 0, 0];
+            bytes.extend_from_slice(&len.to_be_bytes());
+            bytes.extend(body);
+            let mut decoder = FrameDecoder::new();
+            decoder.push(&bytes);
+            if let Err(bad) = decoder.next_frame()
+                && let Err(violation) = on_malformed(negotiation, &bad)
+            {
+                prop_assert_eq!(violation.report.is_none(), pdu_type == 10);
+            }
+        }
     }
 
     const V0: RtrVersion = RtrVersion::V0;

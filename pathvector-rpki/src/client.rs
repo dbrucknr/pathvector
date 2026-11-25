@@ -359,13 +359,16 @@ async fn run_one_connection(
         tokio::select! {
             () = tokio::time::sleep(timers.refresh) => {}
             read = connection.read_frame() => {
-                let frame = received(connection, shared, negotiation.version(), read).await?;
-                if let Err(violation) = protocol::on_idle(
-                    negotiation.version(),
-                    shared.resume(),
-                    frame.version,
-                    &frame.pdu,
-                ) {
+                // `None` (a PDU to ignore) cannot happen here: the version has
+                // been agreed by now.
+                if let Some(frame) = received(connection, shared, negotiation, read).await?
+                    && let Err(violation) = protocol::on_idle(
+                        negotiation.version(),
+                        shared.resume(),
+                        frame.version,
+                        &frame.pdu,
+                    )
+                {
                     return Err(reject(connection, shared, negotiation.version(), violation, &frame.raw).await);
                 }
             }
@@ -413,7 +416,9 @@ async fn sync(
 
         loop {
             let read = connection.read_frame().await;
-            let frame = received(connection, shared, negotiation.version(), read).await?;
+            let Some(frame) = received(connection, shared, *negotiation, read).await? else {
+                continue;
+            };
             let step = match exchange.on_pdu(frame.version, &frame.pdu) {
                 Ok(step) => step,
                 Err(violation) => {
@@ -567,9 +572,10 @@ fn publish(
 
 /// Upper bound on the offending-PDU copy placed in an outgoing Error Report
 /// (RFC 8210 §5.11: the "Erroneous PDU field MAY be truncated" for a PDU of
-/// excessive length). Every legal non-Error-Report PDU a cache sends is at
-/// most 32 bytes, so this never truncates one; it only stops a hostile
-/// oversized PDU from being echoed back at full length.
+/// excessive length). The longest legal non-Error-Report PDU a cache sends is
+/// a Router Key (about 123 bytes with the P-256 key of RFC 8208), so this
+/// never truncates one; it only stops a hostile oversized PDU from being
+/// echoed back at full length.
 const MAX_ERROR_REPORT_PDU_COPY: usize = 256;
 
 /// How long to wait for an Error Report to be accepted by the socket before
@@ -609,7 +615,8 @@ async fn reject(
 }
 
 /// Turns the outcome of [`Connection::read_frame`] into a PDU, carrying out
-/// the reaction to a peer that sent something that is not one.
+/// the reaction to a peer that sent something that cannot be decoded.
+/// `Ok(None)` is a PDU the protocol says to ignore: it has been skipped.
 ///
 /// Takes the *outcome* rather than doing the read, so the idle loop can race
 /// only the (cancellation-safe) read against its timer: once bytes are being
@@ -617,20 +624,26 @@ async fn reject(
 async fn received(
     connection: &mut Connection<TcpStream>,
     shared: &Arc<Shared>,
-    version: RtrVersion,
+    negotiation: Negotiation,
     read: Result<Frame, ReadError>,
-) -> Result<Frame, RtrError> {
+) -> Result<Option<Frame>, RtrError> {
     match read {
-        Ok(frame) => Ok(frame),
+        Ok(frame) => Ok(Some(frame)),
         Err(ReadError::Transport(error)) => Err(error),
-        Err(ReadError::Malformed(bad)) => Err(reject(
-            connection,
-            shared,
-            version,
-            Violation::malformed(bad.error),
-            &bad.raw,
-        )
-        .await),
+        Err(ReadError::Malformed(bad)) => match protocol::on_malformed(negotiation, &bad) {
+            Ok(()) => {
+                connection.skip(&bad);
+                Ok(None)
+            }
+            Err(violation) => Err(reject(
+                connection,
+                shared,
+                negotiation.version(),
+                violation,
+                &bad.raw,
+            )
+            .await),
+        },
     }
 }
 

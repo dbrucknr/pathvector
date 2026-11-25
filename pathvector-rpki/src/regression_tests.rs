@@ -834,7 +834,8 @@ async fn settle() {
 enum Failure {
     /// Connection lost mid-transfer.
     Eof,
-    /// A PDU of unknown type.
+    /// A PDU of unknown type. Answered with Error Report 5, after which the
+    /// resume point is forgotten.
     MalformedPdu,
     /// RFC 8210 §5.9 defines Cache Reset only as the reply to a Serial
     /// Query; mid-transfer it is a protocol violation.
@@ -849,9 +850,11 @@ enum Failure {
 ///
 /// RFC 8210 §4 associates the current serial with a *completed* response, and
 /// the public `subscribe()` contract promises completed-sync notifications.
-/// So until End of Data validates, nothing may be visible: VRPs, serial,
-/// status and notifications must all still describe the previous generation,
-/// and the reconnect must resume from exactly that generation.
+/// So until End of Data validates, nothing may be visible: VRPs, status and
+/// notifications must all still describe the previous generation. The
+/// reconnect resumes from exactly that generation, unless the failure was a
+/// refused PDU: then the same serial would draw the same change set again, so
+/// the client asks for everything.
 async fn failed_incremental_transfer_publishes_nothing(failure: Failure) {
     let go = Gate::new();
     let go_s = go.clone();
@@ -931,25 +934,27 @@ async fn failed_incremental_transfer_publishes_nothing(failure: Failure) {
     );
     assert_eq!(generation(&changed), before, "{ctx}: nothing completed");
     assert!(!changed.has_changed().unwrap(), "{ctx}");
+    let (serial, query) = if matches!(failure, Failure::MalformedPdu) {
+        (None, Pdu::ResetQuery)
+    } else {
+        (
+            Some(1),
+            Pdu::SerialQuery {
+                session_id: 1,
+                serial: 1,
+            },
+        )
+    };
     let status = handle.status();
-    assert_eq!(
-        status.serial,
-        Some(1),
-        "{ctx}: serial still names what is installed"
-    );
+    assert_eq!(status.serial, serial, "{ctx}");
     assert_eq!(status.roa_count, 2, "{ctx}");
 
-    // ...and the resume point matches the installed generation.
-    let reconnect = cache.next_seen("first PDU after reconnect").await;
-    assert_eq!(reconnect.conn, 1, "{ctx}");
-    assert_eq!(
-        reconnect.pdu,
-        Pdu::SerialQuery {
-            session_id: 1,
-            serial: 1
-        },
-        "{ctx}"
-    );
+    // ...and the next query matches.
+    let mut reconnect = cache.next_seen("first PDU after reconnect").await;
+    while reconnect.conn == 0 {
+        reconnect = cache.next_seen("first PDU after reconnect").await;
+    }
+    assert_eq!((reconnect.conn, reconnect.pdu), (1, query), "{ctx}");
 }
 
 #[tokio::test]
@@ -2056,6 +2061,613 @@ async fn trailing_address_bits_do_not_affect_a_vrp_or_its_withdrawal() {
     wait_for("withdrawal", || handle.status().serial == Some(2)).await;
     assert_eq!(validate(&handle, a(), 65001), RoaValidity::NotFound);
     assert_eq!(handle.status().roa_count, 0);
+}
+
+// ── Error Reports for other malformed input ──────────────────────────────
+//
+// RFC 8210 §12: code 0 "Corrupt Data", code 4 "Unsupported Protocol
+// Version" ("The Protocol Version is not known by the receiver"), code 5
+// "Unsupported PDU Type", code 8 "Unexpected Protocol Version" — all fatal,
+// and "Errors which are considered fatal MUST cause the session to be
+// dropped" (RFC 6810 §10 lists the same codes 0, 4 and 5 for version 0).
+// §5.11: "An Error Report PDU MUST NOT be sent for an Error Report PDU. If
+// an erroneous Error Report PDU is received, the session SHOULD be dropped."
+// "If the error is associated with a PDU of excessive length ... or a
+// possibly corrupt length, the Erroneous PDU field MAY be truncated" — so
+// otherwise the whole offending PDU is echoed.
+//
+// The offending PDUs are written as raw bytes, and the client's reply is
+// parsed here field by field, so neither relies on the crate's codec.
+
+const UNSUPPORTED_PROTOCOL_VERSION: u16 = 4;
+const UNSUPPORTED_PDU_TYPE: u16 = 5;
+
+const SERIAL_NOTIFY: u8 = 0;
+const CACHE_RESPONSE: u8 = 3;
+const IPV4_PREFIX: u8 = 4;
+const IPV6_PREFIX: u8 = 6;
+const END_OF_DATA: u8 = 7;
+const CACHE_RESET: u8 = 8;
+const ERROR_REPORT: u8 = 10;
+
+fn version_byte(version: RtrVersion) -> u8 {
+    u8::from(version == RtrVersion::V1)
+}
+
+/// A header declaring `len`, followed by `body` — the two need not agree.
+fn raw_pdu(version: u8, pdu_type: u8, len: u32, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![version, pdu_type, 0, 1];
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// A PDU whose Length is truthful about its (patterned) `body`.
+fn sized_pdu(version: u8, pdu_type: u8, body_len: usize) -> Vec<u8> {
+    let body: Vec<u8> = (0u8..=250).cycle().take(body_len).collect();
+    raw_pdu(
+        version,
+        pdu_type,
+        8 + u32::try_from(body_len).unwrap(),
+        &body,
+    )
+}
+
+fn end_of_data(version: RtrVersion, serial: u32) -> Pdu {
+    match version {
+        RtrVersion::V0 => Pdu::EndOfData {
+            session_id: 1,
+            serial,
+            intervals: None,
+        },
+        RtrVersion::V1 => eod(1, serial),
+    }
+}
+
+/// Where in the session the offending bytes arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum When {
+    /// In reply to the Serial Query that opens a new connection: RFC 8210 §7
+    /// negotiation is not complete.
+    Negotiating,
+    /// After a Cache Response and one record: the version is agreed.
+    MidTransfer,
+    /// After a completed sync, between exchanges.
+    Idle,
+}
+
+const ALWAYS: [When; 3] = [When::Negotiating, When::MidTransfer, When::Idle];
+const AFTER_AGREEMENT: [When; 2] = [When::MidTransfer, When::Idle];
+
+/// What the client did about the offending bytes.
+struct Reaction {
+    /// Every byte it sent between receiving them and closing the connection.
+    reply: Vec<u8>,
+    /// The first PDU on its next connection.
+    next_query: Pdu,
+    /// A VRP from the completed sync is still served, and nothing from the
+    /// failed transfer is.
+    data_intact: bool,
+    /// `status().serial` once it had reconnected.
+    serial: Option<u32>,
+}
+
+/// Completes a first sync (VRP A, serial 1), then has the cache send
+/// `offence` at the point `when` and reports the client's reaction. Fails if
+/// the client does not close that connection.
+async fn offend(version: RtrVersion, when: When, offence: Vec<u8>) -> Reaction {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+    let offending_conn = usize::from(when == When::Negotiating);
+    let mut cache = MockCache::spawn(move |conn, mut s, tap| {
+        let offence = offence.clone();
+        let reply_tx = reply_tx.clone();
+        async move {
+            if conn > offending_conn {
+                tap.read(&mut s).await;
+                hold_open().await;
+            }
+            tap.read(&mut s).await; // Reset Query, or Serial Query on conn 1
+            if conn == 0 {
+                send(&mut s, version, Pdu::CacheResponse { session_id: 1 }).await;
+                send(&mut s, version, v4("192.0.2.0", 24, 65001)).await;
+                send(&mut s, version, end_of_data(version, 1)).await;
+                if when == When::Negotiating {
+                    return; // close; the client reconnects and resumes
+                }
+            }
+            if when == When::MidTransfer {
+                send(
+                    &mut s,
+                    version,
+                    Pdu::SerialNotify {
+                        session_id: 1,
+                        serial: 2,
+                    },
+                )
+                .await;
+                tap.read(&mut s).await; // Serial Query
+                send(&mut s, version, Pdu::CacheResponse { session_id: 1 }).await;
+                send(&mut s, version, v4("198.51.100.0", 24, 65020)).await;
+            }
+            s.write_all(&offence).await.unwrap();
+            let mut reply = Vec::new();
+            // A reset instead of a clean close still ends the connection.
+            let _ = s.read_to_end(&mut reply).await;
+            let _ = reply_tx.send(reply);
+        }
+    })
+    .await;
+    cache.config.initial_version = version;
+
+    let (handle, join) = RtrClient::spawn(cache.config.clone());
+    let reply = tokio::time::timeout(Duration::from_secs(5), reply_rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("{version:?} {when:?}: the session was not dropped"))
+        .unwrap();
+    let next_query = loop {
+        let seen = cache.next_seen("first PDU after reconnect").await;
+        if seen.conn > offending_conn {
+            break seen.pdu;
+        }
+    };
+    let reaction = Reaction {
+        reply,
+        next_query,
+        data_intact: validate(&handle, a(), 65001) == RoaValidity::Valid
+            && validate(&handle, b(), 65020) == RoaValidity::NotFound
+            && handle.status().roa_count == 1,
+        serial: handle.status().serial,
+    };
+    join.abort();
+    reaction
+}
+
+/// What becomes of the resume point. Either way the completed VRPs stay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resume {
+    /// The next query is the same Serial Query (§8.1: appropriate after "a
+    /// broken session with the same cache").
+    Kept,
+    /// The next query is a Reset Query.
+    Forgotten,
+}
+
+fn assert_resume(reaction: &Reaction, expected: Resume, ctx: &str) {
+    assert!(reaction.data_intact, "{ctx}: completed data must stay");
+    let (query, serial) = match expected {
+        Resume::Kept => (
+            Pdu::SerialQuery {
+                session_id: 1,
+                serial: 1,
+            },
+            Some(1),
+        ),
+        Resume::Forgotten => (Pdu::ResetQuery, None),
+    };
+    assert_eq!(
+        (&reaction.next_query, reaction.serial),
+        (&query, serial),
+        "{ctx}"
+    );
+}
+
+/// The reply must be exactly one Error Report (§5.11 layout). Returns its
+/// Protocol Version, Error Code, Erroneous PDU and Error Text.
+fn parse_report(reply: &[u8], ctx: &str) -> (u8, u16, Vec<u8>, String) {
+    assert!(
+        reply.len() >= 16,
+        "{ctx}: expected an Error Report, got {reply:?}"
+    );
+    let be32 = |at: usize| u32::from_be_bytes(reply[at..at + 4].try_into().unwrap()) as usize;
+    assert_eq!(reply[1], ERROR_REPORT, "{ctx}: PDU type");
+    assert_eq!(be32(4), reply.len(), "{ctx}: exactly one PDU");
+    let copy_len = be32(8);
+    let text_at = 12 + copy_len;
+    assert_eq!(text_at + 4 + be32(text_at), reply.len(), "{ctx}: lengths");
+    (
+        reply[0],
+        u16::from_be_bytes([reply[2], reply[3]]),
+        reply[12..text_at].to_vec(),
+        String::from_utf8(reply[text_at + 4..].to_vec()).unwrap(),
+    )
+}
+
+/// One offence that must be answered with an Error Report.
+#[derive(Debug, Clone)]
+struct Reported {
+    /// Version of the session the offence arrives in.
+    session: RtrVersion,
+    when: When,
+    offence: Vec<u8>,
+    code: u16,
+    /// The expected Erroneous PDU field.
+    echo: Vec<u8>,
+    resume: Resume,
+}
+
+impl Reported {
+    async fn check(self) {
+        let ctx = format!(
+            "{:?} session, {:?}, offence {:?}",
+            self.session,
+            self.when,
+            &self.offence[..self.offence.len().min(24)]
+        );
+        let reaction = offend(self.session, self.when, self.offence).await;
+        let (version, code, echo, text) = parse_report(&reaction.reply, &ctx);
+        assert_eq!(code, self.code, "{ctx}: error code ({text})");
+        assert_eq!(version, version_byte(self.session), "{ctx}: report version");
+        assert_eq!(echo, self.echo, "{ctx}: Erroneous PDU");
+        assert_resume(&reaction, self.resume, &ctx);
+    }
+}
+
+/// Runs independent cases concurrently, reporting every failure.
+async fn check_all(cases: Vec<Reported>) {
+    let total = cases.len();
+    let running: Vec<_> = cases
+        .into_iter()
+        .map(|case| tokio::spawn(case.check()))
+        .collect();
+    let mut failed = 0;
+    for case in running {
+        failed += usize::from(case.await.is_err());
+    }
+    assert_eq!(failed, 0, "{failed} of {total} cases failed (see above)");
+}
+
+/// §12 code 5. Type 5 is unused and 11 upwards unassigned in both versions.
+/// A refused record in a change set would be refused again from the same
+/// serial, so the resume point is forgotten (this client's choice, as for a
+/// forbidden prefix; the RFCs do not say).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_pdu_type_is_answered_with_error_5() {
+    let mut cases = Vec::new();
+    for session in [RtrVersion::V0, RtrVersion::V1] {
+        for when in ALWAYS {
+            for (pdu_type, body_len) in [(5, 0), (11, 4), (255, 12)] {
+                let offence = sized_pdu(version_byte(session), pdu_type, body_len);
+                cases.push(Reported {
+                    session,
+                    when,
+                    echo: offence.clone(),
+                    offence,
+                    code: UNSUPPORTED_PDU_TYPE,
+                    resume: Resume::Forgotten,
+                });
+            }
+        }
+    }
+    check_all(cases).await;
+}
+
+/// §12 code 0 for a Length no PDU can have: shorter than the header, or past
+/// this client's 64 KiB bound. Only the header can be echoed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn impossible_length_is_answered_with_error_0() {
+    let mut cases = Vec::new();
+    for session in [RtrVersion::V0, RtrVersion::V1] {
+        for when in ALWAYS {
+            for len in [0, 7, 65_537, u32::MAX] {
+                let offence = raw_pdu(version_byte(session), CACHE_RESET, len, &[]);
+                cases.push(Reported {
+                    session,
+                    when,
+                    echo: offence.clone(),
+                    offence,
+                    code: CORRUPT_DATA,
+                    resume: Resume::Forgotten,
+                });
+            }
+        }
+    }
+    check_all(cases).await;
+}
+
+/// §12 code 0 for a Length that is wrong for the PDU type (§§5.2–5.9 give
+/// each fixed-size PDU its Length).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wrong_length_for_the_type_is_answered_with_error_0() {
+    use RtrVersion::{V0, V1};
+    // (session version, PDU type, wrong body length)
+    let wrong = [
+        (V1, SERIAL_NOTIFY, 0),
+        (V1, SERIAL_NOTIFY, 8),
+        (V1, CACHE_RESPONSE, 4),
+        (V1, IPV4_PREFIX, 11),
+        (V1, IPV4_PREFIX, 16),
+        (V1, IPV6_PREFIX, 12),
+        (V1, END_OF_DATA, 4),  // the version 0 Length
+        (V0, END_OF_DATA, 16), // the version 1 Length
+        (V1, CACHE_RESET, 1),
+        (V0, SERIAL_NOTIFY, 8),
+    ];
+    let mut cases = Vec::new();
+    for (session, pdu_type, body_len) in wrong {
+        for when in ALWAYS {
+            let offence = sized_pdu(version_byte(session), pdu_type, body_len);
+            cases.push(Reported {
+                session,
+                when,
+                echo: offence.clone(),
+                offence,
+                code: CORRUPT_DATA,
+                resume: Resume::Forgotten,
+            });
+        }
+    }
+    check_all(cases).await;
+}
+
+/// §5.11 allows truncating the echo of a PDU "too long to be any legal PDU
+/// other than another Error Report"; a hostile one is not echoed in full.
+#[tokio::test]
+async fn an_oversized_offending_pdu_is_echoed_truncated() {
+    let offence = sized_pdu(1, CACHE_RESPONSE, 4000);
+    Reported {
+        session: RtrVersion::V1,
+        when: When::MidTransfer,
+        echo: offence[..256].to_vec(),
+        offence,
+        code: CORRUPT_DATA,
+        resume: Resume::Forgotten,
+    }
+    .check()
+    .await;
+}
+
+/// §7: "If either party receives a PDU containing an unrecognized Protocol
+/// Version (neither 0 nor 1) during this negotiation, it MUST either
+/// downgrade to a known version or terminate the connection, with an Error
+/// Report PDU unless the received PDU is itself an Error Report PDU." This
+/// client terminates, with code 4. Nothing is wrong with the data or the
+/// serial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_version_during_negotiation_is_answered_with_error_4() {
+    let mut cases = Vec::new();
+    for session in [RtrVersion::V0, RtrVersion::V1] {
+        for wire in [2, 255] {
+            for (pdu_type, body_len) in [
+                (CACHE_RESPONSE, 0),
+                (CACHE_RESET, 0),
+                (IPV4_PREFIX, 12),
+                (99, 4), // version is judged before the type
+            ] {
+                let offence = sized_pdu(wire, pdu_type, body_len);
+                cases.push(Reported {
+                    session,
+                    when: When::Negotiating,
+                    echo: offence.clone(),
+                    offence,
+                    code: UNSUPPORTED_PROTOCOL_VERSION,
+                    resume: Resume::Kept,
+                });
+            }
+        }
+        // An unrecognized version whose Length cannot be trusted either.
+        let offence = raw_pdu(2, CACHE_RESPONSE, 3, &[]);
+        cases.push(Reported {
+            session,
+            when: When::Negotiating,
+            echo: offence.clone(),
+            offence,
+            code: UNSUPPORTED_PROTOCOL_VERSION,
+            resume: Resume::Kept,
+        });
+    }
+    check_all(cases).await;
+}
+
+/// §7: "If either party receives a PDU for a different Protocol Version once
+/// the above negotiation completes, that party MUST drop the session; ... the
+/// party dropping the session SHOULD send an Error Report with an error code
+/// of 8". An unrecognized version is a different one, Serial Notify included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_version_after_negotiation_is_answered_with_error_8() {
+    let mut cases = Vec::new();
+    for session in [RtrVersion::V0, RtrVersion::V1] {
+        for when in AFTER_AGREEMENT {
+            for (pdu_type, body_len) in [(SERIAL_NOTIFY, 4), (CACHE_RESPONSE, 0), (99, 4)] {
+                let offence = sized_pdu(2, pdu_type, body_len);
+                cases.push(Reported {
+                    session,
+                    when,
+                    echo: offence.clone(),
+                    offence,
+                    code: UNEXPECTED_PROTOCOL_VERSION,
+                    resume: Resume::Kept,
+                });
+            }
+        }
+    }
+    check_all(cases).await;
+}
+
+/// The same §7 clause comes first when the PDU of the other (known) version
+/// is also malformed: its type and Length belong to a version this session
+/// does not speak.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_pdu_at_the_other_version_after_negotiation_is_error_8() {
+    let mut cases = Vec::new();
+    for (session, other) in [(RtrVersion::V1, 0), (RtrVersion::V0, 1)] {
+        for when in AFTER_AGREEMENT {
+            for offence in [
+                sized_pdu(other, 11, 4),
+                sized_pdu(other, CACHE_RESET, 4),
+                raw_pdu(other, CACHE_RESET, 7, &[]),
+            ] {
+                cases.push(Reported {
+                    session,
+                    when,
+                    echo: offence.clone(),
+                    offence,
+                    code: UNEXPECTED_PROTOCOL_VERSION,
+                    resume: Resume::Kept,
+                });
+            }
+        }
+    }
+    check_all(cases).await;
+}
+
+/// §7: "The router MUST ignore any Serial Notify PDUs it might receive from
+/// the cache during this initial startup period, regardless of the Protocol
+/// Version field in the Serial Notify PDU" (§5.2: "even if the Serial Notify
+/// PDU is for an unexpected protocol version"). That includes versions this
+/// client does not know: the session carries on, and nothing is sent back.
+#[tokio::test]
+async fn serial_notify_of_unknown_version_during_negotiation_is_ignored() {
+    for session in [RtrVersion::V0, RtrVersion::V1] {
+        let mut cache = MockCache::spawn(move |conn, mut s, tap| async move {
+            use tokio::io::AsyncWriteExt;
+            if conn != 0 {
+                hold_open().await;
+            }
+            tap.read(&mut s).await; // Reset Query
+            let notify = sized_pdu(2, SERIAL_NOTIFY, 4);
+            // Split inside the header and inside the body.
+            for piece in [&notify[..3], &notify[3..10], &notify[10..]] {
+                s.write_all(piece).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let _ = s.write_all(&sized_pdu(255, SERIAL_NOTIFY, 4)).await;
+            let _ = write_pdu(&mut s, session, &Pdu::CacheResponse { session_id: 1 }).await;
+            let _ = write_pdu(&mut s, session, &v4("192.0.2.0", 24, 65001)).await;
+            let _ = write_pdu(&mut s, session, &end_of_data(session, 1)).await;
+            // Anything the router says now (an Error Report) is reported.
+            while tap.read(&mut s).await.is_some() {}
+            hold_open().await;
+        })
+        .await;
+        cache.config.initial_version = session;
+        let (handle, join) = RtrClient::spawn(cache.config.clone());
+        cache.next_seen("Reset Query").await;
+        wait_for("the sync, or a failure", || {
+            handle.status().serial == Some(1) || handle.status().last_error.is_some()
+        })
+        .await;
+        let status = handle.status();
+        assert_eq!(
+            (status.connected, status.serial, status.last_error),
+            (true, Some(1), None),
+            "{session:?}"
+        );
+        settle().await;
+        assert!(
+            cache.seen.try_recv().is_err(),
+            "{session:?}: nothing is sent in reply"
+        );
+        assert_eq!(cache.accepted(), 1, "{session:?}: no reconnect");
+        join.abort();
+    }
+}
+
+/// A Serial Notify is 12 bytes (§5.2). One of an unknown version with any
+/// other Length is not something to skip over.
+#[tokio::test]
+async fn wrong_length_serial_notify_of_unknown_version_is_not_ignored() {
+    let offence = sized_pdu(2, SERIAL_NOTIFY, 8);
+    Reported {
+        session: RtrVersion::V1,
+        when: When::Negotiating,
+        echo: offence.clone(),
+        offence,
+        code: UNSUPPORTED_PROTOCOL_VERSION,
+        resume: Resume::Kept,
+    }
+    .check()
+    .await;
+}
+
+/// An Error Report body: the two inner lengths need not be truthful.
+fn report_body(copy_len: u32, copy: &[u8], text_len: u32, text: &[u8]) -> Vec<u8> {
+    let mut body = copy_len.to_be_bytes().to_vec();
+    body.extend_from_slice(copy);
+    body.extend_from_slice(&text_len.to_be_bytes());
+    body.extend_from_slice(text);
+    body
+}
+
+/// §5.11: "An Error Report PDU MUST NOT be sent for an Error Report PDU. If
+/// an erroneous Error Report PDU is received, the session SHOULD be dropped."
+/// (§7 repeats the exception for both version rules.) Whatever is wrong with
+/// it, and whenever it arrives, the client says nothing and closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_error_report_is_ever_sent_for_an_error_report() {
+    let report = |version: u8, body: &[u8]| {
+        raw_pdu(
+            version,
+            ERROR_REPORT,
+            8 + u32::try_from(body.len()).unwrap(),
+            body,
+        )
+    };
+    let well_formed = report_body(0, &[], 2, b"no");
+    let mut cases = Vec::new();
+    for session in [RtrVersion::V0, RtrVersion::V1] {
+        let v = version_byte(session);
+        for offence in [
+            report(v, &report_body(500, &[], 0, &[])), // copy overruns
+            report(v, &report_body(0, &[], 500, &[])), // text overruns
+            report(v, &report_body(0, &[], 2, &[0xc3, 0x28])), // not UTF-8
+            report(v, &[0, 0, 0, 0]),                  // no text length
+            report(v, &[]),                            // header only
+            raw_pdu(v, ERROR_REPORT, 7, &[]),
+            raw_pdu(v, ERROR_REPORT, 65_537, &[]),
+            report(2, &well_formed),
+            report(2, &report_body(500, &[], 0, &[])),
+            raw_pdu(2, ERROR_REPORT, 7, &[]),
+            report(1 - v, &report_body(500, &[], 0, &[])),
+        ] {
+            for when in ALWAYS {
+                let offence = offence.clone();
+                cases.push(tokio::spawn(async move {
+                    let ctx = format!("{session:?} {when:?} {offence:?}");
+                    let reaction = offend(session, when, offence).await;
+                    assert_eq!(reaction.reply, [0u8; 0], "{ctx}");
+                    assert_resume(&reaction, Resume::Kept, &ctx);
+                }));
+            }
+        }
+    }
+    for case in cases {
+        case.await.unwrap();
+    }
+}
+
+/// §7 case 1: a v0-only cache "may terminate the connection, perhaps with a
+/// version 0 Error Report PDU. In this case, the router MAY retry the
+/// connection using protocol version 0."
+#[tokio::test]
+async fn fallback_survives_a_cache_that_closes_after_rejecting_v1() {
+    let mut cache = MockCache::spawn(|conn, mut s, tap| async move {
+        use tokio::io::AsyncWriteExt;
+        tap.read(&mut s).await;
+        if conn == 0 {
+            let body = report_body(0, &[], 0, &[]);
+            let mut rejection = raw_pdu(0, ERROR_REPORT, 16, &body);
+            rejection[3] = 4; // Unsupported Protocol Version
+            s.write_all(&rejection).await.unwrap();
+            return;
+        }
+        send(&mut s, RtrVersion::V0, Pdu::CacheResponse { session_id: 1 }).await;
+        send(&mut s, RtrVersion::V0, end_of_data(RtrVersion::V0, 1)).await;
+        hold_open().await;
+    })
+    .await;
+    let (handle, _join) = RtrClient::spawn(cache.config.clone());
+    wait_for("a version 0 sync", || handle.status().serial == Some(1)).await;
+    assert_eq!(handle.status().version, Some(RtrVersion::V0));
+    let mut last = cache.next_seen("v1 Reset Query").await;
+    assert_eq!((last.conn, last.version), (0, RtrVersion::V1));
+    while last.conn == 0 {
+        // Only queries: never an Error Report in reply to the rejection.
+        last = cache.next_seen("v0 Reset Query").await;
+        assert_eq!(last.pdu, Pdu::ResetQuery);
+        assert_eq!(last.version, RtrVersion::V0);
+    }
 }
 
 // ── Cost report ──────────────────────────────────────────────────────────
