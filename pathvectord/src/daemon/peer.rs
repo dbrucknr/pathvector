@@ -226,9 +226,9 @@ impl DaemonState {
     /// Drains and returns the list of peers whose outbound UPDATE channel
     /// overflowed during the most recent event.
     ///
-    /// The event loop calls this after each event and sends
-    /// [`SessionCommand::Stop`] to each returned peer so the session can
-    /// re-establish and perform a fresh full-table dump.
+    /// The event loop calls this after each event and resets each returned
+    /// peer's session ([`SessionCommand::AutomaticStop`]) so it re-establishes
+    /// and performs a fresh full-table dump.
     pub(super) fn take_stalled_peers(&mut self) -> Vec<IpAddr> {
         std::mem::take(&mut self.stalled_peers)
     }

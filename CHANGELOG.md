@@ -4,6 +4,54 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-25 (a session the daemon resets now reconnects)
+
+`pathvectord` reset sessions with `SessionCommand::Stop` and `SessionCommand::Notification`, both of
+which the session treats as an operator stop: it goes to Idle with no ConnectRetry timer, and the
+daemon only sends `Start` when a peer is added. After any of the following, the peer stayed down
+until it was removed and added again (or the daemon restarted):
+
+- a maximum-prefix Cease, with or without `max_prefixes_restart` (the idle-hold expiry only removed
+  its own deadline);
+- a reset for a full outbound UPDATE channel, whose log line said the session would re-establish;
+- a session reset for an UPDATE error the daemon detects, such as RFC 7606 §5.2.
+
+**Behaviour changes**
+
+- New `SessionCommand::AutomaticStop(notification)`: send it, close, and reconnect after
+  `connect_retry_time`. The daemon uses it for all of the above. `Stop` and `Notification` keep their
+  meaning and are now used only to remove a peer.
+- A peer over its prefix limit now reconnects. Without `max_prefixes_restart` that is after
+  `connect_retry_time` (120 s by default), as the config documentation already said, so a peer that
+  keeps leaking is reset again on each attempt. With it, attempts inside the hold-off are refused and
+  the first one after it is accepted.
+- Cease subcodes: a stalled peer gets Out of Resources and a reconnect refused by the idle-hold gets
+  Connection Rejected. Both used to get Administrative Shutdown.
+- An Idle session now closes an inbound connection. It used to take the socket and ignore it, which
+  left the peer's connection open and unanswered.
+- `Stop` (and `Notification`) sent while a reconnect is pending now cancels it. It used to be
+  ignored, and the session dialled again.
+- `FsmInput::ProtocolErrorNotificationToSend` is renamed to `FsmInput::AutomaticStop`. Nothing
+  outside the FSM's own tests constructed it.
+
+**RFC basis**
+
+RFC 4271 §8.1.2 defines Event 2 (ManualStop, by the administrator) and Event 8 (AutomaticStop, by the
+local system, with a maximum-prefix limit as its example). §8.2.2 leaves both in Idle; §8.1.1
+`AllowAutomaticStart` lets local logic start the session again, and the timing is local policy.
+§8.2.2 Idle: "the BGP FSM refuses all incoming BGP connections for this peer." Neither RFC 4271 nor
+RFC 4486 defines the max-prefix hold-off.
+
+**Tests**
+
+`pathvectord/src/daemon/session_restart_tests.rs` runs a real session against the event loop; all
+four failed on the old code. In `pathvector-session/tests/stop_and_restart.rs`,
+`stop_while_a_retry_is_pending_cancels_it` and `inbound_connection_in_idle_is_closed` also failed on
+the old code. `event_loop_idle_hold_blocks_reconnect` had been passing for the wrong reason: its
+fixture dropped the update receiver, so the `Stop` it saw was the stalled-peer one.
+
+---
+
 ## 2026-11-25 (pathvectord: a batch that ends in a NOTIFICATION no longer drops the idle-hold Stop)
 
 `run_event_loop`'s drain loop had two exits with two hand-written send sequences. When a coalesced

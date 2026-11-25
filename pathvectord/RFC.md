@@ -580,8 +580,9 @@ to the `pathvector-session` transport layer via `SessionHandle`.
 ## RFC 4486 §4 — Maximum Number of Prefixes (Daemon Integration)
 
 **Owns:** Per-AFI Adj-RIB-In size checking after each UPDATE; sending
-`CEASE/MaximumNumberOfPrefixesReached`; enforcing an idle-hold period before the peer
-may reconnect.  
+`CEASE/MaximumNumberOfPrefixesReached`; reconnecting afterwards, and enforcing an
+idle-hold period first when one is configured. RFC 4486 §4 requires only the Cease: the
+reconnect is RFC 4271 §8.1.1 automatic start and the idle-hold is local policy.  
 **Boundary:** The `CeaseError::MaximumNumberOfPrefixesReached` subcode constant and NOTIFICATION
 wire encoding live in `pathvector-session`.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc4486#section-4
@@ -596,7 +597,8 @@ wire encoding live in `pathvector-session`.
 | Send `CEASE/MaximumNumberOfPrefixesReached` when limit exceeded | `src/daemon/route.rs` | ✅ | `cease_when_limit_exceeded` |
 | Set idle-hold deadline when `max_prefixes_restart > 0` | `src/daemon/route.rs` | ✅ | `idle_hold_inserted_when_restart_configured` |
 | No idle-hold when `max_prefixes_restart` is absent or zero | `src/daemon/route.rs` | ✅ | `no_idle_hold_without_restart` |
-| Block `SessionEvent::Established` during idle-hold; send Stop | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect` |
+| Session reconnects after the CEASE (RFC 4271 §8.1.2 Event 8, local restart policy) | `src/daemon/mod.rs` | ✅ | `session_reconnects_after_max_prefix_cease` |
+| Block `SessionEvent::Established` during idle-hold; reset with CEASE/Connection Rejected | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect`, `session_is_rejected_during_idle_hold_and_accepted_after_it` |
 | Block reconnect during idle-hold via coalesced drain loop | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect_in_drain_loop`, `idle_hold_reconnect_is_stopped_when_batch_ends_in_notification` |
 | Clear idle-hold deadline when timer expires (event loop) | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_timer_clears_expired_deadline` |
 | `add_peer` populates `peer_max_prefixes_v4/v6` + `peer_max_prefixes_restart` | `src/daemon/peer.rs` | ✅ | `add_peer_populates_max_prefix_maps` |

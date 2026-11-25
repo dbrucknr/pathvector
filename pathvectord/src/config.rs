@@ -604,8 +604,11 @@ pub struct PeerConfig {
     /// operators time to investigate and correct a route leak before the
     /// peer floods the RIB again.
     ///
-    /// `0` (the default) means reconnect immediately according to the
-    /// normal `connect_retry_time`.
+    /// Absent (the default) or `0` means no extra hold-off: the session
+    /// reconnects after the normal `connect_retry_time`. With a value set,
+    /// reconnect attempts keep happening every `connect_retry_time` and are
+    /// refused with CEASE/Connection Rejected until it has passed. The
+    /// hold-off is local policy; no RFC defines it.
     ///
     /// ```toml
     /// [[peers]]
