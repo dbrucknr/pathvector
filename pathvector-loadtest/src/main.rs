@@ -78,7 +78,8 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     probe_interval_ms: u64,
 
-    /// Seconds to wait for the daemon to settle after each step
+    /// Deadline in seconds for each step (a bulk send, a gRPC call, or waiting
+    /// for the daemon to settle); exceeding it fails the scenario
     #[arg(long, default_value_t = 300)]
     timeout_secs: u64,
 

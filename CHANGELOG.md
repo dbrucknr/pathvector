@@ -429,6 +429,18 @@ stayed at 3.0–3.2 s in every window; it never approached the 9 s hold time.
   (120 s by default), so a peer that flaps and redials gets no OPEN for that
   long. Observed directly; not changed.
 
+**Harness corrections from review of PR #114** (2026-11-25):
+
+- Silence before the control peer's first recorded message was not measured: a
+  daemon that sent nothing after the handshake read as 0 ns and **OK**. It is
+  now measured from the handshake KEEPALIVE. A one-loader full-table re-run
+  with the fix (`idle`, `converge`, `cow`, `teardown`, `reconverge`; same
+  machine and dump size) read 3.00 s in five windows and 3.69 s in the
+  `watch_routes` window, hold 9 s.
+- Bulk sends and the harness's `get_peer` / `set_export_default` calls had no
+  deadline, so a stalled daemon hung the run instead of failing it. Each is now
+  bounded by `--timeout-secs`, as is the startup readiness check.
+
 **Not yet done** (PR-1 exit criteria): a run with ≥ 2 simultaneous full-table
 peers (needs `lo0` aliases on macOS), the `export` scenario (needs ≥ 2
 loaders), Graceful Restart recovery, route refresh and RPKI cache replacement.
