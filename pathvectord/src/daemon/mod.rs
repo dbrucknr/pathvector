@@ -69,6 +69,8 @@ mod peer;
 mod peer_stats;
 mod policy;
 mod route;
+#[cfg(test)]
+mod update_size_tests;
 
 // Issues #81 and #82: BLACKHOLE authorization and import eligibility through
 // Graceful Restart.
