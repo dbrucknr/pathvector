@@ -1253,8 +1253,9 @@ pub(super) fn process_update(
     }
 
     // ── Pre-policy checks on the AS_PATH (issue #138) ───────────────────────
-    // AS 0 (RFC 7607), AS_SET / AS_CONFED_SET (RFC 9774) and an AS loop (RFC 4271 §9.1.2 / RFC 5065 §4) are
-    // properties of the whole UPDATE, so they are decided once here. They are
+    // AS 0 (RFC 7607), AS_SET / AS_CONFED_SET (RFC 9774) and an AS loop (RFC
+    // 4271 §9.1.2 / RFC 5065 §4) are properties of the whole UPDATE, so they are
+    // decided once here. They are
     // *applied* per announced NLRI below, not by discarding the NLRI: an
     // announcement dropped here still replaces the peer's older route for
     // the same NLRI (RFC 4271 §9), so that route must leave service. See

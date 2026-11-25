@@ -20,9 +20,34 @@
 //! It must run on the attributes as received, before
 //! `AS4_PATH` / `AS4_AGGREGATOR` are merged away.
 
-use pathvector_types::Asn;
+use pathvector_types::{AsPath, Asn};
 
 use super::update::{AttributeDecodeError, AttributeErrorPolicy, PathAttribute};
+
+/// What one received path holds that the rules care about.
+struct PathContent {
+    set_segment: bool,
+    as_zero: bool,
+}
+
+/// Reads `path` once. This runs for every UPDATE received, so the AS 0 test is
+/// a branch-free fold over each segment, which the compiler can vectorise.
+fn scan(path: &AsPath) -> PathContent {
+    let mut content = PathContent {
+        set_segment: false,
+        as_zero: false,
+    };
+    for segment in path.segments() {
+        content.set_segment |= segment.is_set();
+        // Integer OR rather than `any`: no early exit to defeat vectorisation.
+        content.as_zero |= segment
+            .asns()
+            .iter()
+            .fold(0, |found, &asn| found | u8::from(asn == Asn::ZERO))
+            != 0;
+    }
+    content
+}
 
 /// Applies the receive rules to `attrs`, appending to `errors`.
 ///
@@ -35,10 +60,9 @@ pub(super) fn apply_receive_rules(
 ) {
     use AttributeErrorPolicy::{AttributeDiscard, TreatAsWithdraw};
 
-    attrs.retain(|attr| {
-        let mut keep = true;
-        let mut report = |policy: AttributeErrorPolicy, detail| {
-            keep &= policy != AttributeDiscard;
+    let first_new = errors.len();
+    for attr in attrs.iter() {
+        let mut report = |policy, detail| {
             errors.push(AttributeDecodeError {
                 type_code: attr.type_code(),
                 policy,
@@ -47,24 +71,26 @@ pub(super) fn apply_receive_rules(
         };
         match attr {
             PathAttribute::AsPath(path) => {
-                if path.contains_as_set() {
+                let content = scan(path);
+                if content.set_segment {
                     report(
                         TreatAsWithdraw,
                         "AS_SET or AS_CONFED_SET in AS_PATH (RFC 9774 §3)",
                     );
                 }
-                if path.contains(Asn::ZERO) {
+                if content.as_zero {
                     report(TreatAsWithdraw, "AS 0 in AS_PATH (RFC 7607 §2)");
                 }
             }
             PathAttribute::As4Path(path) => {
-                if path.contains_as_set() {
+                let content = scan(path);
+                if content.set_segment {
                     report(
                         TreatAsWithdraw,
                         "AS_SET or AS_CONFED_SET in AS4_PATH (RFC 9774 §3)",
                     );
                 }
-                if path.contains(Asn::ZERO) {
+                if content.as_zero {
                     report(AttributeDiscard, "AS 0 in AS4_PATH (RFC 7607 §2)");
                 }
             }
@@ -76,6 +102,17 @@ pub(super) fn apply_receive_rules(
             }
             _ => {}
         }
-        keep
-    });
+    }
+
+    // Only a violation costs a second pass. `attrs` holds one instance of
+    // each type (repeats were dropped while decoding), so a type code
+    // identifies the attribute to discard.
+    let discarded = &errors[first_new..];
+    if !discarded.is_empty() {
+        attrs.retain(|attr| {
+            !discarded
+                .iter()
+                .any(|e| e.policy == AttributeDiscard && e.type_code == attr.type_code())
+        });
+    }
 }
