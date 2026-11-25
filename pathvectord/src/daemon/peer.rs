@@ -790,11 +790,6 @@ impl DaemonState {
                 .get(&other_ip)
                 .copied()
                 .unwrap_or(PeerType::External);
-            let max_len = self
-                .negotiated_max_len
-                .get(&other_ip)
-                .copied()
-                .unwrap_or(MAX_LEN);
             let Some(export_policy) = self.export_policies.get(&other_ip) else {
                 tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation on Terminated");
                 continue;
@@ -803,10 +798,10 @@ impl DaemonState {
                 tracing::error!(peer = %other_ip, "adj_ribs_out missing peer — skipping propagation on Terminated");
                 continue;
             };
-            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+            if !self.update_senders.contains_key(&other_ip) {
                 tracing::error!(peer = %other_ip, "update_senders missing peer — skipping propagation on Terminated");
                 continue;
-            };
+            }
 
             let decisions: Vec<PrefixDecision> = prev_prefixes
                 .iter()
@@ -825,6 +820,7 @@ impl DaemonState {
                         nlri,
                         &self.rib.loc_rib,
                         adj_rib_out,
+                        &self.rib.rr_clients,
                         export_policy,
                         other_type,
                         local_as,
@@ -835,17 +831,7 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            let other_four_byte = self.four_byte_peers.contains(&other_ip);
-            if !flush_updates(
-                other_ip,
-                decisions,
-                max_len,
-                update_tx,
-                other_type,
-                other_four_byte,
-            ) {
-                self.stalled_peers.push(other_ip);
-            }
+            self.send_decisions(other_ip, decisions);
             self.sync_advertised(other_ip);
         }
         self.repropagate_peer_prefixes_v6(peer_ip, &changed_v6);

@@ -302,9 +302,9 @@ impl DaemonState {
         let Some(peer_type) = self.rib.peer_types.get(&peer_ip).copied() else {
             return false;
         };
-        let Some(max_len) = self.negotiated_max_len.get(&peer_ip).copied() else {
+        if !self.negotiated_max_len.contains_key(&peer_ip) {
             return false;
-        };
+        }
         let Some(update_tx) = self.update_senders.get(&peer_ip).cloned() else {
             return false;
         };
@@ -314,7 +314,6 @@ impl DaemonState {
         let Some(adj_rib_out) = self.adj_ribs_out.get_mut(&peer_ip) else {
             return false;
         };
-        let peer_four_byte = self.four_byte_peers.contains(&peer_ip);
 
         let all_nlris: Vec<Nlri<Ipv4Addr>> =
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
@@ -331,34 +330,17 @@ impl DaemonState {
             })
             .unwrap_or(local_bgp_id);
         let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
-        let is_rr = !self.rib.rr_clients.is_empty();
-        let dest_is_client = self.rib.rr_clients.contains(&peer_ip);
         let rr_clients = &self.rib.rr_clients;
-        let peer_types = &self.rib.peer_types;
         let loc_rib = &self.rib.loc_rib;
 
         let decisions: Vec<PrefixDecision> = all_nlris
             .into_iter()
             .map(|nlri| {
-                // RFC 4456 §8 split-horizon: as an RR, a non-client iBGP peer
-                // must not receive routes learned from other non-client iBGP
-                // peers.
-                if is_rr
-                    && peer_type == PeerType::Internal
-                    && let Some(src) = loc_rib.best_peer(&nlri)
-                    && let IpAddr::V4(src_ip) = src.ip()
-                {
-                    let src_is_client = rr_clients.contains(&IpAddr::V4(src_ip));
-                    let src_is_ibgp =
-                        peer_types.get(&IpAddr::V4(src_ip)).copied() == Some(PeerType::Internal);
-                    if src_is_ibgp && !src_is_client && !dest_is_client {
-                        return PrefixDecision::NoChange;
-                    }
-                }
                 propagate_prefix(
                     nlri,
                     loc_rib,
                     adj_rib_out,
+                    rr_clients,
                     export_policy,
                     peer_type,
                     local_as,
@@ -371,19 +353,10 @@ impl DaemonState {
             })
             .collect();
 
-        let mut stalled = !flush_updates(
-            peer_ip,
-            decisions,
-            max_len,
-            &update_tx,
-            peer_type,
-            peer_four_byte,
-        );
+        let mut stalled = !self.send_decisions(peer_ip, decisions);
         if !stalled && !send_eor_ipv4(&update_tx) {
-            stalled = true;
-        }
-        if stalled {
             self.stalled_peers.push(peer_ip);
+            stalled = true;
         }
         self.sync_advertised(peer_ip);
         stalled
@@ -400,13 +373,12 @@ impl DaemonState {
         if !self.ipv6_capable_peers.contains(&peer_ip) {
             return false;
         }
-        let Some(max_len) = self.negotiated_max_len.get(&peer_ip).copied() else {
+        if !self.negotiated_max_len.contains_key(&peer_ip) {
             return false;
-        };
+        }
         let Some(update_tx) = self.update_senders.get(&peer_ip).cloned() else {
             return false;
         };
-        let peer_four_byte = self.four_byte_peers.contains(&peer_ip);
 
         let all_nlris_v6: Vec<Nlri<Ipv6Addr>> =
             self.rib.loc_rib_v6.best_routes().map(|(n, _)| n).collect();
@@ -429,31 +401,17 @@ impl DaemonState {
         let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_ipv6 = self.rib.local_ipv6;
         let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
-        let is_rr = !self.rib.rr_clients.is_empty();
-        let dest_is_client = self.rib.rr_clients.contains(&peer_ip);
         let rr_clients = &self.rib.rr_clients;
-        let peer_types = &self.rib.peer_types;
         let loc_rib_v6 = &self.rib.loc_rib_v6;
 
         let decisions_v6: Vec<PrefixDecisionV6> = all_nlris_v6
             .into_iter()
             .map(|nlri| {
-                if is_rr
-                    && peer_type == PeerType::Internal
-                    && let Some(src) = loc_rib_v6.best_peer(&nlri)
-                    && let IpAddr::V4(src_ip) = src.ip()
-                {
-                    let src_is_client = rr_clients.contains(&IpAddr::V4(src_ip));
-                    let src_is_ibgp =
-                        peer_types.get(&IpAddr::V4(src_ip)).copied() == Some(PeerType::Internal);
-                    if src_is_ibgp && !src_is_client && !dest_is_client {
-                        return PrefixDecisionV6::NoChange;
-                    }
-                }
                 propagate_prefix_v6(
                     nlri,
                     loc_rib_v6,
                     adj_rib_out_v6,
+                    rr_clients,
                     export_policy_v6,
                     peer_type,
                     local_as,
@@ -465,19 +423,10 @@ impl DaemonState {
             })
             .collect();
 
-        let mut stalled = !flush_updates_v6(
-            peer_ip,
-            decisions_v6,
-            max_len,
-            &update_tx,
-            peer_type,
-            peer_four_byte,
-        );
+        let mut stalled = !self.send_decisions_v6(peer_ip, decisions_v6);
         if !stalled && !send_eor_ipv6(&update_tx) {
-            stalled = true;
-        }
-        if stalled {
             self.stalled_peers.push(peer_ip);
+            stalled = true;
         }
         self.sync_advertised(peer_ip);
         stalled
