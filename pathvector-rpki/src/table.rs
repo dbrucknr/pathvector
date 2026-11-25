@@ -30,7 +30,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use ipnetx::{interfaces::IpAddress, prefix::IpPrefix};
 use routemap::RouteMap;
 
-use crate::pdu::Pdu;
+use crate::{pdu::Pdu, vrp::Vrp};
 
 /// RFC 6811 §2 origin validation state for a `(prefix, origin AS)` pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +53,15 @@ struct RoaEntry {
     asn: u32,
 }
 
+impl<A: IpAddress> From<Vrp<A>> for RoaEntry {
+    fn from(vrp: Vrp<A>) -> Self {
+        Self {
+            max_len: vrp.max_len(),
+            asn: vrp.asn(),
+        }
+    }
+}
+
 /// One address family's ROA table.
 struct FamilyTable<A: IpAddress>(RouteMap<A, Vec<RoaEntry>>);
 
@@ -61,12 +70,13 @@ impl<A: IpAddress> FamilyTable<A> {
         Self(RouteMap::new())
     }
 
-    /// Adds one ROA at `prefix`. Deduplicates against any existing entry with
-    /// the same `(max_len, asn)` at that exact prefix — Serial Query replay
-    /// can re-announce an already-known ROA, and without dedup a later
-    /// withdrawal would remove only one of the duplicate copies, silently
-    /// leaving a phantom entry behind.
-    fn insert(&mut self, prefix: IpPrefix<A>, entry: RoaEntry) {
+    /// Adds one ROA. Deduplicates against any existing entry with the same
+    /// `(max_len, asn)` at that exact prefix — Serial Query replay can
+    /// re-announce an already-known ROA, and without dedup a later withdrawal
+    /// would remove only one of the duplicate copies, silently leaving a
+    /// phantom entry behind.
+    fn insert(&mut self, vrp: Vrp<A>) {
+        let (prefix, entry) = (vrp.prefix(), RoaEntry::from(vrp));
         let mut entries = self.0.get(prefix).cloned().unwrap_or_default();
         if !entries.contains(&entry) {
             entries.push(entry);
@@ -74,12 +84,13 @@ impl<A: IpAddress> FamilyTable<A> {
         self.0.insert(prefix, entries);
     }
 
-    /// Removes one ROA at `prefix`. If it was the last entry at that exact
-    /// prefix, removes the `RouteMap` node entirely rather than leaving an
-    /// empty `Vec` behind (an empty-but-present node would make the fast
-    /// `NotFound` short-circuit in `validate` incorrectly see "some
-    /// coverage" via `longest_match_entry`).
-    fn remove(&mut self, prefix: IpPrefix<A>, entry: RoaEntry) {
+    /// Removes one ROA. If it was the last entry at that exact prefix, removes
+    /// the `RouteMap` node entirely rather than leaving an empty `Vec` behind
+    /// (an empty-but-present node would make the fast `NotFound`
+    /// short-circuit in `validate` incorrectly see "some coverage" via
+    /// `longest_match_entry`).
+    fn remove(&mut self, vrp: Vrp<A>) {
+        let (prefix, entry) = (vrp.prefix(), RoaEntry::from(vrp));
         let Some(mut entries) = self.0.get(prefix).cloned() else {
             return;
         };
@@ -141,54 +152,31 @@ impl<A: IpAddress> FamilyTable<A> {
 
 /// One decoded VRP change: announce or withdraw one `(prefix, max_len, asn)`.
 ///
-/// This is what a Prefix PDU becomes once it has been checked as
-/// representable. Staged transfers hold these instead of raw PDUs, so a
-/// staged delta can only ever contain prefix changes.
+/// Staged transfers hold these instead of raw PDUs, so a staged delta can only
+/// ever contain prefix changes — and, through [`Vrp`], only legal ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VrpOp {
     announce: bool,
-    vrp: Vrp,
+    vrp: FamilyVrp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Vrp {
-    V4(IpPrefix<Ipv4Addr>, RoaEntry),
-    V6(IpPrefix<Ipv6Addr>, RoaEntry),
+enum FamilyVrp {
+    V4(Vrp<Ipv4Addr>),
+    V6(Vrp<Ipv6Addr>),
 }
 
 impl VrpOp {
-    /// Decodes the change a Prefix PDU describes. `None` for any other PDU,
-    /// and for a prefix length the address family cannot represent (such a
-    /// record is skipped, exactly as before — whether it should instead be
-    /// reported as corrupt data is the separate prefix-bounds validation
-    /// issue, #91).
+    /// The change a Prefix PDU describes; `None` for any other PDU.
     pub(crate) fn from_pdu(pdu: &Pdu) -> Option<Self> {
         match *pdu {
-            Pdu::Ipv4Prefix {
-                flags,
-                prefix_len,
-                max_len,
-                prefix,
-                asn,
-            } => Some(Self {
+            Pdu::Ipv4Prefix { flags, vrp } => Some(Self {
                 announce: flags.announce,
-                vrp: Vrp::V4(
-                    IpPrefix::new(prefix, prefix_len).ok()?,
-                    RoaEntry { max_len, asn },
-                ),
+                vrp: FamilyVrp::V4(vrp),
             }),
-            Pdu::Ipv6Prefix {
-                flags,
-                prefix_len,
-                max_len,
-                prefix,
-                asn,
-            } => Some(Self {
+            Pdu::Ipv6Prefix { flags, vrp } => Some(Self {
                 announce: flags.announce,
-                vrp: Vrp::V6(
-                    IpPrefix::new(prefix, prefix_len).ok()?,
-                    RoaEntry { max_len, asn },
-                ),
+                vrp: FamilyVrp::V6(vrp),
             }),
             _ => None,
         }
@@ -213,8 +201,8 @@ impl Snapshot {
 
     pub(crate) fn apply(&mut self, op: VrpOp) {
         match op.vrp {
-            Vrp::V4(p, e) => apply_flagged(&mut self.v4, p, e, op.announce),
-            Vrp::V6(p, e) => apply_flagged(&mut self.v6, p, e, op.announce),
+            FamilyVrp::V4(vrp) => apply_flagged(&mut self.v4, vrp, op.announce),
+            FamilyVrp::V6(vrp) => apply_flagged(&mut self.v6, vrp, op.announce),
         }
     }
 }
@@ -281,36 +269,8 @@ impl RoaTable {
     /// the call site in `client.rs` a single match-free line).
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn apply_prefix_pdu(&self, pdu: &Pdu) {
-        match *pdu {
-            Pdu::Ipv4Prefix {
-                flags,
-                prefix_len,
-                max_len,
-                prefix,
-                asn,
-            } => {
-                let Ok(p) = IpPrefix::new(prefix, prefix_len) else {
-                    return;
-                };
-                let entry = RoaEntry { max_len, asn };
-                let mut table = self.v4.write().unwrap();
-                apply_flagged(&mut table, p, entry, flags.announce);
-            }
-            Pdu::Ipv6Prefix {
-                flags,
-                prefix_len,
-                max_len,
-                prefix,
-                asn,
-            } => {
-                let Ok(p) = IpPrefix::new(prefix, prefix_len) else {
-                    return;
-                };
-                let entry = RoaEntry { max_len, asn };
-                let mut table = self.v6.write().unwrap();
-                apply_flagged(&mut table, p, entry, flags.announce);
-            }
-            _ => {}
+        if let Some(op) = VrpOp::from_pdu(pdu) {
+            self.apply_delta(&[op]);
         }
     }
 
@@ -342,8 +302,8 @@ impl RoaTable {
         let mut v6 = self.v6.write().unwrap();
         for op in ops {
             match op.vrp {
-                Vrp::V4(p, e) => apply_flagged(&mut v4, p, e, op.announce),
-                Vrp::V6(p, e) => apply_flagged(&mut v6, p, e, op.announce),
+                FamilyVrp::V4(vrp) => apply_flagged(&mut v4, vrp, op.announce),
+                FamilyVrp::V6(vrp) => apply_flagged(&mut v6, vrp, op.announce),
             }
         }
     }
@@ -380,23 +340,17 @@ impl Retired {
     }
 }
 
-fn apply_flagged<A: IpAddress>(
-    table: &mut FamilyTable<A>,
-    prefix: IpPrefix<A>,
-    entry: RoaEntry,
-    announce: bool,
-) {
+fn apply_flagged<A: IpAddress>(table: &mut FamilyTable<A>, vrp: Vrp<A>, announce: bool) {
     if announce {
-        table.insert(prefix, entry);
+        table.insert(vrp);
     } else {
-        table.remove(prefix, entry);
+        table.remove(vrp);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pdu::PrefixFlags;
 
     fn p4(s: &str) -> IpPrefix<Ipv4Addr> {
         s.parse().unwrap()
@@ -404,6 +358,10 @@ mod tests {
 
     fn p6(s: &str) -> IpPrefix<Ipv6Addr> {
         s.parse().unwrap()
+    }
+
+    fn vrp<A: IpAddress>(prefix: IpPrefix<A>, entry: RoaEntry) -> Vrp<A> {
+        Vrp::new(prefix.ip(), prefix.mask(), entry.max_len, entry.asn).unwrap()
     }
 
     // ── FamilyTable ──────────────────────────────────────────────────────
@@ -420,13 +378,13 @@ mod tests {
     #[test]
     fn exact_match_is_valid() {
         let mut t: FamilyTable<Ipv4Addr> = FamilyTable::new();
-        t.insert(
+        t.insert(vrp(
             p4("192.0.2.0/24"),
             RoaEntry {
                 max_len: 24,
                 asn: 65001,
             },
-        );
+        ));
         assert_eq!(
             t.validate("192.0.2.1".parse().unwrap(), 24, 65001),
             RoaValidity::Valid
@@ -436,13 +394,13 @@ mod tests {
     #[test]
     fn exceeds_max_len_is_invalid() {
         let mut t: FamilyTable<Ipv4Addr> = FamilyTable::new();
-        t.insert(
+        t.insert(vrp(
             p4("192.0.2.0/24"),
             RoaEntry {
                 max_len: 24,
                 asn: 65001,
             },
-        );
+        ));
         // Announcing a /25 under a ROA whose max_len is /24.
         assert_eq!(
             t.validate("192.0.2.0".parse().unwrap(), 25, 65001),
@@ -453,13 +411,13 @@ mod tests {
     #[test]
     fn asn_mismatch_is_invalid() {
         let mut t: FamilyTable<Ipv4Addr> = FamilyTable::new();
-        t.insert(
+        t.insert(vrp(
             p4("192.0.2.0/24"),
             RoaEntry {
                 max_len: 24,
                 asn: 65001,
             },
-        );
+        ));
         assert_eq!(
             t.validate("192.0.2.1".parse().unwrap(), 24, 65002),
             RoaValidity::Invalid
@@ -469,13 +427,13 @@ mod tests {
     #[test]
     fn disjoint_prefix_is_not_found() {
         let mut t: FamilyTable<Ipv4Addr> = FamilyTable::new();
-        t.insert(
+        t.insert(vrp(
             p4("192.0.2.0/24"),
             RoaEntry {
                 max_len: 24,
                 asn: 65001,
             },
-        );
+        ));
         assert_eq!(
             t.validate("198.51.100.1".parse().unwrap(), 24, 65001),
             RoaValidity::NotFound
@@ -488,20 +446,20 @@ mod tests {
         // authorizes only AS 65002. Announcing the exact /24 under AS 65001
         // must find the /16 ROA even though the /24 ROA doesn't match.
         let mut t: FamilyTable<Ipv4Addr> = FamilyTable::new();
-        t.insert(
+        t.insert(vrp(
             p4("10.0.0.0/16"),
             RoaEntry {
                 max_len: 24,
                 asn: 65001,
             },
-        );
-        t.insert(
+        ));
+        t.insert(vrp(
             p4("10.0.5.0/24"),
             RoaEntry {
                 max_len: 24,
                 asn: 65002,
             },
-        );
+        ));
         assert_eq!(
             t.validate("10.0.5.1".parse().unwrap(), 24, 65001),
             RoaValidity::Valid
@@ -511,20 +469,20 @@ mod tests {
     #[test]
     fn multiple_overlapping_roas_no_match_is_invalid_not_not_found() {
         let mut t: FamilyTable<Ipv4Addr> = FamilyTable::new();
-        t.insert(
+        t.insert(vrp(
             p4("10.0.0.0/16"),
             RoaEntry {
                 max_len: 24,
                 asn: 65001,
             },
-        );
-        t.insert(
+        ));
+        t.insert(vrp(
             p4("10.0.5.0/24"),
             RoaEntry {
                 max_len: 24,
                 asn: 65002,
             },
-        );
+        ));
         assert_eq!(
             t.validate("10.0.5.1".parse().unwrap(), 24, 65003),
             RoaValidity::Invalid
@@ -534,20 +492,20 @@ mod tests {
     #[test]
     fn multiple_roas_at_same_prefix_any_match_wins() {
         let mut t: FamilyTable<Ipv4Addr> = FamilyTable::new();
-        t.insert(
+        t.insert(vrp(
             p4("192.0.2.0/24"),
             RoaEntry {
                 max_len: 24,
                 asn: 65001,
             },
-        );
-        t.insert(
+        ));
+        t.insert(vrp(
             p4("192.0.2.0/24"),
             RoaEntry {
                 max_len: 24,
                 asn: 65002,
             },
-        );
+        ));
         assert_eq!(
             t.validate("192.0.2.1".parse().unwrap(), 24, 65002),
             RoaValidity::Valid
@@ -561,8 +519,8 @@ mod tests {
             max_len: 24,
             asn: 65001,
         };
-        t.insert(p4("192.0.2.0/24"), entry);
-        t.remove(p4("192.0.2.0/24"), entry);
+        t.insert(vrp(p4("192.0.2.0/24"), entry));
+        t.remove(vrp(p4("192.0.2.0/24"), entry));
         assert_eq!(
             t.validate("192.0.2.1".parse().unwrap(), 24, 65001),
             RoaValidity::NotFound
@@ -576,11 +534,11 @@ mod tests {
             max_len: 24,
             asn: 65001,
         };
-        t.insert(p4("192.0.2.0/24"), entry);
-        t.insert(p4("192.0.2.0/24"), entry); // replay
+        t.insert(vrp(p4("192.0.2.0/24"), entry));
+        t.insert(vrp(p4("192.0.2.0/24"), entry)); // replay
         assert_eq!(t.len(), 1);
         // A single withdrawal now fully removes it — no phantom copy left.
-        t.remove(p4("192.0.2.0/24"), entry);
+        t.remove(vrp(p4("192.0.2.0/24"), entry));
         assert_eq!(t.len(), 0);
         assert_eq!(
             t.validate("192.0.2.1".parse().unwrap(), 24, 65001),
@@ -599,9 +557,9 @@ mod tests {
             max_len: 24,
             asn: 65002,
         };
-        t.insert(p4("192.0.2.0/24"), a);
-        t.insert(p4("192.0.2.0/24"), b);
-        t.remove(p4("192.0.2.0/24"), a);
+        t.insert(vrp(p4("192.0.2.0/24"), a));
+        t.insert(vrp(p4("192.0.2.0/24"), b));
+        t.remove(vrp(p4("192.0.2.0/24"), a));
         assert_eq!(
             t.validate("192.0.2.1".parse().unwrap(), 24, 65001),
             RoaValidity::Invalid // a is gone, but the prefix still has coverage from b
@@ -617,13 +575,13 @@ mod tests {
     #[test]
     fn v6_exact_match_is_valid() {
         let mut t: FamilyTable<Ipv6Addr> = FamilyTable::new();
-        t.insert(
+        t.insert(vrp(
             p6("2001:db8::/32"),
             RoaEntry {
                 max_len: 32,
                 asn: 65001,
             },
-        );
+        ));
         assert_eq!(
             t.validate("2001:db8::1".parse().unwrap(), 32, 65001),
             RoaValidity::Valid
@@ -633,13 +591,13 @@ mod tests {
     #[test]
     fn v6_exceeds_max_len_is_invalid() {
         let mut t: FamilyTable<Ipv6Addr> = FamilyTable::new();
-        t.insert(
+        t.insert(vrp(
             p6("2001:db8::/32"),
             RoaEntry {
                 max_len: 32,
                 asn: 65001,
             },
-        );
+        ));
         assert_eq!(
             t.validate("2001:db8::".parse().unwrap(), 48, 65001),
             RoaValidity::Invalid
@@ -649,13 +607,13 @@ mod tests {
     #[test]
     fn v6_disjoint_is_not_found() {
         let mut t: FamilyTable<Ipv6Addr> = FamilyTable::new();
-        t.insert(
+        t.insert(vrp(
             p6("2001:db8::/32"),
             RoaEntry {
                 max_len: 32,
                 asn: 65001,
             },
-        );
+        ));
         assert_eq!(
             t.validate("2001:db9::1".parse().unwrap(), 32, 65001),
             RoaValidity::NotFound
@@ -667,20 +625,18 @@ mod tests {
     #[test]
     fn roa_table_dispatches_v4_and_v6_independently() {
         let table = RoaTable::new();
-        table.apply_prefix_pdu(&Pdu::Ipv4Prefix {
-            flags: PrefixFlags { announce: true },
-            prefix_len: 24,
-            max_len: 24,
-            prefix: "192.0.2.0".parse().unwrap(),
-            asn: 65001,
-        });
-        table.apply_prefix_pdu(&Pdu::Ipv6Prefix {
-            flags: PrefixFlags { announce: true },
-            prefix_len: 32,
-            max_len: 32,
-            prefix: "2001:db8::".parse().unwrap(),
-            asn: 65002,
-        });
+        table.apply_prefix_pdu(&Pdu::announce_v4(
+            "192.0.2.0".parse().unwrap(),
+            24,
+            24,
+            65001,
+        ));
+        table.apply_prefix_pdu(&Pdu::announce_v6(
+            "2001:db8::".parse().unwrap(),
+            32,
+            32,
+            65002,
+        ));
         assert_eq!(
             table.validate_v4("192.0.2.1".parse().unwrap(), 24, 65001),
             RoaValidity::Valid
@@ -695,21 +651,9 @@ mod tests {
     #[test]
     fn roa_table_withdraw_via_pdu() {
         let table = RoaTable::new();
-        let announce = Pdu::Ipv4Prefix {
-            flags: PrefixFlags { announce: true },
-            prefix_len: 24,
-            max_len: 24,
-            prefix: "192.0.2.0".parse().unwrap(),
-            asn: 65001,
-        };
+        let announce = Pdu::announce_v4("192.0.2.0".parse().unwrap(), 24, 24, 65001);
         table.apply_prefix_pdu(&announce);
-        let withdraw = Pdu::Ipv4Prefix {
-            flags: PrefixFlags { announce: false },
-            prefix_len: 24,
-            max_len: 24,
-            prefix: "192.0.2.0".parse().unwrap(),
-            asn: 65001,
-        };
+        let withdraw = Pdu::announce_v4("192.0.2.0".parse().unwrap(), 24, 24, 65001).withdrawn();
         table.apply_prefix_pdu(&withdraw);
         assert_eq!(
             table.validate_v4("192.0.2.1".parse().unwrap(), 24, 65001),
@@ -725,23 +669,17 @@ mod tests {
     fn install_returns_the_previous_generation_for_deferred_drop() {
         let table = RoaTable::new();
         for asn in [65001, 65002] {
-            table.apply_prefix_pdu(&Pdu::Ipv4Prefix {
-                flags: PrefixFlags { announce: true },
-                prefix_len: 24,
-                max_len: 24,
-                prefix: Ipv4Addr::new(192, 0, 2, 0),
-                asn,
-            });
+            let prefix = Ipv4Addr::new(192, 0, 2, 0);
+            table.apply_prefix_pdu(&Pdu::announce_v4(prefix, 24, 24, asn));
         }
         let mut snap = Snapshot::new();
         snap.apply(
-            VrpOp::from_pdu(&Pdu::Ipv6Prefix {
-                flags: PrefixFlags { announce: true },
-                prefix_len: 32,
-                max_len: 32,
-                prefix: "2001:db8::".parse().unwrap(),
-                asn: 65009,
-            })
+            VrpOp::from_pdu(&Pdu::announce_v6(
+                "2001:db8::".parse().unwrap(),
+                32,
+                32,
+                65009,
+            ))
             .unwrap(),
         );
         let retired = table.install(snap);
@@ -754,13 +692,12 @@ mod tests {
     #[test]
     fn roa_table_clear_removes_data() {
         let table = RoaTable::new();
-        table.apply_prefix_pdu(&Pdu::Ipv4Prefix {
-            flags: PrefixFlags { announce: true },
-            prefix_len: 24,
-            max_len: 24,
-            prefix: "192.0.2.0".parse().unwrap(),
-            asn: 65001,
-        });
+        table.apply_prefix_pdu(&Pdu::announce_v4(
+            "192.0.2.0".parse().unwrap(),
+            24,
+            24,
+            65001,
+        ));
         table.clear();
         assert!(table.is_empty());
     }
@@ -775,12 +712,8 @@ mod tests {
 
         fn pdus(n: u32, base: u32) -> Vec<Pdu> {
             (0..n)
-                .map(|i| Pdu::Ipv4Prefix {
-                    flags: PrefixFlags { announce: true },
-                    prefix_len: 24,
-                    max_len: 24,
-                    prefix: Ipv4Addr::from((base + i) << 8),
-                    asn: 64_512 + (i % 1000),
+                .map(|i| {
+                    Pdu::announce_v4(Ipv4Addr::from((base + i) << 8), 24, 24, 64_512 + (i % 1000))
                 })
                 .collect()
         }
@@ -856,6 +789,10 @@ mod prop_tests {
 
     use super::*;
 
+    fn vrp(prefix: IpPrefix<Ipv4Addr>, entry: RoaEntry) -> Vrp<Ipv4Addr> {
+        Vrp::new(prefix.ip(), prefix.mask(), entry.max_len, entry.asn).unwrap()
+    }
+
     #[derive(Debug, Clone)]
     enum Op {
         Insert(IpPrefix<Ipv4Addr>, RoaEntry),
@@ -867,14 +804,18 @@ mod prop_tests {
             .prop_map(|(addr, len)| IpPrefix::new(Ipv4Addr::from(addr), len).unwrap().masked())
     }
 
-    fn arb_entry() -> impl Strategy<Value = RoaEntry> {
-        (0u8..=32, 1u32..=10).prop_map(|(max_len, asn)| RoaEntry { max_len, asn })
+    /// A record a cache could legally send: `prefix_len <= max_len <= 32`.
+    fn arb_record() -> impl Strategy<Value = (IpPrefix<Ipv4Addr>, RoaEntry)> {
+        arb_prefix().prop_flat_map(|prefix| {
+            (Just(prefix), prefix.mask()..=32, 1u32..=10)
+                .prop_map(|(prefix, max_len, asn)| (prefix, RoaEntry { max_len, asn }))
+        })
     }
 
     fn arb_op() -> impl Strategy<Value = Op> {
         prop_oneof![
-            (arb_prefix(), arb_entry()).prop_map(|(p, e)| Op::Insert(p, e)),
-            (arb_prefix(), arb_entry()).prop_map(|(p, e)| Op::Remove(p, e)),
+            arb_record().prop_map(|(p, e)| Op::Insert(p, e)),
+            arb_record().prop_map(|(p, e)| Op::Remove(p, e)),
         ]
     }
 
@@ -921,13 +862,13 @@ mod prop_tests {
             for op in &ops {
                 match op {
                     Op::Insert(p, e) => {
-                        table.insert(*p, *e);
+                        table.insert(vrp(*p, *e));
                         if !naive.contains(&(*p, *e)) {
                             naive.push((*p, *e));
                         }
                     }
                     Op::Remove(p, e) => {
-                        table.remove(*p, *e);
+                        table.remove(vrp(*p, *e));
                         naive.retain(|(np, ne)| !(np == p && ne == e));
                     }
                 }

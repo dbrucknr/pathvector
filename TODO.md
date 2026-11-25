@@ -1790,10 +1790,21 @@ tracked as their own issues: #89, #91, #92, #93, #94. Interactions worth knowing
 about: #93 (application-level query deadline) is what bounds a *stalled* sync — expiry
 now bounds how stale the data can get meanwhile; #92 will want the staged transfer
 (`Staged`) as the place to detect duplicate/unknown records before anything is
-published; #89's persistent frame buffer replaces `read_frame` in `client.rs` and is
-independent of the new state machine; `pathvectord` should call
+published; `pathvectord` should call
 `RtrConfig::validate()` when loading `[daemon.rpki]` timers (not done here — outside
 the crate).
+
+**#89 and #91 fixed 2026-11-25** (see CHANGELOG): framing is now `frame.rs` +
+`transport.rs`, and prefix records are `Vrp<A>` values. Left open from that work:
+
+- Error Reports for other malformed input. `Violation::malformed` reports only a
+  forbidden prefix tuple; an unknown PDU type (RFC 8210 §12 code 5), unsupported
+  protocol version (code 4) or wrong Length (code 0) still drops the session silently.
+  The decoder already hands over the offending bytes; the care needed is in never
+  reporting a malformed Error Report (§5.11) and not disturbing the v1→v0 fallback.
+- `RtrHandle::validate_v4`/`validate_v6` take a bare `(address, prefix_len)`, so a
+  caller can still ask about a `/33`. A typed prefix argument would need a
+  `pathvector-policy` change.
 
 **22. "Audit-the-audit" pass — is anything not tracked that should be?**
 Prompted directly by the user asking whether `RFC_REQUIREMENTS.md` itself
