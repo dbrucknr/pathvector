@@ -909,9 +909,25 @@ refused (8210bis would refuse them, for protocol version 2 only; note that
 draft names the code "1 (Corrupt Data)" although Corrupt Data is 0), and the
 resume serial is forgotten after a refused record.
 
-Noticed and not fixed: RFC 8210 §12 also defines codes 4 and 5 (and 0) for an
+Noticed then: RFC 8210 §12 also defines codes 4 and 5 (and 0) for an
 unsupported protocol version, an unsupported PDU type and a corrupt Length; the
-client ends the session for these without sending a report (`TODO.md` 21a).
+client ended the session for these without sending a report. Fixed in the update
+below.
+
+**Update 2026-11-25 — Error Reports for undecodable PDUs.** Clauses re-read from
+rfc-editor.org (RFC 8210 §§5.1, 5.2, 5.11, 7, 12; RFC 6810 §§5.1, 5.10, 10; no
+errata found and no RFC updates RFC 8210).
+
+| Area | What was wrong | Resolution |
+|---|---|---|
+| §12 codes 0, 4, 5 | The earlier audit counted error codes only as things *received*; nothing checked which the router has to *send*. | Each decode failure maps to a code in one function; black-box tests send raw bytes and parse the reply independently of the codec. |
+| §5.2/§7 "regardless of the Protocol Version field" | Not previously noticed: the decoder rejected an unknown version before the state machine could apply the Serial Notify exemption, so a version 2 Serial Notify during negotiation ended the session. The existing test only used versions 0 and 1. | The 12-byte notify of an unknown version is skipped while negotiating. |
+| §7 vs §12 code 4 | Code 4 reads as the code for any unknown version, but §7 gives a PDU "for a different Protocol Version" after negotiation code 8. | 4 while negotiating, 8 after; the version rule is applied before the type or Length is judged. |
+
+Design points the RFCs leave open: terminating rather than downgrading on an
+unrecognized version during negotiation (§7 allows either); forgetting the resume
+serial after codes 0 and 5, keeping it after 4, 8 and a broken Error Report.
+Still open: see `TODO.md` 21a.
 
 ---
 
