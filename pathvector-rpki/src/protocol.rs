@@ -26,7 +26,7 @@
 //! forget a part of the RFC-mandated reaction.
 
 use crate::{
-    error::RtrError,
+    error::{PduError, RtrError, VrpError},
     pdu::{EndOfDataIntervals, Pdu, RtrVersion},
 };
 
@@ -212,6 +212,35 @@ impl Violation {
             error,
             report: None,
             consequence: Consequence::Drop,
+        }
+    }
+
+    /// The peer sent bytes that are not a legal PDU.
+    ///
+    /// A Prefix PDU whose lengths RFC 8210 §§5.1, 5.6 and 5.7 forbid is §12
+    /// error 0, "Corrupt Data (fatal)": "The receiver believes the received
+    /// PDU to be corrupt in a manner not specified by another error code", and
+    /// "Errors which are considered fatal MUST cause the session to be
+    /// dropped" (RFC 6810 §10: SHOULD). The installed VRPs came from a
+    /// completed transfer and stay; the resume point is forgotten, because a
+    /// Serial Query from it would only be answered with the same refused
+    /// change set. (The RFCs do not say what to ask for next.)
+    pub(crate) fn malformed(error: PduError) -> Self {
+        let PduError::InvalidPrefix(invalid) = error else {
+            return Self::plain(RtrError::Pdu(error));
+        };
+        let text = match invalid {
+            VrpError::PrefixLengthExceedsFamily { .. } => "Prefix Length out of range",
+            VrpError::MaxLengthExceedsFamily { .. } => "Max Length out of range",
+            VrpError::MaxLengthBelowPrefixLength { .. } => "Max Length less than Prefix Length",
+        };
+        Self {
+            error: RtrError::Pdu(error),
+            report: Some(ErrorReportSpec {
+                code: ERROR_CODE_CORRUPT_DATA,
+                text,
+            }),
+            consequence: Consequence::ForgetResume,
         }
     }
 
@@ -513,7 +542,42 @@ pub(crate) fn on_idle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pdu::PrefixFlags;
+    use crate::error::{PduError, VrpError};
+
+    /// RFC 8210 §12 code 0 for a forbidden prefix tuple: reported, fatal, and
+    /// the resume point (not the data) is forgotten.
+    #[test]
+    fn forbidden_prefix_tuple_is_corrupt_data() {
+        for invalid in [
+            VrpError::PrefixLengthExceedsFamily {
+                prefix_len: 33,
+                family_bits: 32,
+            },
+            VrpError::MaxLengthExceedsFamily {
+                max_len: 129,
+                family_bits: 128,
+            },
+            VrpError::MaxLengthBelowPrefixLength {
+                prefix_len: 24,
+                max_len: 16,
+            },
+        ] {
+            let violation = Violation::malformed(PduError::InvalidPrefix(invalid));
+            assert_eq!(
+                violation.report.map(|r| r.code),
+                Some(ERROR_CODE_CORRUPT_DATA)
+            );
+            assert_eq!(violation.consequence, Consequence::ForgetResume);
+        }
+    }
+
+    /// Other malformed input keeps its previous handling (drop, no report).
+    #[test]
+    fn other_decode_errors_end_the_session_without_touching_the_cache() {
+        let violation = Violation::malformed(PduError::UnknownPduType(5));
+        assert_eq!(violation.report, None);
+        assert_eq!(violation.consequence, Consequence::Drop);
+    }
 
     const V0: RtrVersion = RtrVersion::V0;
     const V1: RtrVersion = RtrVersion::V1;
@@ -527,13 +591,7 @@ mod tests {
     }
 
     fn prefix() -> Pdu {
-        Pdu::Ipv4Prefix {
-            flags: PrefixFlags { announce: true },
-            prefix_len: 24,
-            max_len: 24,
-            prefix: "192.0.2.0".parse().unwrap(),
-            asn: 65001,
-        }
+        Pdu::announce_v4("192.0.2.0".parse().unwrap(), 24, 24, 65001)
     }
 
     fn eod(session_id: u16, version: RtrVersion) -> Pdu {
