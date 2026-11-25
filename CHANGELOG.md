@@ -23,6 +23,27 @@ bounded-length matching.
 
 ---
 
+## 2026-11-25 (pathvectord: a coalesced session teardown refreshes the capability set — issue #148)
+
+`run_event_loop` had two hand-written copies of `SessionEvent::Terminated` handling. Only the one
+for the first event of a batch sent `SessionCommand::SetCapabilities`. With `restarting = true`, a
+session whose teardown was coalesced behind other events therefore kept the set it was spawned
+with: its later OPENs carried Restart State (R) = 1 and Forwarding State (F) = 0 for IPv4 and IPv6
+unicast. RFC 4724 §4.2 says a speaker re-establishing a session MUST NOT set R unless it has
+restarted, and a peer that receives F = 0 MUST delete the stale routes it retained for that family.
+
+- Both arms now call one `handle_session_terminated`, which returns the refresh owed to the
+  session. The send happens after the state write lock is released, including when the drain loop
+  leaves early to send a NOTIFICATION.
+- Tests: `coalesced_teardown_refreshes_capabilities`,
+  `coalesced_teardown_refreshes_capabilities_when_batch_ends_in_notification`,
+  `coalesced_capability_refresh_is_sent_without_the_state_lock`. All three failed on the old code.
+- Unchanged: a session that has not reached Established since our restart still sends R = 1 after
+  `graceful_restart_time` has passed. RFC 4724 §4.1 requires the Restarting Speaker to set R to
+  re-establish a session and defines no expiry for it.
+
+---
+
 ## 2026-11-25 (pathvector-rpki: partial RTR PDUs and prefix tuple bounds — issues #89, #91)
 
 **#89 — a refresh could lose the bytes of a partly received PDU.** The idle loop races the
@@ -415,6 +436,133 @@ Related and untouched: #96 (extended-message/AS-width setup reads possibly stale
 `Session.config` capabilities — `AsnWidth::negotiate` is now the single place to fix it for
 the AS width), #97 (outbound size/length overflow — the segment split here removes only the
 `AS_PATH` count wrap).
+
+---
+
+## 2026-11-23 (GH #105: metrics hooks now run for every event the event loop coalesces)
+
+`run_event_loop` coalesces every event already queued behind the first into one
+write-lock hold, but called its metrics hooks only for the first. The drain
+loop handled Established, Terminated and RouteUpdate events without them, so
+under load `pathvectord_bgp_session_up` could stay at 1 for a peer that was
+gone, `sessions_established_total` / `sessions_terminated_total` /
+`updates_received_total` undercounted, and `adj_rib_in_prefixes` was stale
+(read 785,254 against a true 1,133,510).
+
+- The coalesced Established, Terminated and RouteUpdate arms now call the same
+  hooks as the first-event arm, in the same order (Terminated records the
+  reason before `on_terminated` consumes it).
+- The first-event Terminated arm `continue`s before the end-of-batch gauge
+  refresh, so `pathvectord_bgp_loc_rib_prefixes` stayed at its pre-teardown
+  value; it now refreshes the RIB-size gauges before returning.
+- Three regression tests drive queued events through `run_event_loop` with a
+  recording metrics recorder; each was confirmed to fail on the old code for
+  the reported reason (`session_up` stuck at 1, no series for a coalesced
+  Established, no Loc-RIB gauge after a first-event teardown).
+- End to end: five full-table `pathvector-loadtest` runs (converge, churn,
+  teardown, reconverge; 1,133,510 prefixes) show no `METRIC DISCREPANCY`, where
+  every convergence previously did and ~3 in 10 teardown checks hit the stuck
+  `session_up`. The harness's teardown and reconverge scenarios now cross-check
+  `session_up` so a regression is flagged. Convergence write-lock totals were
+  3.25-3.52 s versus 3.1-3.7 s before: the per-event hooks add no measurable
+  cost.
+
+**Same root cause, not fixed here:** the coalesced Terminated arm also never
+sends `SessionCommand::SetCapabilities` (the RFC 4724 §3 R-bit refresh the
+first-event arm performs). Two hand-copied versions of the per-event handling
+will keep drifting; that is a protocol-behaviour question, tracked separately.
+
+## 2026-11-23 (PR-1 load harness `pathvector-loadtest` + first full-table measurements)
+
+New crate `pathvector-loadtest` (binary `loadtest`, `just loadtest`): spawns a
+real `pathvectord`, connects N loader peers that each announce a full MRT table
+plus one quiet control peer with a 9 s hold timer, and runs `idle`, `converge`,
+`cow`, `teardown`, `reconverge` and `export` scenarios. Each reports the control
+peer's longest keepalive silence, gRPC `list_peers` latency, peak RSS and the
+daemon's own lock-hold / event-batch / session-blocked histograms, diffed over
+exactly that scenario's window. See `pathvector-loadtest/README.md`.
+`pathvector-mrt` became lib + bin so the UPDATE builder
+(`build_update_messages`, `build_withdraw_messages`) is shared.
+
+**First measurements** — one loader announcing a 1,133,510-prefix RIPE RIS
+dump over loopback, Apple M2 Max, release build. *Not* the PR-1 exit-criteria
+run (that needs ≥ 2 loaders; see below). The control peer's keepalive silence
+stayed at 3.0–3.2 s in every window; it never approached the 9 s hold time.
+
+| Scenario | Longest single write-lock hold (upper bucket bound) | gRPC `list_peers` worst |
+|---|---|---|
+| Initial convergence | ≤ 2.5 s (3.1–3.7 s total over 4–8 k batches; > 1,024 events coalesced into one hold) | 1.0–1.9 s |
+| Teardown of a full-table peer | **one hold of 1.1–1.5 s** | 1.0–1.2 s |
+| Reconvergence into a populated RIB | ≤ 2.5 s | 2.4 s |
+| Churn of 2,000 prefixes, no management client | ≤ 25 ms | — |
+
+- **Session backpressure is real and measured.** During convergence the
+  loader's session task was parked on the full event channel 96,486 times for
+  2.72 s in total (up to 250 ms at a stretch). That task owns the session's
+  keepalive timer, so a busy *sending* peer delays its own keepalives.
+- **A `list_peers` call makes the daemon clone the RIB under the write lock.**
+  `build_peer_state` scans the whole Loc-RIB per peer (~230 ms on this table)
+  while holding the `Arc<RibSnapshot>`, so the next event-loop mutation hits
+  `Arc::make_mut`'s copy-on-write. A/B on identical churn: with the 10 Hz
+  probe, single holds up to 500 ms and RSS 1.24 → 1.9 GiB; with it off, holds
+  ≤ 25 ms and flat RSS. Cause inferred from the code path plus those two
+  signatures, not isolated with a profiler. `watch_routes` snapshots do not
+  have this effect on hold time (they cost ~760 MiB of RSS instead).
+- **Daemon metrics bug, found by this harness (fixed — see the entry above).** The event loop
+  calls `on_route_update`, `on_session_established` and
+  `on_session_terminated` only for the first event of each coalesced batch;
+  its drain loop handles the same events without them. Observed: the
+  Adj-RIB-In gauge reads 785,254 when the daemon holds 1,133,510, and a
+  coalesced Terminated left `pathvectord_bgp_session_up{peer}` at **1** for a
+  peer the daemon's own log and gRPC state showed as down.
+- **Reconnect delay after an Established session ends.** The FSM goes to
+  `Idle` and ignores inbound connections until its ConnectRetry timer fires
+  (120 s by default), so a peer that flaps and redials gets no OPEN for that
+  long. Observed directly; not changed.
+
+**Harness corrections from review of PR #114** (2026-11-25):
+
+- Silence before the control peer's first recorded message was not measured: a
+  daemon that sent nothing after the handshake read as 0 ns and **OK**. It is
+  now measured from the handshake KEEPALIVE. A one-loader full-table re-run
+  with the fix (`idle`, `converge`, `cow`, `teardown`, `reconverge`; same
+  machine and dump size) read 3.00 s in five windows and 3.69 s in the
+  `watch_routes` window, hold 9 s.
+- Bulk sends and the harness's `get_peer` / `set_export_default` calls had no
+  deadline, so a stalled daemon hung the run instead of failing it. Each is now
+  bounded by `--timeout-secs`, as is the startup readiness check.
+
+**Not yet done** (PR-1 exit criteria): a run with ≥ 2 simultaneous full-table
+peers (needs `lo0` aliases on macOS), the `export` scenario (needs ≥ 2
+loaders), Graceful Restart recovery, route refresh and RPKI cache replacement.
+
+## 2026-11-23 (PR-1 control-plane stall instrumentation — measurement only, no behaviour change)
+
+First step of `PRODUCTION_READINESS.md` PR-1: make the stalls measurable before
+changing the architecture. New Prometheus histograms (real buckets, 100 µs–30 s,
+so `histogram_quantile()` works):
+
+- `pathvectord_state_lock_wait_seconds{kind}` / `pathvectord_state_lock_hold_seconds{kind}` —
+  every steady-state write-lock acquisition on `DaemonState` (event loop,
+  RPKI install/re-evaluation, FIB change, GR deadline, selection deferral,
+  max-prefix idle, MRAI, and the mutating gRPC handlers) via the new
+  `lock_timing::write_timed` guard. `kind` is the call site, never peer-derived.
+  The single startup acquisition that wires the FIB writer and route oracles
+  before any session exists is deliberately not timed.
+- `pathvectord_event_loop_batch_events` — events coalesced under one
+  `event_batch` hold (the drain loop is currently uncapped).
+- `pathvector_session_event_send_blocked_seconds{peer}` — time a session task
+  was parked on a full event channel. That task also owns the hold/keepalive
+  timers, so this is the direct backpressure path from a slow daemon loop to
+  missed KEEPALIVEs. Fast path is a `try_send`; only genuinely blocked sends
+  are timed.
+- `pathvector_session_keepalive_lateness_seconds{peer}` — how far past due the
+  keepalive timer was serviced (also exposes starvation by the `biased;`
+  `select!` ordering, independent of the daemon loop).
+
+`pathvector-session` gains a dependency on the `metrics` facade crate (a no-op
+unless the embedding application installs a recorder). Not yet done: the
+two-full-table-peers + control-peer load run that PR-1's exit criteria require.
 
 ---
 

@@ -70,7 +70,13 @@ before a high-consequence deployment.
 ### PR-1: Bound control-plane stalls under production load
 
 **Status:** Open; underlying architecture and several hot paths are already
-tracked in [`TODO.md`](TODO.md).
+tracked in [`TODO.md`](TODO.md). Lock-hold, event-batch, session-send-blocked
+and keepalive-lateness histograms landed 2026-11-23, along with the
+`pathvector-loadtest` harness and first single-loader full-table measurements
+(see CHANGELOG.md: a full-table peer teardown holds the write lock for
+1.1–1.5 s; the same runs found that a `list_peers` call made the daemon clone
+the RIB under it, since fixed in GH #106). The two-full-table-peer run the exit
+criteria require has not been done.
 
 All peer events currently converge on one daemon event loop and a broad
 `DaemonState` write lock. Full-table advertisement, Graceful Restart stale-route
