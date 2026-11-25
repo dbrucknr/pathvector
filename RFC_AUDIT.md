@@ -895,6 +895,25 @@ Still open from the same review, deliberately not touched here: #89
 (duplicate announcement / unknown withdrawal, Error Codes 6/7), #93 (stalled-query
 deadlines, retry timing across reconnects), #94 (coverage-claim documentation).
 
+**Update 2026-11-25 — #89 and #91 fixed.** Clauses re-read from rfc-editor.org
+(RFC 8210 §§5, 5.1, 5.6, 5.7, 5.11, 12; RFC 6810 §§5, 5.1, 10; RFC 6811 §2;
+no errata or updating RFC changes them), and the 8210bis-29 draft consulted.
+
+| Area | What was wrong | Resolution |
+|---|---|---|
+| §5.1 Length-delimited framing | The original audit never considered *when* a read can be abandoned: the idle `select!` dropped a half-finished `read_exact`, losing consumed bytes (#89). Tests only ever wrote whole PDUs. | Framing state moved into a pure decoder (`frame.rs`) owned by the connection; black-box tests split a Serial Notify at every offset while the timer fires. |
+| §5.1/§5.6/§5.7 field ranges | "PDU length bound … confirmed correct" covered the PDU's size only. Prefix Length and Max Length were never range-checked: Max Length < Prefix Length was installed and, being *covering* under RFC 6811 §2, turned routes `Invalid` (#91). | Valid-by-construction `Vrp<A>`; violations are Error Report 0 and drop the session. |
+
+Design points the RFCs leave open, recorded so they are not mistaken for
+requirements: address bits beyond the Prefix Length are cleared rather than
+refused (8210bis would refuse them, for protocol version 2 only; note that
+draft names the code "1 (Corrupt Data)" although Corrupt Data is 0), and the
+resume serial is forgotten after a refused record.
+
+Noticed and not fixed: RFC 8210 §12 also defines codes 4 and 5 (and 0) for an
+unsupported protocol version, an unsupported PDU type and a corrupt Length; the
+client ends the session for these without sending a report (`TODO.md` 21a).
+
 ---
 
 # RFC 6811 — BGP Prefix Origin Validation

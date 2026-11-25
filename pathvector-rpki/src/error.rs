@@ -16,6 +16,10 @@ pub enum PduError {
     InvalidLength { pdu_type: u8, len: u32 },
     /// An Error Report PDU's text field is not valid UTF-8.
     Utf8(std::str::Utf8Error),
+    /// A Prefix PDU's lengths are outside what RFC 8210 §§5.1, 5.6 and 5.7
+    /// permit (RFC 6810 §5 for version 0). The client answers with an Error
+    /// Report, code 0 ("Corrupt Data"), and drops the session.
+    InvalidPrefix(VrpError),
 }
 
 impl std::fmt::Display for PduError {
@@ -32,6 +36,7 @@ impl std::fmt::Display for PduError {
                 write!(f, "invalid PDU length {len} for PDU type {pdu_type}")
             }
             Self::Utf8(e) => write!(f, "invalid UTF-8 in Error Report text: {e}"),
+            Self::InvalidPrefix(e) => write!(f, "invalid Prefix PDU: {e}"),
         }
     }
 }
@@ -40,10 +45,53 @@ impl std::error::Error for PduError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Utf8(e) => Some(e),
+            Self::InvalidPrefix(e) => Some(e),
             _ => None,
         }
     }
 }
+
+/// Why a `(prefix length, max length)` pair cannot form a VRP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VrpError {
+    /// Prefix Length is longer than the address family's addresses.
+    PrefixLengthExceedsFamily { prefix_len: u8, family_bits: u8 },
+    /// Max Length is longer than the address family's addresses.
+    MaxLengthExceedsFamily { max_len: u8, family_bits: u8 },
+    /// RFC 8210 §5.1: Max Length "MUST NOT be less than the Prefix Length
+    /// element".
+    MaxLengthBelowPrefixLength { prefix_len: u8, max_len: u8 },
+}
+
+impl std::fmt::Display for VrpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PrefixLengthExceedsFamily {
+                prefix_len,
+                family_bits,
+            } => write!(
+                f,
+                "Prefix Length {prefix_len} exceeds the {family_bits}-bit address family"
+            ),
+            Self::MaxLengthExceedsFamily {
+                max_len,
+                family_bits,
+            } => write!(
+                f,
+                "Max Length {max_len} exceeds the {family_bits}-bit address family"
+            ),
+            Self::MaxLengthBelowPrefixLength {
+                prefix_len,
+                max_len,
+            } => write!(
+                f,
+                "Max Length {max_len} is less than Prefix Length {prefix_len}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VrpError {}
 
 /// An [`RtrConfig`](crate::RtrConfig) timer is outside what RFC 8210 §6
 /// permits a cache to advertise.

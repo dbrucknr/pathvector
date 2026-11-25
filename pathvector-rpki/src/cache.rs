@@ -442,25 +442,12 @@ pub(crate) fn table_from(
     v4: impl IntoIterator<Item = (std::net::Ipv4Addr, u8, u8, u32)>,
     v6: impl IntoIterator<Item = (std::net::Ipv6Addr, u8, u8, u32)>,
 ) -> RoaTable {
-    use crate::pdu::PrefixFlags;
     let table = RoaTable::new();
     for (prefix, prefix_len, max_len, asn) in v4 {
-        table.apply_prefix_pdu(&Pdu::Ipv4Prefix {
-            flags: PrefixFlags { announce: true },
-            prefix_len,
-            max_len,
-            prefix,
-            asn,
-        });
+        table.apply_prefix_pdu(&Pdu::announce_v4(prefix, prefix_len, max_len, asn));
     }
     for (prefix, prefix_len, max_len, asn) in v6 {
-        table.apply_prefix_pdu(&Pdu::Ipv6Prefix {
-            flags: PrefixFlags { announce: true },
-            prefix_len,
-            max_len,
-            prefix,
-            asn,
-        });
+        table.apply_prefix_pdu(&Pdu::announce_v6(prefix, prefix_len, max_len, asn));
     }
     table
 }
