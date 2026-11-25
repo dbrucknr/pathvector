@@ -3,6 +3,7 @@ use ipnetx::interfaces::IpAddress;
 use pathvector_types::Nlri;
 
 use crate::{
+    canonical::CanonicalNlri,
     peer::PeerId,
     route::{Route, Staleness},
 };
@@ -19,6 +20,12 @@ use crate::{
 /// is what makes soft reconfiguration possible: if you change your import
 /// policy, you re-process the `AdjRibIn` without asking the peer to
 /// re-advertise.
+///
+/// # Prefix identity
+///
+/// Bits beyond the prefix length are irrelevant (RFC 4271 §4.3, RFC 4760 §5):
+/// every method accepts any spelling of an NLRI, and stored routes and keys are
+/// canonical, with those bits zero.
 ///
 /// # Examples
 ///
@@ -42,7 +49,7 @@ use crate::{
 #[derive(Clone)]
 pub struct AdjRibIn<A: IpAddress> {
     peer: PeerId,
-    routes: AHashMap<Nlri<A>, Route<A>>,
+    routes: AHashMap<CanonicalNlri<A>, Route<A>>,
 }
 
 impl<A: IpAddress> AdjRibIn<A> {
@@ -64,7 +71,8 @@ impl<A: IpAddress> AdjRibIn<A> {
     /// Inserts or replaces a route.
     ///
     /// If the peer previously advertised a different route for this prefix,
-    /// the old route is replaced and returned.
+    /// the old route is replaced and returned. The route is stored with its
+    /// NLRI in canonical form (see [prefix identity](AdjRibIn#prefix-identity)).
     ///
     /// # Examples
     ///
@@ -81,25 +89,30 @@ impl<A: IpAddress> AdjRibIn<A> {
     /// assert!(old.is_none());
     /// ```
     pub fn insert(&mut self, route: Route<A>) -> Option<Route<A>> {
-        self.routes.insert(route.nlri, route)
+        let key = CanonicalNlri::new(route.nlri);
+        let mut route = route;
+        route.nlri = key.nlri();
+        self.routes.insert(key, route)
     }
 
     /// Removes the route for a prefix and returns it, if present.
     ///
     /// Called when the peer sends a WITHDRAW for this prefix.
     pub fn withdraw(&mut self, nlri: &Nlri<A>) -> Option<Route<A>> {
-        self.routes.remove(nlri)
+        self.routes.remove(&CanonicalNlri::new(*nlri))
     }
 
     /// Returns the route for a prefix, if present.
     #[must_use]
     pub fn get(&self, nlri: &Nlri<A>) -> Option<&Route<A>> {
-        self.routes.get(nlri)
+        self.routes.get(&CanonicalNlri::new(*nlri))
     }
 
     /// Iterates over all `(prefix, route)` pairs in this table.
     pub fn routes(&self) -> impl Iterator<Item = (&Nlri<A>, &Route<A>)> {
-        self.routes.iter()
+        self.routes
+            .iter()
+            .map(|(key, route)| (key.as_nlri(), route))
     }
 
     /// Returns the number of prefixes in this table.
