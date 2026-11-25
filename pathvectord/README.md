@@ -423,6 +423,10 @@ a reverse proxy in front.
 | `pathvector.v1.OriginationService` | `OriginateRoute`, `OriginateRoutes`, `WithdrawOriginatedRoute`, `WithdrawOriginatedRoutes`, `ListOriginatedRoutes` |
 | `pathvector.v1.WatchService` | `WatchRoutes`, `WatchPeers` |
 
+Address bits beyond the prefix length are ignored in every request (RFC 4271
+§4.3): originating `10.1.2.3/8` originates `10.0.0.0/8`, any spelling withdraws
+or looks it up, and responses always name the canonical prefix.
+
 Full schema: [`proto/pathvector/v1/management.proto`](../proto/pathvector/v1/management.proto)
 
 The `pathvector` CLI wraps all services with a human-friendly interface. `grpcurl` works
