@@ -2127,6 +2127,22 @@ whose comment described a value the fixed generator can no longer produce.
 
 ---
 
+## AS-number rules: follow-ups from issues #109–#111 (2026-11-25)
+
+- **RFC 9774 operator exception.** §3 allows an operator to permit AS_SET /
+  AS_CONFED_SET during a transition. Not offered: a peer still sending them
+  has those routes withdrawn. If needed, make it a per-peer, opt-in setting
+  that is logged, covering both receive (session decoder and daemon gate) and
+  send.
+- **Differing repeated FourByteAsn capabilities.** The first instance wins
+  (zero in any instance is refused). RFC 6793 does not define the case; decide
+  whether differing values should be rejected, as for BGP Role.
+- **Library send path.** `SessionHandle::update_sender` sends what it is given;
+  only `pathvectord` applies the RFC 7607 / 9774 send rules.
+- **Flaky transport tests.** `test_framed_transport_send_io_error_is_forwarded`
+  and `test_collision_candidate_deferred_in_open_sent_closed_on_manual_stop`
+  each failed intermittently in full parallel runs (socket close timing).
+
 ## General
 
 ### Testing strategy — overall picture (2026-06-11)

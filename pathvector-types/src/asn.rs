@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 /// A 32-bit BGP Autonomous System Number (ASN).
 ///
 /// Every network that participates in BGP is assigned a globally unique ASN by a
@@ -38,6 +40,12 @@
 pub struct Asn(u32);
 
 impl Asn {
+    /// AS 0, reserved. It is a legitimate *value* — an RPKI ROA names it to
+    /// say a prefix must not be routed (RFC 6483 §4) — but RFC 7607
+    /// prohibits it in BGP: see [`SpeakerAsn`] for identities and the
+    /// receive rules in `pathvector-session` for path attributes.
+    pub const ZERO: Self = Self(0);
+
     /// Placeholder ASN used when a 4-byte ASN must be carried through a
     /// 2-byte-only BGP segment (RFC 6793 §7). The session layer substitutes
     /// this value on the wire; the actual ASN is preserved in the
@@ -174,6 +182,78 @@ impl std::fmt::Display for Asn {
     }
 }
 
+/// An AS number that can identify a BGP speaker: any [`Asn`] except 0.
+///
+/// RFC 7607 §2: a speaker that "receives zero as the peer AS in an OPEN
+/// message ... MUST abort the connection", and "A router MUST NOT initiate a
+/// connection claiming to be AS 0." [`Asn`] itself can hold 0, which raw data
+/// and ROAs need; this type is for the places where 0 must not get through.
+///
+/// # Examples
+///
+/// ```
+/// use pathvector_types::{Asn, ReservedAsZero, SpeakerAsn};
+///
+/// assert_eq!(SpeakerAsn::try_from(65001).unwrap().asn(), Asn::new(65001));
+/// assert_eq!(SpeakerAsn::try_from(Asn::ZERO), Err(ReservedAsZero));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SpeakerAsn(NonZeroU32);
+
+impl SpeakerAsn {
+    /// The AS number.
+    #[must_use]
+    pub const fn asn(self) -> Asn {
+        Asn(self.0.get())
+    }
+
+    /// The raw 32-bit value, never 0.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl TryFrom<u32> for SpeakerAsn {
+    type Error = ReservedAsZero;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        NonZeroU32::new(value).map(Self).ok_or(ReservedAsZero)
+    }
+}
+
+impl TryFrom<Asn> for SpeakerAsn {
+    type Error = ReservedAsZero;
+
+    fn try_from(asn: Asn) -> Result<Self, Self::Error> {
+        Self::try_from(asn.0)
+    }
+}
+
+impl From<SpeakerAsn> for Asn {
+    fn from(speaker: SpeakerAsn) -> Self {
+        speaker.asn()
+    }
+}
+
+impl std::fmt::Display for SpeakerAsn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.asn().fmt(f)
+    }
+}
+
+/// AS 0 was offered where a BGP speaker's AS number is required (RFC 7607).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReservedAsZero;
+
+impl std::fmt::Display for ReservedAsZero {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AS 0 is reserved and cannot identify a BGP speaker (RFC 7607)")
+    }
+}
+
+impl std::error::Error for ReservedAsZero {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +281,21 @@ mod tests {
         assert!(Asn::new(4_200_000_000).is_private());
         assert!(Asn::new(4_294_967_294).is_private());
         assert!(!Asn::new(4_294_967_295).is_private());
+    }
+
+    /// RFC 7607: only 0 is excluded; the rest of the 32-bit space is a valid
+    /// speaker identity.
+    #[test]
+    fn speaker_asn_excludes_only_zero() {
+        assert_eq!(SpeakerAsn::try_from(0), Err(ReservedAsZero));
+        assert_eq!(SpeakerAsn::try_from(Asn::ZERO), Err(ReservedAsZero));
+        for v in [1, 23456, 65535, 65536, u32::MAX] {
+            let s = SpeakerAsn::try_from(v).unwrap();
+            assert_eq!(
+                (s.as_u32(), s.asn(), Asn::from(s)),
+                (v, Asn::new(v), Asn::new(v))
+            );
+        }
     }
 
     #[test]
