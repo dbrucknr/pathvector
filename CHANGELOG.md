@@ -37,6 +37,27 @@ The installed VRPs are kept in every case, and nothing of a failed transfer is p
 
 ---
 
+## 2026-11-25 (pathvectord: a batch that ends in a NOTIFICATION no longer drops the idle-hold Stop)
+
+`run_event_loop`'s drain loop had two exits with two hand-written send sequences. When a coalesced
+UPDATE needed a NOTIFICATION, the early exit never sent the `SessionCommand::Stop` owed to a peer
+that had reconnected during its max-prefix idle-hold in the same batch. The daemon had not
+registered that session, but nothing told it to close.
+
+- The early exit now leaves the drain loop with `break` and shares the code after it, so both exits
+  send capability refreshes, the NOTIFICATION, stalled-peer Stops and idle-hold Stops after the
+  state write lock is released.
+- The early exit also skipped `update_rib_sizes`, so the Loc-RIB and Adj-RIB-Out gauges missed
+  changes made by events coalesced ahead of the failing UPDATE until a later batch refreshed them.
+  It now refreshes them. `pathvectord_event_loop_batch_events` is still not recorded on that exit.
+- Tests: `idle_hold_reconnect_is_stopped_when_batch_ends_in_notification`,
+  `early_exit_idle_hold_stop_is_sent_without_the_state_lock`,
+  `drain_loop_early_exit_refreshes_loc_rib_gauge`. All three failed on the old code.
+- The idle-hold is local policy. RFC 4271 §6.7 and RFC 4486 §4 require the Cease NOTIFICATION when
+  a prefix limit is exceeded; neither defines a hold-off before the peer may reconnect.
+
+---
+
 ## 2026-11-25 (AS-number rules on the wire: RFC 6793 AS4_PATH, RFC 7607 AS 0, RFC 9774 AS_SET — issues #109, #110, #111)
 
 ### Behavior changes (read before upgrading)
