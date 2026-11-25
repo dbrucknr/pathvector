@@ -15,6 +15,10 @@ Found by reading the code during issue #102, then reproduced over loopback befor
   never completed. Such a session reports no `Terminated`, so the peer stayed configured and every
   later `AddPeer` for it was refused.
 
+A third problem, found while making the change and shown by a test: if a Graceful Restart peer's
+connection failed just before `RemovePeer`, that termination opened a restart window for the peer
+being removed. Its routes stayed in the Loc-RIB with nothing left to withdraw them.
+
 **The fix**
 
 - `SessionCommand::Retire` stops a session and ends its task, whoever still holds a sender. The task
@@ -23,6 +27,7 @@ Found by reading the code during issue #102, then reproduced over loopback befor
   as before; `Retired` completes any other.
 - `RemovePeer` takes the session's sender under the same lock that marks the peer. A termination
   already queued could otherwise complete the removal first, leaving the session never stopped.
+- A peer stays marked for removal while its termination is processed, so no restart window opens.
 
 **API change:** `SessionCommand` has a new `Retire` variant and `SessionEvent` a new `Retired`
 variant.

@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pathvector_session::message::{
-    BgpMessage, Capability, CeaseError, NotificationError, RouteRefreshMessage, UpdateMessage,
+    BgpMessage, Capability, CeaseError, GracefulRestartFamily, NotificationError, PathAttribute,
+    RouteRefreshMessage, UpdateMessage,
 };
 use pathvector_session::transport::{
     self, SessionCommand, SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle,
@@ -27,6 +28,7 @@ use pathvector_session::transport::{
     listener::ListenerKeys,
     tcp_md5::{KernelTcpMd5, Md5Enforcement},
 };
+use pathvector_types::{AfiSafi, AsPath, Asn, Origin, PeerType};
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 
@@ -439,4 +441,62 @@ async fn late_retired_does_not_complete_a_later_removal() {
     let s = state.read().await;
     assert!(s.adj_ribs_in.contains_key(&PEER_IP));
     assert!(s.pending_removal.contains(&PEER_IP));
+}
+
+/// A Graceful Restart peer's connection can fail just before `RemovePeer`. That
+/// termination completes the removal, and must not open a restart window: the
+/// peer is no longer configured, so nothing would ever withdraw the routes.
+#[tokio::test]
+async fn removal_completed_by_an_unclean_termination_withdraws_routes() {
+    let state = state_with_peer();
+    {
+        let mut s = state.write().await;
+        s.on_established(
+            PEER_IP,
+            Ipv4Addr::new(10, 0, 0, 2),
+            PeerType::External,
+            65002,
+            90,
+            &[Capability::GracefulRestart {
+                restart_flags: 0,
+                restart_time: 120,
+                families: vec![GracefulRestartFamily {
+                    afi_safi: AfiSafi::IPV4_UNICAST,
+                    forwarding_preserved: true,
+                }],
+            }],
+            None,
+        );
+        s.on_route_update(
+            PEER_IP,
+            UpdateMessage {
+                withdrawn: vec![],
+                attributes: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65002)])),
+                    PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+                ],
+                announced: vec!["192.0.2.0/24".parse().unwrap()],
+            },
+        );
+        s.flush_pending();
+        assert_eq!(s.rib.loc_rib.len(), 1);
+        s.pending_removal.insert(PEER_IP);
+    }
+    let (session_tx, _session_rx) = mpsc::channel(8);
+    let (event_tx, event_rx) = mpsc::channel(8);
+    event_tx
+        .send((
+            PEER_IP,
+            SessionEvent::Terminated(TerminationReason::Unclean),
+        ))
+        .await
+        .unwrap();
+    drop(event_tx);
+
+    run_event_loop(event_rx, Arc::clone(&state), stop_map(session_tx), None).await;
+
+    let s = state.read().await;
+    assert!(!s.adj_ribs_in.contains_key(&PEER_IP));
+    assert_eq!(s.rib.loc_rib.len(), 0, "the removed peer's route remains");
 }
