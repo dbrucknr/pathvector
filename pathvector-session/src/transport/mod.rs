@@ -322,15 +322,18 @@ pub enum SessionCommand {
     /// To reset a session that should come back, use [`Self::AutomaticStop`].
     Stop,
     /// Like `Stop`, with a caller-chosen NOTIFICATION (e.g. an RFC 9003
-    /// shutdown message). The session stays down until [`Self::Start`].
+    /// shutdown message, or CEASE/Maximum Number of Prefixes Reached). The
+    /// session stays down until [`Self::Start`], whatever state it was in. See
+    /// [`FsmInput::NotificationToSend`].
     Notification(crate::message::NotificationMessage),
     /// Reset an Established session on the caller's own authority: send the
     /// NOTIFICATION, drop the connection, and reconnect after
     /// [`SessionConfig::connect_retry_time`]. Ignored in other states.
     ///
-    /// For RFC 4271 §8.1.2 `AutomaticStop` conditions (such as a maximum
-    /// prefix limit) and UPDATE errors the caller detects (§8.2.2 Event 28).
-    /// See [`FsmInput::AutomaticStop`].
+    /// For RFC 4271 §8.1.2 `AutomaticStop` conditions that should be retried
+    /// and UPDATE errors the caller detects (§8.2.2 Event 28). To keep the
+    /// session down, as after a maximum-prefix limit, use
+    /// [`Self::Notification`]. See [`FsmInput::AutomaticStop`].
     AutomaticStop(crate::message::NotificationMessage),
     /// An inbound TCP connection from this peer was accepted by the daemon's
     /// BGP listener.  The session applies RFC 4271 §6.8 collision detection

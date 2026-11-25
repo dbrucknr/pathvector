@@ -101,21 +101,29 @@ pub enum FsmInput {
     CollisionDetected,
     /// A complete BGP message was received from the peer.
     MessageReceived(BgpMessage),
-    /// An operator stop that sends the given NOTIFICATION, e.g. peer removal
-    /// with an RFC 9003 shutdown message. Like [`FsmInput::ManualStop`], there
-    /// is no automatic reconnect. For a teardown the local system decides on
-    /// by itself, use [`FsmInput::AutomaticStop`].
+    /// Stop and stay stopped, sending the given NOTIFICATION if an OPEN has
+    /// gone out. Like [`FsmInput::ManualStop`] it applies in every state and
+    /// there is no automatic reconnect: only [`FsmInput::ManualStart`]
+    /// restarts the session.
+    ///
+    /// Used for peer removal with an RFC 9003 shutdown message, and for an
+    /// `AutomaticStop` after which the FSM must not restart on its own
+    /// (RFC 4271 §8.1.1 `AllowAutomaticStart` false, or an `IdleHoldTimer` the
+    /// caller owns), such as a maximum-prefix limit. For a teardown that should
+    /// reconnect, use [`FsmInput::AutomaticStop`].
     NotificationToSend(crate::message::NotificationMessage),
     /// The local system tears down an Established session by its own logic:
     /// send the given NOTIFICATION, close, and reconnect after the
     /// `ConnectRetry` interval.
     ///
-    /// This covers RFC 4271 §8.1.2 Event 8 (`AutomaticStop`, whose example is
-    /// exceeding a peer's maximum number of prefixes) and an UPDATE error the
-    /// caller detects (§8.2.2 Established, Event 28), such as RFC 7606 §5.2's
-    /// session reset. §8.2.2 leaves the session in Idle in both cases; when it
-    /// is started again is local policy (§8.1.1 `AllowAutomaticStart`), and
-    /// this FSM does it with the connect-retry timer.
+    /// This covers an RFC 4271 §8.1.2 Event 8 (`AutomaticStop`) that should be
+    /// retried, such as running out of room to send to the peer, and an UPDATE
+    /// error the caller detects (§8.2.2 Established, Event 28), such as RFC
+    /// 7606 §5.2's session reset. §8.2.2 leaves the session in Idle in both
+    /// cases; when it is started again is local policy (§8.1.1
+    /// `AllowAutomaticStart`), and this FSM does it with the connect-retry
+    /// timer. A stop the FSM must not undo on its own, such as a
+    /// maximum-prefix limit, is [`FsmInput::NotificationToSend`].
     ///
     /// The full [`NotificationMessage`] is carried so the data field is
     /// preserved verbatim.
@@ -358,7 +366,7 @@ impl Fsm {
                 FsmOutput::InitiateTcpConnect,
                 FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
             ],
-            FsmInput::ManualStop => self.do_stop_pre_open(),
+            FsmInput::ManualStop | FsmInput::NotificationToSend(_) => self.do_stop_pre_open(),
             // RFC 4271 §8.2.2 Connect: "In response to any other events
             // (Events 8, 10-11, 13, 19, 23, 25-28)": stop the
             // ConnectRetryTimer, drop the TCP connection, → Idle. No
@@ -381,7 +389,7 @@ impl Fsm {
                     FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
                 ]
             }
-            FsmInput::ManualStop => self.do_stop_pre_open(),
+            FsmInput::ManualStop | FsmInput::NotificationToSend(_) => self.do_stop_pre_open(),
             // RFC 4271 §8.2.2 Active: "In response to any other event
             // (Events 8, 10-11, 13, 19, 23, 25-28)" — as Connect above.
             FsmInput::MessageReceived(BgpMessage::Update(_)) | FsmInput::MalformedUpdate(_) => {
@@ -454,6 +462,16 @@ impl Fsm {
                     FsmOutput::CloseTcpConnection,
                 ]
             }
+            // RFC 4271 §8.2.2 OpenSent, Events 2 and 8: "sends the
+            // NOTIFICATION with a Cease", drops the connection, Idle.
+            FsmInput::NotificationToSend(msg) => {
+                self.state = State::Idle;
+                vec![
+                    FsmOutput::StopHoldTimer,
+                    FsmOutput::SendMessage(BgpMessage::Notification(msg)),
+                    FsmOutput::CloseTcpConnection,
+                ]
+            }
             // RFC 4271 §8.2.2, OpenSent/Event 19: "If this connection is to
             // be dropped due to connection collision, the local system
             // sends a NOTIFICATION with a Cease" (subcode Connection
@@ -491,6 +509,7 @@ impl Fsm {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn on_open_confirm(&mut self, input: &FsmInput) -> Vec<FsmOutput> {
         match input {
             FsmInput::MessageReceived(BgpMessage::Keepalive) => {
@@ -558,6 +577,18 @@ impl Fsm {
                         error: NotificationError::Cease(CeaseError::AdministrativeShutdown),
                         data: vec![],
                     })),
+                    FsmOutput::CloseTcpConnection,
+                ]
+            }
+            // As OpenSent: send the NOTIFICATION, drop the connection, Idle.
+            FsmInput::NotificationToSend(msg) => {
+                self.peer_open = None;
+                self.negotiated_hold_time = 0;
+                self.state = State::Idle;
+                vec![
+                    FsmOutput::StopHoldTimer,
+                    FsmOutput::StopKeepaliveTimer,
+                    FsmOutput::SendMessage(BgpMessage::Notification(msg.clone())),
                     FsmOutput::CloseTcpConnection,
                 ]
             }
@@ -721,8 +752,8 @@ impl Fsm {
                     FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
                 ]
             }
-            // Operator stop with a specific NOTIFICATION (peer removal with an
-            // RFC 9003 shutdown message) — no automatic reconnect.
+            // Stop with a specific NOTIFICATION (peer removal, or a limit the
+            // caller holds the session down for) — no automatic reconnect.
             FsmInput::NotificationToSend(msg) => {
                 self.state = State::Idle;
                 vec![
@@ -2942,6 +2973,66 @@ mod tests {
         }));
         assert_eq!(fsm.state(), State::Idle);
         assert_eq!(out, vec![FsmOutput::StopConnectRetryTimer]);
+    }
+
+    /// `NotificationToSend` stops the session from every state, not only
+    /// Established. RFC 4271 §8.2.2 ends in Idle from each of them on a stop
+    /// event; the NOTIFICATION is sent once an OPEN has gone out.
+    #[test]
+    fn test_notification_to_send_stops_every_state() {
+        let notif = NotificationMessage {
+            error: NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached),
+            data: vec![],
+        };
+        let cases: [(&[FsmInput], State, bool); 4] = [
+            (&[FsmInput::ManualStart], State::Connect, false),
+            (
+                &[FsmInput::ManualStart, FsmInput::TcpFailed],
+                State::Active,
+                false,
+            ),
+            (
+                &[FsmInput::ManualStart, FsmInput::TcpConnected],
+                State::OpenSent,
+                true,
+            ),
+            (
+                &[
+                    FsmInput::ManualStart,
+                    FsmInput::TcpConnected,
+                    FsmInput::MessageReceived(peer_open(65002, 90)),
+                ],
+                State::OpenConfirm,
+                true,
+            ),
+        ];
+        for (inputs, state, sends) in cases {
+            let mut fsm = Fsm::new(default_config());
+            for input in inputs {
+                fsm.process(input.clone());
+            }
+            assert_eq!(fsm.state(), state, "precondition");
+
+            let out = fsm.process(FsmInput::NotificationToSend(notif.clone()));
+
+            assert_eq!(fsm.state(), State::Idle, "from {state:?}");
+            assert!(
+                out.contains(&FsmOutput::CloseTcpConnection),
+                "from {state:?}"
+            );
+            assert_eq!(
+                out.contains(&FsmOutput::SendMessage(BgpMessage::Notification(
+                    notif.clone()
+                ))),
+                sends,
+                "from {state:?}"
+            );
+            assert!(
+                !out.iter()
+                    .any(|o| matches!(o, FsmOutput::StartConnectRetryTimer(_))),
+                "from {state:?}"
+            );
+        }
     }
 
     #[test]

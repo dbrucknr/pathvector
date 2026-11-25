@@ -345,7 +345,15 @@ impl DaemonState {
                 tracing::info!(
                     peer = %peer_ip,
                     restart_secs,
-                    "max-prefix idle-hold: reconnect blocked for {restart_secs}s"
+                    "max-prefix idle-hold: session restarts in {restart_secs}s"
+                );
+            } else {
+                self.max_prefix_latched.insert(peer_ip);
+                tracing::warn!(
+                    peer = %peer_ip,
+                    "max-prefix: no max_prefixes_restart configured, so the session \
+                     stays down until the peer is removed and added again or the \
+                     daemon restarts"
                 );
             }
             return Some(NotificationMessage {

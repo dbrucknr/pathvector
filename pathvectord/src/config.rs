@@ -596,19 +596,26 @@ pub struct PeerConfig {
     /// causes the session to be torn down.
     #[serde(default)]
     pub max_prefixes_v6: Option<u32>,
-    /// Seconds to wait before reconnecting after a max-prefix CEASE.
+    /// Seconds after a max-prefix CEASE at which the session is started again.
     ///
-    /// When either `max_prefixes_v4` or `max_prefixes_v6` is exceeded and
-    /// the session is dropped, pathvectord waits this many seconds before
-    /// allowing the peer to reconnect. Use this as a back-off to give
-    /// operators time to investigate and correct a route leak before the
-    /// peer floods the RIB again.
+    /// Applies when either `max_prefixes_v4` or `max_prefixes_v6` is exceeded.
+    /// With a positive value the session stays down for that long, neither
+    /// dialling nor accepting a connection, and is then started again,
+    /// independently of `connect_retry_time`.
     ///
-    /// Absent (the default) or `0` means no extra hold-off: the session
-    /// reconnects after the normal `connect_retry_time`. With a value set,
-    /// reconnect attempts keep happening every `connect_retry_time` and are
-    /// refused with CEASE/Connection Rejected until it has passed. The
-    /// hold-off is local policy; no RFC defines it.
+    /// Absent (the default) or `0` keeps the session down. It does not
+    /// reconnect, and a connection from the peer does not bring it back. To
+    /// clear it:
+    ///
+    /// - restart the daemon, which reads this peer's limits from the config
+    ///   again (the held-down state is not persisted); or
+    /// - remove the peer and add it again (`RemovePeer`, then `AddPeer` once
+    ///   it has left `ListPeers`). The re-added peer has only the settings
+    ///   `AddPeer` carries, which do not include a prefix limit, until the
+    ///   daemon restarts.
+    ///
+    /// `SoftReset` does not clear it, nor does `AddPeer` on its own. When to
+    /// restart is local policy (RFC 4271 §8.1.1); no RFC defines it.
     ///
     /// ```toml
     /// [[peers]]
