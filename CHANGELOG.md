@@ -4,6 +4,29 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-25 (pathvectord: UPDATEs from a refused reconnect no longer reach the RIB)
+
+When a peer reconnected during its max-prefix idle-hold, `run_event_loop` skipped
+`on_established` and sent `SessionCommand::Stop`, but an UPDATE already queued behind the
+`Established` still went through `on_route_update`. Its routes were installed in Adj-RIB-In and
+Loc-RIB and advertised to other peers. If it again exceeded the prefix limit, it also pushed the
+idle-hold deadline out and drew a second Cease.
+
+- `on_route_update` now ignores every UPDATE from a session that is not registered (no
+  `rib.peer_types` entry), whatever the reason: no table changes, no End-of-RIB handling, no
+  NOTIFICATION. RFC 4271 §9: "An UPDATE message may be received only in the Established state."
+  The idle-hold itself is local policy.
+- The guard covers both the first-event and drain-loop paths. The received-UPDATE counter still
+  counts the ignored message.
+- Tests: `update_behind_rejected_established_is_ignored`,
+  `coalesced_update_behind_rejected_established_is_ignored`,
+  `update_from_rejected_session_does_not_rearm_idle_hold`,
+  `update_from_unregistered_session_is_ignored`. All four failed on the old code.
+- `test_on_route_update_missing_adj_rib_in_logs_and_returns` now establishes its peer first, so it
+  still reaches the guard it tests.
+
+---
+
 ## 2026-11-25 (pathvectord: a batch that ends in a NOTIFICATION no longer drops the idle-hold Stop)
 
 `run_event_loop`'s drain loop had two exits with two hand-written send sequences. When a coalesced
