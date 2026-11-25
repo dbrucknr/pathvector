@@ -86,6 +86,14 @@ mod gr_preference_tests;
 #[cfg(test)]
 mod rr_tie_break_tests;
 
+// Issue #168: RFC 4456 §6 non-client split-horizon on every send path.
+#[cfg(test)]
+mod rr_split_horizon_tests;
+
+// Issue #159: UPDATEs sent to a peer, applied in order, match its Adj-RIB-Out.
+#[cfg(test)]
+mod outbound_order_tests;
+
 // Sessions the daemon resets on its own authority must reconnect.
 #[cfg(test)]
 mod session_restart_tests;
@@ -402,12 +410,15 @@ pub(crate) struct DaemonState {
     ///
     /// [`take_stalled_peers`]: DaemonState::take_stalled_peers
     stalled_peers: Vec<IpAddr>,
-    /// Per-peer coalescing buffers for outbound IPv4 prefix decisions.
+    /// Per-peer coalescing buffers for outbound IPv4 prefix decisions, in the
+    /// order the decisions were made.
     ///
     /// `on_route_update` accumulates decisions here instead of calling
     /// `flush_updates` immediately. The event loop calls `flush_pending` when
     /// the event channel drains (natural quiescence), batching all decisions
     /// that arrived during one burst into the fewest possible UPDATE messages.
+    /// Paths that must send at once go through `send_decisions`, which drains
+    /// this buffer with them so that nothing overtakes an older decision.
     pub(crate) pending_decisions: HashMap<IpAddr, Vec<PrefixDecision>>,
     /// Per-peer coalescing buffers for outbound IPv6 prefix decisions.
     pub(crate) pending_decisions_v6: HashMap<IpAddr, Vec<PrefixDecisionV6>>,
@@ -6228,6 +6239,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::Internal,
             65001,
@@ -6258,6 +6270,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::External,
             65001,
@@ -6293,6 +6306,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::External,
             65001,
@@ -6323,6 +6337,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::Internal,
             65001,
@@ -6338,6 +6353,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::Internal,
             65001,
@@ -8627,7 +8643,17 @@ mod tests {
     ) -> bool {
         let peer_ip = aro.peer().ip();
         let decision = propagate_prefix(
-            nlri, rib, aro, policy, peer_type, local_as, local_as, bgp_id, false, false,
+            nlri,
+            rib,
+            aro,
+            &std::collections::HashSet::new(),
+            policy,
+            peer_type,
+            local_as,
+            local_as,
+            bgp_id,
+            false,
+            false,
         );
         flush_updates(peer_ip, vec![decision], MAX_LEN, tx, peer_type, true)
     }
@@ -12984,14 +13010,14 @@ mod coalescing_tests {
         state.on_route_update(IpAddr::V4(peer_a), announce(peer_a, &["10.0.0.0/8"]));
 
         // `pending_decisions[peer_b]` now has one entry.  Call set_export_default
-        // (which writes directly to the channel, bypassing the pending buffer).
+        // (which sends at once, draining the buffer ahead of its own decisions).
         // In production this is always serialized by the write lock — the event
         // loop always flushes before releasing — but we simulate the direct call
         // here to verify the buffer is not corrupted.
         state.set_export_default(IpAddr::V4(peer_b), pathvector_policy::DefaultAction::Accept);
 
-        // set_export_default fires first (direct channel write), then flush_pending
-        // sends the buffered decision.  Peer_b must receive both.
+        // Peer_b must receive the route whether set_export_default or this
+        // flush_pending sends it.
         state.flush_pending();
 
         let mut received_prefixes = std::collections::HashSet::new();
@@ -18539,7 +18565,8 @@ mod test_gr_phase2 {
         // PEER_IP is the only source of the prefix; OBS_IP observes.
         state.on_route_update(IpAddr::V4(PEER_IP), announce(&["198.51.100.0/24"]));
 
-        // Drain the initial advertisement so the channel is quiet.
+        // Send and drain the initial advertisement so the channel is quiet.
+        state.flush_pending();
         let obs_rx = rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap();
         while obs_rx.try_recv().is_ok() {}
 

@@ -3,6 +3,7 @@
 //! Functions for building path attributes, computing per-peer prefix decisions,
 //! and flushing batched UPDATE messages for both IPv4 and IPv6.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use pathvector_policy::{Decision, Policy};
@@ -194,6 +195,30 @@ fn permitted_on_wire<A: IpAddress>(route: &Route<A>, peer: PeerId) -> bool {
     }
 }
 
+/// Whether route reflection keeps `best`, learned from `source`, out of this
+/// peer's Adj-RIB-Out.
+///
+/// RFC 4456 §6: "A route from a Non-Client IBGP peer: Reflect to all the
+/// Clients." / "A route from a Client peer: Reflect to all the Non-Client
+/// peers and also to the Client peers." So a reflector never passes a route
+/// from one non-client to another.
+///
+/// A reflecting Adj-RIB-Out (an iBGP peer of a route reflector) does not apply
+/// iBGP split horizon itself, so this is where the rule lives. The source's
+/// peer type comes from the route, not from the live sessions: a route retained
+/// for Graceful Restart is still a non-client's route.
+fn excluded_by_reflection<A: IpAddress>(
+    best: &Route<A>,
+    source: Option<PeerId>,
+    adj_rib_out: &AdjRibOut<A>,
+    rr_clients: &HashSet<IpAddr>,
+) -> bool {
+    adj_rib_out.reflects()
+        && best.peer_type == PeerType::Internal
+        && !rr_clients.contains(&adj_rib_out.peer().ip())
+        && source.is_some_and(|source| !rr_clients.contains(&source.ip()))
+}
+
 /// The outbound decision for a single prefix after AdjRibOut processing.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -210,6 +235,12 @@ pub(crate) enum PrefixDecision {
 /// Returns what should be sent without transmitting anything — callers batch
 /// decisions and flush via [`flush_updates`].
 ///
+/// Every send path decides through this function (or [`propagate_prefix_v6`]),
+/// so the rules for excluding a route from a peer's Adj-RIB-Out belong here. An
+/// excluded route that was advertised before yields a `Withdraw` (RFC 4271
+/// §9.1.3). `rr_clients` is the reflector's client set (RFC 4456 §6), empty
+/// when not a route reflector.
+///
 /// `deferred` implements RFC 4724 §4.1's Restarting-Speaker
 /// outbound-advertisement deferral: when `true`, returns `NoChange`
 /// immediately without touching `loc_rib`/`adj_rib_out`/`export_policy` at
@@ -220,6 +251,7 @@ pub(crate) fn propagate_prefix(
     nlri: Nlri<Ipv4Addr>,
     loc_rib: &impl RibView<Ipv4Addr>,
     adj_rib_out: &mut AdjRibOut<Ipv4Addr>,
+    rr_clients: &HashSet<IpAddr>,
     export_policy: &Policy<Route<Ipv4Addr>>,
     peer_type: PeerType,
     local_as: u32,
@@ -231,9 +263,6 @@ pub(crate) fn propagate_prefix(
     if deferred {
         return PrefixDecision::NoChange;
     }
-    // Compute best_peer once; callers that already looked it up for split-horizon
-    // checks pass the same call, but the real savings is removing the internal
-    // second call that used to exist here.
     let best_peer = loc_rib.best_peer(&nlri);
     match loc_rib.best(&nlri) {
         Some(best) => {
@@ -242,7 +271,9 @@ pub(crate) fn propagate_prefix(
             // iBGP case is also enforced by AdjRibOut::insert, but catching it
             // here avoids unnecessary prepare_outbound work and keeps eviction
             // logic consistent.
-            if best_peer == Some(adj_rib_out.peer()) {
+            if best_peer == Some(adj_rib_out.peer())
+                || excluded_by_reflection(best, best_peer, adj_rib_out, rr_clients)
+            {
                 return if adj_rib_out.withdraw(&nlri).is_some() {
                     PrefixDecision::Withdraw(nlri)
                 } else {
@@ -298,6 +329,9 @@ pub(crate) fn propagate_prefix(
 
 /// Sends batched BGP UPDATE messages for a collected set of prefix decisions.
 ///
+/// `decisions` is in the order the decisions were made; only the last one for
+/// each NLRI is sent (see [`retain_last_per_nlri`]).
+///
 /// Announcements are grouped by identical path attributes; each group is packed
 /// into the fewest UPDATE messages that fit within `max_len`. Withdrawals are
 /// similarly batched into withdraw-only UPDATEs. Withdrawals are sent before
@@ -311,7 +345,7 @@ type AnnounceGroup = (Vec<u8>, Vec<PathAttribute>, Vec<Nlri<Ipv4Addr>>);
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn flush_updates(
     peer_ip: IpAddr,
-    decisions: Vec<PrefixDecision>,
+    mut decisions: Vec<PrefixDecision>,
     max_len: usize,
     update_tx: &mpsc::Sender<UpdateMessage>,
     peer_type: PeerType,
@@ -320,6 +354,7 @@ pub(crate) fn flush_updates(
     let mut withdrawals: Vec<Nlri<Ipv4Addr>> = Vec::new();
     let mut announce_groups: Vec<AnnounceGroup> = Vec::new();
 
+    retain_last_per_nlri(&mut decisions);
     for decision in decisions {
         match decision {
             PrefixDecision::Withdraw(nlri) => withdrawals.push(nlri),
@@ -433,14 +468,44 @@ pub(crate) enum DecisionKind {
 /// RFC 4271 §9.2.1.1 MRAI gate in `daemon/route.rs` is written once for both
 /// families.
 pub(crate) trait OutboundDecision {
+    /// The address family's address type.
+    type Addr: IpAddress;
+
     /// The "send nothing" decision for this family.
     const NO_CHANGE: Self;
 
     /// Classifies this decision.
     fn kind(&self) -> DecisionKind;
+
+    /// The destination this decision changes at the peer, or `None` for
+    /// `NoChange`.
+    fn nlri(&self) -> Option<Nlri<Self::Addr>>;
+}
+
+/// Reduces a batch, given in decision order, to the last announcement or
+/// withdrawal for each NLRI, and drops every `NoChange`.
+///
+/// RFC 4271 §3.1: a withdrawal marks a previously advertised route "as being
+/// no longer available for use", and "Changing the attribute(s) of a route is
+/// accomplished by advertising a replacement route". Both depend on the order
+/// the peer receives them in, which packing a batch does not preserve:
+/// withdrawals go first, then one run of UPDATEs per attribute set. With one
+/// decision per NLRI that order cannot matter. An earlier decision is not
+/// lost information: the later one was diffed against the Adj-RIB-Out the
+/// earlier one left, and supersedes it.
+///
+/// `NoChange` supersedes nothing — the Adj-RIB-Out did not move, so an earlier
+/// buffered decision still has to reach the peer.
+fn retain_last_per_nlri<D: OutboundDecision>(decisions: &mut Vec<D>) {
+    let mut seen = HashSet::with_capacity(decisions.len());
+    decisions.reverse();
+    decisions.retain(|d| d.nlri().is_some_and(|nlri| seen.insert(nlri)));
+    decisions.reverse();
 }
 
 impl OutboundDecision for PrefixDecision {
+    type Addr = Ipv4Addr;
+
     const NO_CHANGE: Self = Self::NoChange;
 
     fn kind(&self) -> DecisionKind {
@@ -450,9 +515,19 @@ impl OutboundDecision for PrefixDecision {
             Self::NoChange => DecisionKind::NoChange,
         }
     }
+
+    fn nlri(&self) -> Option<Nlri<Ipv4Addr>> {
+        match self {
+            Self::Announce(route) => Some(route.nlri),
+            Self::Withdraw(nlri) => Some(*nlri),
+            Self::NoChange => None,
+        }
+    }
 }
 
 impl OutboundDecision for PrefixDecisionV6 {
+    type Addr = Ipv6Addr;
+
     const NO_CHANGE: Self = Self::NoChange;
 
     fn kind(&self) -> DecisionKind {
@@ -460,6 +535,14 @@ impl OutboundDecision for PrefixDecisionV6 {
             Self::Announce(_) => DecisionKind::Announce,
             Self::Withdraw(_) => DecisionKind::Withdraw,
             Self::NoChange => DecisionKind::NoChange,
+        }
+    }
+
+    fn nlri(&self) -> Option<Nlri<Ipv6Addr>> {
+        match self {
+            Self::Announce(route) => Some(route.nlri),
+            Self::Withdraw(nlri) => Some(*nlri),
+            Self::NoChange => None,
         }
     }
 }
@@ -477,6 +560,7 @@ pub(crate) fn propagate_prefix_v6(
     nlri: Nlri<Ipv6Addr>,
     loc_rib: &LocRib<Ipv6Addr>,
     adj_rib_out: &mut AdjRibOut<Ipv6Addr>,
+    rr_clients: &HashSet<IpAddr>,
     export_policy: &Policy<Route<Ipv6Addr>>,
     peer_type: PeerType,
     local_as: u32,
@@ -495,8 +579,11 @@ pub(crate) fn propagate_prefix_v6(
     let best_peer = loc_rib.best_peer(&nlri);
     match loc_rib.best(&nlri) {
         Some(best) if can_announce => {
-            // Never re-advertise a route back to the peer it was learned from.
-            if best_peer == Some(adj_rib_out.peer()) {
+            // Never re-advertise a route back to the peer it was learned from,
+            // nor reflect one between non-clients.
+            if best_peer == Some(adj_rib_out.peer())
+                || excluded_by_reflection(best, best_peer, adj_rib_out, rr_clients)
+            {
                 return if adj_rib_out.withdraw(&nlri).is_some() {
                     PrefixDecisionV6::Withdraw(nlri)
                 } else {
@@ -553,27 +640,31 @@ pub(crate) fn propagate_prefix_v6(
 /// Sends batched BGP UPDATE messages for IPv6 prefix decisions using
 /// MP_REACH_NLRI / MP_UNREACH_NLRI attributes (RFC 4760).
 ///
-/// Announcements are grouped by identical path attributes; each group is packed
-/// into the fewest UPDATE messages that fit within `max_len`. Withdrawals are
-/// sent first as MP_UNREACH_NLRI UPDATE messages.
+/// `decisions` is in the order the decisions were made; only the last one for
+/// each NLRI is sent (see [`retain_last_per_nlri`]).
+///
+/// Announcements are grouped by identical path attributes and next hop; each
+/// group is packed into the fewest UPDATE messages that fit within `max_len`.
+/// Withdrawals are sent first as MP_UNREACH_NLRI UPDATE messages.
 ///
 /// Returns `true` if all sends succeeded; `false` on the first channel-full
 /// error.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn flush_updates_v6(
     peer_ip: IpAddr,
-    decisions: Vec<PrefixDecisionV6>,
+    mut decisions: Vec<PrefixDecisionV6>,
     max_len: usize,
     update_tx: &mpsc::Sender<UpdateMessage>,
     peer_type: PeerType,
     peer_four_byte: bool,
 ) -> bool {
-    // (encoded-attr-bytes, attribute-list-with-mp-reach, nlri-list)
-    type AnnounceGroupV6 = (Vec<u8>, Vec<PathAttribute>, Vec<Nlri<Ipv6Addr>>);
+    // ((encoded-attr-bytes, next-hop), attribute-list-with-mp-reach, nlri-list)
+    type AnnounceGroupV6 = ((Vec<u8>, NextHop), Vec<PathAttribute>, Vec<Nlri<Ipv6Addr>>);
 
     let mut withdrawals: Vec<Nlri<Ipv6Addr>> = Vec::new();
     let mut announce_groups: Vec<AnnounceGroupV6> = Vec::new();
 
+    retain_last_per_nlri(&mut decisions);
     for decision in decisions {
         match decision {
             PrefixDecisionV6::Withdraw(nlri) => withdrawals.push(nlri),
@@ -583,7 +674,9 @@ pub(crate) fn flush_updates_v6(
                 // minus the NLRI list) and pack them together.
                 let (mut attrs, mp_reach) =
                     route_v6_to_attributes(&route, peer_type, peer_four_byte);
-                let key = encode_attributes(&attrs);
+                // RFC 4760 §3: the next hop in MP_REACH_NLRI applies to every
+                // prefix listed in it, so it is part of what makes a group.
+                let key = (encode_attributes(&attrs), mp_reach.next_hop);
                 // Restore the MP_REACH_NLRI placeholder next-hop in the group leader.
                 if let Some((_, group_attrs, nlris)) =
                     announce_groups.iter_mut().find(|(k, _, _)| *k == key)
@@ -1651,6 +1744,61 @@ mod prop_tests {
         ]
     }
 
+    // ── Expectations ─────────────────────────────────────────────────────────
+    //
+    // RFC 4271 §3.1: a withdrawal or a replacement supersedes what was
+    // advertised before it, so only the last decision for a prefix is owed to
+    // the peer. `NoChange` changes nothing and supersedes nothing.
+
+    /// For each NLRI, whether its last announce/withdraw was an announce.
+    fn last_is_announce<A: std::hash::Hash + Eq + Copy>(
+        decisions: impl Iterator<Item = Option<(A, bool)>>,
+    ) -> std::collections::HashMap<A, bool> {
+        decisions.flatten().collect()
+    }
+
+    fn outcome_v4(d: &PrefixDecision) -> Option<(Nlri<Ipv4Addr>, bool)> {
+        match d {
+            PrefixDecision::Announce(r) => Some((r.nlri, true)),
+            PrefixDecision::Withdraw(n) => Some((*n, false)),
+            PrefixDecision::NoChange => None,
+        }
+    }
+
+    fn outcome_v6(d: &PrefixDecisionV6) -> Option<(Nlri<Ipv6Addr>, bool)> {
+        match d {
+            PrefixDecisionV6::Announce(r) => Some((r.nlri, true)),
+            PrefixDecisionV6::Withdraw(n) => Some((*n, false)),
+            PrefixDecisionV6::NoChange => None,
+        }
+    }
+
+    fn ending_as<A: std::hash::Hash + Eq + Copy>(
+        outcomes: std::collections::HashMap<A, bool>,
+        announce: bool,
+    ) -> Vec<A> {
+        outcomes
+            .into_iter()
+            .filter_map(|(nlri, a)| (a == announce).then_some(nlri))
+            .collect()
+    }
+
+    fn last_announces_v4(d: &[PrefixDecision]) -> Vec<Nlri<Ipv4Addr>> {
+        ending_as(last_is_announce(d.iter().map(outcome_v4)), true)
+    }
+
+    fn last_withdraws_v4(d: &[PrefixDecision]) -> Vec<Nlri<Ipv4Addr>> {
+        ending_as(last_is_announce(d.iter().map(outcome_v4)), false)
+    }
+
+    fn last_announces_v6(d: &[PrefixDecisionV6]) -> Vec<Nlri<Ipv6Addr>> {
+        ending_as(last_is_announce(d.iter().map(outcome_v6)), true)
+    }
+
+    fn last_withdraws_v6(d: &[PrefixDecisionV6]) -> Vec<Nlri<Ipv6Addr>> {
+        ending_as(last_is_announce(d.iter().map(outcome_v6)), false)
+    }
+
     // ── IPv4 flush_updates properties ────────────────────────────────────────
 
     proptest! {
@@ -1673,14 +1821,12 @@ mod prop_tests {
             })?;
         }
 
-        /// Every Announce decision appears in exactly one outbound UPDATE.
+        /// A prefix whose last decision is Announce appears in exactly one UPDATE.
         #[test]
         fn prop_flush_updates_all_announces_sent(
             decisions in proptest::collection::vec(arb_decision_v4(), 0..=100),
         ) {
-            let expected_announces: Vec<Nlri<Ipv4Addr>> = decisions.iter()
-                .filter_map(|d| if let PrefixDecision::Announce(r) = d { Some(r.nlri) } else { None })
-                .collect();
+            let expected_announces = last_announces_v4(&decisions);
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .build().unwrap();
@@ -1701,14 +1847,12 @@ mod prop_tests {
             })?;
         }
 
-        /// Every Withdraw decision appears in exactly one outbound WITHDRAW.
+        /// A prefix whose last decision is Withdraw appears in exactly one WITHDRAW.
         #[test]
         fn prop_flush_updates_all_withdrawals_sent(
             decisions in proptest::collection::vec(arb_decision_v4(), 0..=100),
         ) {
-            let expected_withdrawals: Vec<Nlri<Ipv4Addr>> = decisions.iter()
-                .filter_map(|d| if let PrefixDecision::Withdraw(n) = d { Some(*n) } else { None })
-                .collect();
+            let expected_withdrawals = last_withdraws_v4(&decisions);
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .build().unwrap();
@@ -1752,14 +1896,13 @@ mod prop_tests {
             })?;
         }
 
-        /// Every IPv6 Announce decision appears in exactly one outbound MP_REACH UPDATE.
+        /// An IPv6 prefix whose last decision is Announce appears in exactly one
+        /// MP_REACH UPDATE.
         #[test]
         fn prop_flush_updates_v6_all_announces_sent(
             decisions in proptest::collection::vec(arb_decision_v6(), 0..=100),
         ) {
-            let expected: Vec<Nlri<Ipv6Addr>> = decisions.iter()
-                .filter_map(|d| if let PrefixDecisionV6::Announce(r) = d { Some(r.nlri) } else { None })
-                .collect();
+            let expected = last_announces_v6(&decisions);
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .build().unwrap();
@@ -1788,14 +1931,13 @@ mod prop_tests {
             })?;
         }
 
-        /// Every IPv6 Withdraw decision appears in exactly one outbound MP_UNREACH UPDATE.
+        /// An IPv6 prefix whose last decision is Withdraw appears in exactly one
+        /// MP_UNREACH UPDATE.
         #[test]
         fn prop_flush_updates_v6_all_withdrawals_sent(
             decisions in proptest::collection::vec(arb_decision_v6(), 0..=100),
         ) {
-            let expected: Vec<Nlri<Ipv6Addr>> = decisions.iter()
-                .filter_map(|d| if let PrefixDecisionV6::Withdraw(n) = d { Some(*n) } else { None })
-                .collect();
+            let expected = last_withdraws_v6(&decisions);
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .build().unwrap();
@@ -2170,6 +2312,7 @@ mod route_to_attributes_tests {
 
 #[cfg(test)]
 mod propagate_tests {
+    use std::collections::HashSet;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use pathvector_policy::{
@@ -2240,6 +2383,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -2271,6 +2415,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -2303,6 +2448,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &reject_policy_v6(),
             PeerType::External,
             65001,
@@ -2336,6 +2482,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -2352,6 +2499,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &reject_policy_v6(),
             PeerType::External,
             65001,
@@ -2382,6 +2530,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -2396,6 +2545,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -2447,6 +2597,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::Internal,
             65001,
@@ -2483,6 +2634,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::Internal,
             65001,
@@ -2547,6 +2699,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -2578,6 +2731,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::Internal,
             65001,
@@ -2610,6 +2764,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut ebgp_adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -2629,6 +2784,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut ibgp_adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::Internal,
             65001,
@@ -2661,6 +2817,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut ebgp_adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -2680,6 +2837,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut ibgp_adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::Internal,
             65001,
@@ -2712,6 +2870,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -2732,6 +2891,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -2763,6 +2923,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -2795,6 +2956,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut ebgp_adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -2814,6 +2976,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut ibgp_adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::Internal,
             65001,
@@ -2865,6 +3028,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &policy,
             PeerType::External,
             65001,
@@ -2911,6 +3075,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &policy,
             PeerType::External,
             65001,
@@ -2946,6 +3111,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -2985,6 +3151,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy(),
             PeerType::External,
             65001,
@@ -3021,6 +3188,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -3049,6 +3217,7 @@ mod propagate_tests {
             n,
             &loc_rib,
             &mut adj_out,
+            &HashSet::new(),
             &accept_policy_v6(),
             PeerType::External,
             65001,
@@ -3070,6 +3239,7 @@ mod propagate_tests {
 /// source.
 #[cfg(test)]
 mod egress_rules_tests {
+    use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use pathvector_policy::{DefaultAction, Policy};
@@ -3116,6 +3286,7 @@ mod egress_rules_tests {
                 n4(),
                 &loc_rib,
                 &mut out,
+                &HashSet::new(),
                 &policy,
                 peer_type,
                 65001,
@@ -3142,6 +3313,7 @@ mod egress_rules_tests {
                 n6(),
                 &loc_rib,
                 &mut out,
+                &HashSet::new(),
                 &policy,
                 peer_type,
                 65001,
