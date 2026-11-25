@@ -38,6 +38,11 @@ pub struct RibEntry {
 /// Parse an MRT `TABLE_DUMP_V2` dump from `reader`, yielding all IPv4 unicast
 /// RIB entries.  The reader may wrap a [`flate2::read::GzDecoder`] for `.gz`
 /// files.
+///
+/// # Errors
+///
+/// Returns an I/O error if the reader fails or the stream is truncated
+/// mid-record.
 pub fn parse<R: Read>(mut reader: R) -> io::Result<Vec<RibEntry>> {
     let mut entries: Vec<RibEntry> = Vec::new();
     let mut header = [0u8; MRT_HEADER_LEN];

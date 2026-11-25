@@ -34,11 +34,7 @@ use futures::StreamExt as _;
 use pathvector_client::{DaemonClient, PathvectorClient, types::RouteEventType};
 use tokio::time::sleep;
 
-mod mrt;
-mod speaker;
-
-use mrt::RibEntry;
-use speaker::BgpSpeaker;
+use pathvector_mrt::{read_mrt, speaker::BgpSpeaker};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -237,17 +233,6 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Read and parse an MRT file, handling optional gzip compression.
-fn read_mrt(path: &PathBuf) -> Result<Vec<RibEntry>, Box<dyn std::error::Error>> {
-    let file = std::fs::File::open(path)?;
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    if ext == "gz" {
-        Ok(mrt::parse(flate2::read::GzDecoder::new(file))?)
-    } else {
-        Ok(mrt::parse(std::io::BufReader::new(file))?)
-    }
-}
 
 /// Compute prefixes-per-second as a u64.
 #[allow(

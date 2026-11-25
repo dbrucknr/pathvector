@@ -1124,7 +1124,7 @@ async fn install_rpki(
     let changed = reject_invalid.then(|| handle.subscribe());
 
     {
-        let mut guard = state.write().await;
+        let mut guard = crate::lock_timing::write_timed(state, "rpki_install").await;
         if reject_invalid {
             guard.install_rpki_import_terms(&handle);
         }
@@ -1137,7 +1137,9 @@ async fn install_rpki(
         // subscription. Catch that case explicitly rather than relying on
         // subscribe() having won the race against the background task.
         if handle.status().connected {
-            state.write().await.reevaluate_all_import_policies();
+            crate::lock_timing::write_timed(state, "rpki_reeval")
+                .await
+                .reevaluate_all_import_policies();
         }
         // Re-evaluates every peer's import policy whenever the ROA cache
         // changes (any later update) — closes the window between "route
@@ -1149,7 +1151,9 @@ async fn install_rpki(
         let reeval_state = Arc::clone(state);
         tokio::spawn(async move {
             while changed.changed().await.is_ok() {
-                reeval_state.write().await.reevaluate_all_import_policies();
+                crate::lock_timing::write_timed(&reeval_state, "rpki_reeval")
+                    .await
+                    .reevaluate_all_import_policies();
             }
         });
     }
@@ -1332,7 +1336,9 @@ pub(crate) async fn run_event_loop(
         tokio::select! {
             event = event_rx.recv() => {
                 let Some((peer_ip, event)) = event else { break; };
-                let mut s = state.write().await;
+                // `event_batch` covers the whole lock hold: the triggering
+                // event plus every event coalesced by the drain loop below.
+                let mut s = crate::lock_timing::write_timed(&state, "event_batch").await;
                 match event {
                     SessionEvent::Established(info) => {
                         // RFC 4486 §4 — max-prefix idle-hold: if the peer is
@@ -1449,6 +1455,14 @@ pub(crate) async fn run_event_loop(
                                 });
                             }
                         }
+                        // This arm skips the end-of-batch gauge refresh below, so
+                        // refresh the RIB-size gauges here: the peer's routes have
+                        // just been flushed (GH #105).
+                        crate::metrics::update_rib_sizes(
+                            s.rib.loc_rib.len(),
+                            s.rib.loc_rib_v6.len(),
+                            &s.rib.prefixes_advertised,
+                        );
                         // Drop the write guard before awaiting so we don't hold the
                         // lock while the channel send blocks, then skip the coalescing
                         // loop (no pending_decisions were touched in Terminated path).
@@ -1506,7 +1520,14 @@ pub(crate) async fn run_event_loop(
                 // to avoid dropping and re-acquiring the write lock mid-iteration.
                 let mut idle_hold_rejected: Vec<IpAddr> = Vec::new();
 
+                // PR-1: the drain loop has no cap, so batch size is the main
+                // driver of `event_batch` lock-hold time. Counted here
+                // (primary event + each coalesced one) and recorded once the
+                // channel is empty; the early-exit error paths skip it.
+                let mut batch_events: u32 = 1;
+
                 while let Ok((extra_ip, extra_event)) = event_rx.try_recv() {
+                    batch_events += 1;
                     match extra_event {
                         SessionEvent::Established(info) => {
                             // Same idle-hold guard as the primary Established arm.
@@ -1527,6 +1548,9 @@ pub(crate) async fn run_event_loop(
                                 &info.peer_capabilities,
                                 info.local_addr,
                             );
+                            // Same hook as the first-event arm: coalescing must
+                            // not change what gets recorded (GH #105).
+                            crate::metrics::on_session_established(extra_ip);
                         }
                         SessionEvent::Terminated(termination_reason) => {
                             let is_removed = s.pending_removal.remove(&extra_ip);
@@ -1537,6 +1561,9 @@ pub(crate) async fn run_event_loop(
                             } else {
                                 None
                             };
+                            // Recorded before `on_terminated` consumes the reason,
+                            // exactly as in the first-event arm (GH #105).
+                            crate::metrics::on_session_terminated(extra_ip, &termination_reason);
                             s.on_terminated(extra_ip, termination_reason, !is_removed);
                             if is_removed {
                                 s.remove_peer(extra_ip);
@@ -1560,7 +1587,18 @@ pub(crate) async fn run_event_loop(
                             // 7606 still calls for (not a missing mandatory
                             // attribute, which is now treat-as-withdraw and
                             // returns None here).
-                            if let Some(err) = s.on_route_update(extra_ip, msg) {
+                            let notify_err = s.on_route_update(extra_ip, msg);
+                            // Counted per UPDATE and the Adj-RIB-In gauge set from
+                            // live state, exactly as in the first-event arm; both
+                            // used to be skipped for coalesced events (GH #105).
+                            let adj_in = s
+                                .rib
+                                .prefixes_received
+                                .get(&extra_ip)
+                                .copied()
+                                .unwrap_or(0);
+                            crate::metrics::on_route_update(extra_ip, adj_in);
+                            if let Some(err) = notify_err {
                                 s.flush_pending();
                                 let notify_stalled = s.take_stalled_peers();
                                 drop(s);
@@ -1579,6 +1617,8 @@ pub(crate) async fn run_event_loop(
                         }
                     }
                 }
+                metrics::histogram!("pathvectord_event_loop_batch_events")
+                    .record(f64::from(batch_events));
                 // Channel is empty — flush all accumulated outbound decisions.
                 s.flush_pending();
                 crate::metrics::update_rib_sizes(
@@ -1612,7 +1652,7 @@ pub(crate) async fn run_event_loop(
             }
 
             Ok(()) = fib_changed => {
-                let mut s = state.write().await;
+                let mut s = crate::lock_timing::write_timed(&state, "fib_change").await;
                 s.on_fib_change();
                 s.flush_pending();
                 let stalled = s.take_stalled_peers();
@@ -1643,7 +1683,7 @@ pub(crate) async fn run_event_loop(
             } => {
                 let now = Instant::now();
                 let expired: Vec<IpAddr> = {
-                    let mut s = state.write().await;
+                    let mut s = crate::lock_timing::write_timed(&state, "gr_deadline").await;
                     let expired = s.gr.drain_expired(now);
                     for peer_ip in &expired {
                         s.on_gr_deadline_expired(*peer_ip);
@@ -1651,7 +1691,9 @@ pub(crate) async fn run_event_loop(
                     expired
                 };
                 if !expired.is_empty() {
-                    let stalled = state.write().await.take_stalled_peers();
+                    let stalled = crate::lock_timing::write_timed(&state, "gr_deadline")
+                        .await
+                        .take_stalled_peers();
                     for peer in stalled {
                         tracing::error!(
                             peer = %peer,
@@ -1680,7 +1722,7 @@ pub(crate) async fn run_event_loop(
                     None    => std::future::pending::<()>().await,
                 }
             } => {
-                let mut s = state.write().await;
+                let mut s = crate::lock_timing::write_timed(&state, "selection_deferral").await;
                 tracing::warn!(
                     "RFC 4724 §4.1: selection-deferral timer expired — \
                      releasing any still-deferred address family unconditionally"
@@ -1718,7 +1760,7 @@ pub(crate) async fn run_event_loop(
                 }
             } => {
                 let now = Instant::now();
-                let mut s = state.write().await;
+                let mut s = crate::lock_timing::write_timed(&state, "max_prefix_idle").await;
                 let expired: Vec<IpAddr> = s
                     .max_prefix_idle
                     .iter()
@@ -1735,7 +1777,7 @@ pub(crate) async fn run_event_loop(
             }
 
             _ = mrai_timer.tick() => {
-                let mut s = state.write().await;
+                let mut s = crate::lock_timing::write_timed(&state, "mrai").await;
                 // Flush any coalesced decisions before MRAI processing so the
                 // MRAI check sees the fully-accumulated outbound state.
                 s.flush_pending();
@@ -12993,6 +13035,266 @@ mod event_loop_tests {
         assert!(
             s.rib.peer_types.contains_key(&peer_ip),
             "Established event must register peer type in DaemonState"
+        );
+    }
+
+    // ── Metrics for coalesced events (GH #105) ────────────────────────────────
+
+    /// `(metric name, sorted labels) -> value` for everything a test recorded.
+    type MetricSnapshot = std::collections::HashMap<
+        (String, Vec<(String, String)>),
+        metrics_util::debugging::DebugValue,
+    >;
+
+    /// Runs `f` with a thread-local debugging recorder installed for its whole
+    /// (possibly async) duration, then returns everything it recorded as
+    /// `(name, sorted labels) -> value`. Sound here because `#[tokio::test]`
+    /// uses a current-thread runtime and `run_event_loop` is awaited inline.
+    async fn capture_metrics<F: std::future::Future<Output = ()>>(f: F) -> MetricSnapshot {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            f.await;
+        }
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(ck, _unit, _desc, value)| {
+                let key = ck.key();
+                let mut labels: Vec<(String, String)> = key
+                    .labels()
+                    .map(|l| (l.key().to_string(), l.value().to_string()))
+                    .collect();
+                labels.sort();
+                ((key.name().to_string(), labels), value)
+            })
+            .collect()
+    }
+
+    fn peer_label(ip: IpAddr) -> Vec<(String, String)> {
+        vec![("peer".to_string(), ip.to_string())]
+    }
+
+    fn gauge(snap: &MetricSnapshot, name: &str, labels: Vec<(String, String)>) -> Option<f64> {
+        match snap.get(&(name.to_string(), labels)) {
+            Some(metrics_util::debugging::DebugValue::Gauge(v)) => Some(v.into_inner()),
+            _ => None,
+        }
+    }
+
+    fn counter(snap: &MetricSnapshot, name: &str, labels: Vec<(String, String)>) -> Option<u64> {
+        match snap.get(&(name.to_string(), labels)) {
+            Some(metrics_util::debugging::DebugValue::Counter(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn update_for(peer: Ipv4Addr, asn: u32, prefix: &str) -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(asn)])),
+                PathAttribute::NextHop(peer),
+            ],
+            announced: vec![nlri(prefix)],
+        }
+    }
+
+    /// `run_event_loop` coalesces every event already queued behind the first
+    /// into one lock hold. The metrics hooks used to run only for that first
+    /// event, so an Established → UPDATEs → Terminated burst left
+    /// `session_up` at 1 for a peer that was gone (the alert-hiding case from
+    /// GH #105) and undercounted received UPDATEs.
+    #[tokio::test]
+    async fn coalesced_terminated_zeroes_session_up_and_counts_every_update() {
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65002)], 64);
+
+        // Everything is queued before the loop starts, so the Established is
+        // the "first" event and the other four are drained behind it.
+        let (event_tx, event_rx) = mpsc::channel(16);
+        event_tx
+            .send((peer_ip, SessionEvent::Established(established_info(65002))))
+            .await
+            .unwrap();
+        for prefix in ["10.1.0.0/16", "10.2.0.0/16", "10.3.0.0/16"] {
+            event_tx
+                .send((
+                    peer_ip,
+                    SessionEvent::RouteUpdate(update_for(
+                        "10.0.0.2".parse().unwrap(),
+                        65002,
+                        prefix,
+                    )),
+                ))
+                .await
+                .unwrap();
+        }
+        event_tx
+            .send((
+                peer_ip,
+                SessionEvent::Terminated(
+                    pathvector_session::transport::TerminationReason::OperatorStop,
+                ),
+            ))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        let snap = capture_metrics(async {
+            run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+        })
+        .await;
+
+        let p = peer_label(peer_ip);
+        assert_eq!(
+            gauge(&snap, "pathvectord_bgp_session_up", p.clone()),
+            Some(0.0),
+            "a Terminated event coalesced behind others must still mark the session down"
+        );
+        assert_eq!(
+            counter(
+                &snap,
+                "pathvectord_bgp_sessions_established_total",
+                p.clone()
+            ),
+            Some(1)
+        );
+        let mut terminated = p.clone();
+        terminated.push(("reason".to_string(), "operator_stop".to_string()));
+        terminated.sort();
+        assert_eq!(
+            counter(
+                &snap,
+                "pathvectord_bgp_sessions_terminated_total",
+                terminated
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter(&snap, "pathvectord_bgp_updates_received_total", p),
+            Some(3),
+            "every UPDATE counts, not just the first of a batch"
+        );
+    }
+
+    /// The mirror case: an Established that is *not* the first event of its
+    /// batch must still mark the session up, and the Adj-RIB-In gauge must
+    /// reflect the latest count after UPDATEs that were also coalesced.
+    #[tokio::test]
+    async fn coalesced_established_sets_session_up_and_adj_rib_in_gauge() {
+        let first: IpAddr = "10.0.0.3".parse().unwrap();
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65002), (first, 65003)], 64);
+
+        let (event_tx, event_rx) = mpsc::channel(16);
+        // Peer `first` is the batch's first event; everything for `peer_ip`
+        // is drained behind it.
+        event_tx
+            .send((first, SessionEvent::Established(established_info(65003))))
+            .await
+            .unwrap();
+        event_tx
+            .send((peer_ip, SessionEvent::Established(established_info(65002))))
+            .await
+            .unwrap();
+        for prefix in ["10.1.0.0/16", "10.2.0.0/16", "10.3.0.0/16"] {
+            event_tx
+                .send((
+                    peer_ip,
+                    SessionEvent::RouteUpdate(update_for(
+                        "10.0.0.2".parse().unwrap(),
+                        65002,
+                        prefix,
+                    )),
+                ))
+                .await
+                .unwrap();
+        }
+        drop(event_tx);
+
+        let snap = capture_metrics(async {
+            run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+        })
+        .await;
+
+        let p = peer_label(peer_ip);
+        assert_eq!(
+            gauge(&snap, "pathvectord_bgp_session_up", p.clone()),
+            Some(1.0)
+        );
+        assert_eq!(
+            counter(
+                &snap,
+                "pathvectord_bgp_sessions_established_total",
+                p.clone()
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            gauge(&snap, "pathvectord_bgp_adj_rib_in_prefixes", p.clone()),
+            Some(3.0),
+            "Adj-RIB-In gauge must show the count after the last coalesced UPDATE"
+        );
+        assert_eq!(
+            counter(&snap, "pathvectord_bgp_updates_received_total", p),
+            Some(3)
+        );
+    }
+
+    /// A Terminated that is the *first* event of its batch takes an early
+    /// `continue`, which used to skip `update_rib_sizes`: after a peer's
+    /// routes were flushed, `pathvectord_bgp_loc_rib_prefixes` kept
+    /// reporting the pre-teardown size (GH #105).
+    #[tokio::test]
+    async fn terminated_first_event_refreshes_loc_rib_gauge() {
+        let peer_ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65002)], 64);
+        {
+            let mut s = state.write().await;
+            s.on_established(
+                peer_ip,
+                "10.0.0.2".parse().unwrap(),
+                PeerType::External,
+                65002,
+                90,
+                &[],
+                None,
+            );
+            s.on_route_update(
+                peer_ip,
+                update_for("10.0.0.2".parse().unwrap(), 65002, "10.1.0.0/16"),
+            );
+            assert_eq!(s.rib.loc_rib.len(), 1, "precondition: route installed");
+        }
+
+        let (event_tx, event_rx) = mpsc::channel(4);
+        event_tx
+            .send((
+                peer_ip,
+                SessionEvent::Terminated(TerminationReason::OperatorStop),
+            ))
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        let snap = capture_metrics(async {
+            run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+        })
+        .await;
+
+        assert_eq!(state.read().await.rib.loc_rib.len(), 0, "routes flushed");
+        assert_eq!(
+            gauge(
+                &snap,
+                "pathvectord_bgp_loc_rib_prefixes",
+                vec![("afi".to_string(), "ipv4".to_string())]
+            ),
+            Some(0.0),
+            "Loc-RIB size gauge must be refreshed after a teardown"
         );
     }
 
