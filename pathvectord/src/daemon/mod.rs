@@ -73,6 +73,9 @@ mod route;
 // Issue #160: session loss must withdraw or replace routes in both families.
 #[cfg(test)]
 mod session_loss_tests;
+// Issue #178: UPDATEs stay within the negotiated maximum message size.
+#[cfg(test)]
+mod update_size_tests;
 
 // Issues #81 and #82: BLACKHOLE authorization and import eligibility through
 // Graceful Restart.
