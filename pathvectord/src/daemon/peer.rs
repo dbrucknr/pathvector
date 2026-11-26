@@ -572,6 +572,7 @@ impl DaemonState {
         );
         self.program_fib_v6(effects);
         self.repropagate_peer_prefixes_v6(peer_ip, &nlris);
+        self.emit_route_events_v6(&nlris);
     }
 
     ///
@@ -724,8 +725,8 @@ impl DaemonState {
             ari.clear();
         }
 
-        // Snapshot affected prefixes before withdrawal so we can propagate the
-        // changes to other established peers below.
+        // Snapshot affected IPv4 prefixes before withdrawal so we can propagate
+        // the changes to other established peers below.
         let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
 
@@ -740,6 +741,9 @@ impl DaemonState {
             best: self.rib_withdraw_peer_v6(&peer_id),
             blackhole: self.blackholes.v6.release_peer(peer_id),
         };
+        // IPv6 prefixes whose best path this teardown removed or replaced.
+        let mut changed_v6 = changed_nlris(&fx_v6.best);
+        changed_v6.sort_unstable();
         self.program_fib_v4(fx_v4);
         self.program_fib_v6(fx_v6);
 
@@ -761,6 +765,10 @@ impl DaemonState {
         // Tell all other established peers about the best-path changes caused
         // by this teardown.
         //
+        // RFC 4271 §3.1 / §8.2.2 delete the lost peer's routes; §9.2 requires
+        // the newly unfeasible and newly installed ones to be advertised. That
+        // holds per address family: IPv4 below, IPv6 after it.
+        //
         // WARNING: this loop runs synchronously while holding the DaemonState
         // write lock.  For a peer with a large route table the loop can stall
         // BGP event processing (including KEEPALIVE handling) for tens of
@@ -779,7 +787,7 @@ impl DaemonState {
         let local_bgp_id = self.rib.local_bgp_id;
         let v4_deferred = self.selection_deferral.v4_deferred();
         let propagation_start = std::time::Instant::now();
-        let prefix_count = prev_prefixes.len();
+        let prefix_count = prev_prefixes.len() + changed_v6.len();
         for other_ip in other_peers {
             let other_type = self
                 .rib
@@ -831,6 +839,7 @@ impl DaemonState {
             self.send_decisions(other_ip, decisions);
             self.sync_advertised(other_ip);
         }
+        self.repropagate_peer_prefixes_v6(peer_ip, &changed_v6);
 
         let elapsed = propagation_start.elapsed();
         if elapsed.as_millis() > 100 {
@@ -848,6 +857,7 @@ impl DaemonState {
         // (or Announced if another peer's route was promoted). Without this,
         // the dashboard shows stale routes after a peer disconnects.
         self.emit_route_events(&prev_prefixes);
+        self.emit_route_events_v6(&changed_v6);
 
         if notify {
             let _ = self.peer_tx.send(proto::PeerEvent {
