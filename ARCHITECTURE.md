@@ -134,9 +134,10 @@ Session::wait_for_input()              pathvector-session/src/transport/mod.rs
   │  takes UPDATEs only while the writer is idle, one bounded batch at a time
   │
   ▼
-Outbound::queue() / flush()            pathvector-session/src/transport/link.rs
-  │  BgpCodec::encode() into a buffer; written to the socket concurrently
-  │  with everything else the loop waits for
+Outbound::queue() / flush_some()       pathvector-session/src/transport/link.rs
+  │  BgpCodec::encode() into a buffer (transport/sink.rs); written to the
+  │  socket concurrently with everything else the loop waits for, which hears
+  │  of each message as its last byte goes out
   │
   ▼
 Peer TCP socket
@@ -202,9 +203,10 @@ two directions the session drives independently:
 BgpTransport::into_split() → (BgpReader, BgpWriter)
   BgpReader   recv()            cancel safe
   BgpWriter   queue()           never waits
-              flush()           cancel safe
+              flush()           cancel safe; resolves as soon as at least one
+                                more message is written, with how many
 
-  ├─ FramedBgpTransport   production: FramedRead + a byte buffer over TcpStream
+  ├─ FramedBgpTransport   production: FramedRead + MessageSink over TcpStream
   └─ mock transports      tests: in-memory channels, with writes that can block
 ```
 
@@ -219,7 +221,8 @@ tokio time and no ports (`tests/deadline_supervision.rs`, `tests/send_hold_timer
 
 Around the I/O sit two modules with no I/O of their own: `transport/schedule.rs`
 (which timer to service, and the budgets) and `transport/outbox.rs` (ordered,
-non-blocking event delivery).
+non-blocking event delivery). `transport/sink.rs` keeps the message boundaries of
+the write buffer over any `AsyncWrite`.
 
 ---
 

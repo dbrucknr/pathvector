@@ -23,6 +23,7 @@ mod outbox;
 #[cfg(test)]
 mod prop_tests;
 mod schedule;
+mod sink;
 pub mod tcp_md5;
 
 use std::future::Future;
@@ -44,7 +45,7 @@ use crate::message::{
     NotificationMessage, OpenMessage, OpenMsgError, UpdateMessage,
 };
 
-pub use link::{BgpReader, BgpTransport, BgpWriter};
+pub use link::{BgpReader, BgpTransport, BgpWriter, MessagesWritten};
 use link::{FramedBgpTransport, Link, Outbound, ready_now};
 use outbox::Outbox;
 use schedule::{
@@ -698,7 +699,7 @@ impl<T: BgpTransport> Session<T> {
     /// task ends. Bounded by [`CLOSE_FLUSH_TIMEOUT`].
     async fn finish(mut self) {
         if let Some(mut link) = self.closing.take()
-            && tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, link.out.flush())
+            && tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, link.out.drain())
                 .await
                 .is_err()
         {
@@ -769,7 +770,7 @@ impl<T: BgpTransport> Session<T> {
                     }
                 }
 
-                _ = flush_pending(closing) => {
+                _ = drain_pending(closing) => {
                     self.closing = None;
                     self.deadlines.cancel(Timer::CloseFlush);
                 }
@@ -934,12 +935,17 @@ impl<T: BgpTransport> Session<T> {
     /// RFC 9687 §4.3: "Each time the local system sends a BGP message, it
     /// restarts the `SendHoldTimer`". "Sent" means accepted by the transport:
     /// for TCP, written to the socket.
-    fn restart_send_hold_timer(&mut self) {
+    ///
+    /// Returns whether a message was sent since the last call. A write resolves
+    /// as each message finishes (see [`BgpWriter::flush`]), and every path from
+    /// one to here is synchronous, so "now" is when it was sent.
+    fn restart_send_hold_timer(&mut self) -> bool {
         let sent = self.link.as_mut().is_some_and(|l| l.out.take_sent());
         if sent && let Some(interval) = self.send_hold_interval {
             self.deadlines
                 .arm(Timer::SendHold, Instant::now() + interval);
         }
+        sent
     }
 
     /// Service one overdue timer.
@@ -947,11 +953,13 @@ impl<T: BgpTransport> Session<T> {
         match timer {
             Timer::SendHold => {
                 // The connection may have become writable since the last turn.
-                if let Some(link) = &mut self.link
-                    && link.out.is_flushing()
-                    && matches!(link.out.try_flush(), Some(Ok(())))
-                {
-                    self.restart_send_hold_timer();
+                // A message that goes out now restarts the timer, whether or
+                // not others are still waiting behind it. A write error is met
+                // again by the flush in `wait_for_input`.
+                if let Some(link) = &mut self.link {
+                    let _ = link.out.try_flush();
+                }
+                if self.restart_send_hold_timer() {
                     return None;
                 }
                 self.deadlines.cancel(Timer::SendHold);
@@ -1780,11 +1788,20 @@ async fn recv_message<R: BgpReader>(
     }
 }
 
-/// Resolves when `out` has written everything queued, or never if there is
-/// nothing to write.
+/// Resolves when `out` has written at least one more message, or never if
+/// there is nothing to write.
 async fn flush_pending<W: BgpWriter>(out: Option<&mut Outbound<W>>) -> io::Result<()> {
     match out {
-        Some(o) if o.is_flushing() => o.flush().await,
+        Some(o) if o.is_flushing() => o.flush_some().await,
+        _ => std::future::pending().await,
+    }
+}
+
+/// Resolves when `out` has written everything queued, or never if there is
+/// nothing to write.
+async fn drain_pending<W: BgpWriter>(out: Option<&mut Outbound<W>>) -> io::Result<()> {
+    match out {
+        Some(o) if o.is_flushing() => o.drain().await,
         _ => std::future::pending().await,
     }
 }
@@ -1820,13 +1837,15 @@ mod tests {
 
     use super::{
         BgpReader, BgpTransport, BgpWriter, COLLISION_CANDIDATE_OPEN_TIMEOUT, ConnectionIdentity,
-        ConnectionOrigin, DEFAULT_CONNECT_RETRY_TIME, FramedBgpTransport, Session, SessionCommand,
-        SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle, TerminationReason, spawn,
-        spawn_with, spawn_with_collision_timeout,
+        ConnectionOrigin, DEFAULT_CONNECT_RETRY_TIME, FramedBgpTransport, Link, MessagesWritten,
+        Session, SessionCommand, SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle,
+        TerminationReason, spawn, spawn_with, spawn_with_collision_timeout,
     };
     use crate::framing::FramingError;
     use pathvector_types::Nlri;
 
+    use super::schedule::Timer;
+    use crate::fsm::FsmInput;
     use crate::message::{
         AttributeDecodeError, AttributeErrorPolicy, BgpMessage, Capability, CeaseError, CodecError,
         MalformedUpdate, MsgHeaderError, NotificationError, NotificationMessage, OpenMessage,
@@ -1872,6 +1891,7 @@ mod tests {
     struct MockWriter {
         send_tx: mpsc::UnboundedSender<BgpMessage>,
         fail_send: Arc<AtomicBool>,
+        unreported: usize,
     }
 
     impl BgpTransport for MockTransport {
@@ -1884,6 +1904,7 @@ mod tests {
                 MockWriter {
                     send_tx: self.send_tx,
                     fail_send: self.fail_send,
+                    unreported: 0,
                 },
             )
         }
@@ -1904,11 +1925,84 @@ mod tests {
                 ));
             }
             let _ = self.send_tx.send(msg);
+            self.unreported += 1;
             Ok(1)
         }
 
-        async fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+        async fn flush(&mut self) -> io::Result<MessagesWritten> {
+            Ok(MessagesWritten(std::mem::take(&mut self.unreported)))
+        }
+    }
+
+    // ── A peer that takes one message at a time ──────────────────────────────
+
+    /// Takes `room` more messages, one per `flush`, then blocks.
+    #[derive(Default)]
+    struct Trickle {
+        queued: usize,
+        room: usize,
+    }
+
+    impl BgpWriter for Trickle {
+        fn queue(&mut self, _: BgpMessage) -> io::Result<usize> {
+            self.queued += 1;
+            Ok(1)
+        }
+
+        async fn flush(&mut self) -> io::Result<MessagesWritten> {
+            if self.queued == 0 {
+                return Ok(MessagesWritten(0));
+            }
+            if self.room == 0 {
+                std::future::pending::<()>().await;
+            }
+            self.queued -= 1;
+            self.room -= 1;
+            Ok(MessagesWritten(1))
+        }
+    }
+
+    struct TrickleTransport(Trickle);
+
+    impl BgpTransport for TrickleTransport {
+        type Reader = MockReader;
+        type Writer = Trickle;
+
+        fn into_split(self) -> (MockReader, Trickle) {
+            (MockReader(mpsc::unbounded_channel().1), self.0)
+        }
+    }
+
+    /// RFC 9687 §4.3 on the timer's own path: the deadline is due, and the
+    /// connection turns out to take one of the two waiting messages. That one
+    /// is sent, so it restarts the timer. When nothing can be sent, it expires.
+    #[tokio::test(start_paused = true)]
+    async fn due_send_hold_timer_is_restarted_by_one_message_of_several() {
+        let period = Duration::from_secs(480);
+        let (mut session, _handle) = Session::<TrickleTransport>::new(test_config());
+        let mut link = Link::new(TrickleTransport(Trickle { queued: 0, room: 1 }));
+        for _ in 0..2 {
+            link.out.queue(BgpMessage::Update(announcement())).unwrap();
+        }
+        session.link = Some(link);
+        session.send_hold_interval = Some(period);
+        let now = tokio::time::Instant::now();
+        session.deadlines.arm(Timer::SendHold, now);
+
+        assert!(session.on_timer(Timer::SendHold).is_none());
+        assert_eq!(session.deadlines.get(Timer::SendHold), Some(now + period));
+
+        assert!(matches!(
+            session.on_timer(Timer::SendHold),
+            Some(FsmInput::SendHoldTimerExpired)
+        ));
+    }
+
+    fn announcement() -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![Nlri::new(Ipv4Addr::new(192, 0, 2, 0), 24).expect("valid /24")],
         }
     }
 
@@ -2225,7 +2319,7 @@ mod tests {
             self.0.queue(msg)
         }
 
-        async fn flush(&mut self) -> io::Result<()> {
+        async fn flush(&mut self) -> io::Result<MessagesWritten> {
             self.0.flush().await
         }
     }

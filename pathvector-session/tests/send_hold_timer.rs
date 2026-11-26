@@ -14,10 +14,11 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use pathvector_session::message::BgpMessage;
+use pathvector_session::message::{BgpMessage, RouteRefreshMessage};
 use pathvector_session::transport::{
     SendHoldTime, SessionEvent, SessionHandle, SpawnedSessionHandle, TerminationReason,
 };
+use pathvector_types::AfiSafi;
 use supervision_support::*;
 
 /// Keep the peer talking (KEEPALIVE every 10 s) for `secs`, stopping early if
@@ -95,6 +96,101 @@ async fn each_completed_send_restarts_the_send_hold_timer() {
     let stalled = Instant::now();
     expect_send_hold_expiry(talk_for(&mut handle, &peer, 600).await.as_ref());
     assert!(stalled.elapsed() >= Duration::from_secs(440));
+}
+
+/// §4.3: "Each time the local system sends a BGP message, it restarts the
+/// `SendHoldTimer`". That is each message, not each time the write buffer
+/// empties: here a batch of five goes out one message per 100 s.
+#[tokio::test(start_paused = true)]
+async fn each_message_of_a_partly_written_batch_restarts_the_timer() {
+    let (mut handle, mut peer) = established(config(90)).await;
+    peer.clear_sent();
+    peer.set_reading(false);
+    for n in 1..=5 {
+        handle.update_sender().send(update(n)).await.unwrap();
+    }
+
+    let mut last_send = Instant::now();
+    for _ in 0..4 {
+        let event = talk_for(&mut handle, &peer, 100).await;
+        assert!(event.is_none(), "{event:?} while messages were being sent");
+        last_send = Instant::now();
+        peer.take(1);
+        settle().await;
+    }
+    let sent: Vec<_> = peer.sent().into_iter().map(|s| s.msg).collect();
+    assert_eq!(sent, (1..=4).map(update_msg).collect::<Vec<_>>());
+
+    // The period then runs from the last message that was sent.
+    expect_send_hold_expiry(talk_for(&mut handle, &peer, 600).await.as_ref());
+    let after = last_send.elapsed();
+    assert!(
+        (Duration::from_secs(480)..=Duration::from_secs(481)).contains(&after),
+        "closed {after:?} after the last message"
+    );
+}
+
+/// A message that can be written when the timer comes due is sent, so it
+/// restarts the timer although more are still waiting.
+#[tokio::test(start_paused = true)]
+async fn a_message_found_sendable_at_the_deadline_restarts_the_timer() {
+    let mut cfg = config(90);
+    cfg.send_hold_time = SendHoldTime::from_secs(125, 90).unwrap();
+    let (mut handle, mut peer) = established(cfg).await;
+    peer.clear_sent();
+    peer.set_reading(false);
+    handle.update_sender().send(update(1)).await.unwrap();
+    handle.update_sender().send(update(2)).await.unwrap();
+
+    assert!(talk_for(&mut handle, &peer, 120).await.is_none());
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    // Nothing else is due before the deadline at 125 s.
+    peer.take_quietly(1);
+    let event = talk_for(&mut handle, &peer, 20).await;
+    assert!(event.is_none(), "{event:?}");
+    let sent: Vec<_> = peer.sent().into_iter().map(|s| s.msg).collect();
+    assert_eq!(sent, vec![update_msg(1)]);
+}
+
+/// A KEEPALIVE or ROUTE-REFRESH is dropped as a repeat only while an identical
+/// one is still unsent. Once it has gone out, the next one is queued, although
+/// messages behind the first are still waiting.
+#[tokio::test(start_paused = true)]
+async fn a_sent_keepalive_or_route_refresh_does_not_suppress_the_next() {
+    let (handle, mut peer) = established(config(90)).await;
+    peer.clear_sent();
+    peer.set_reading(false);
+    let refresh = RouteRefreshMessage::new(AfiSafi::IPV4_UNICAST);
+    let other = RouteRefreshMessage::new(AfiSafi::IPV6_UNICAST);
+
+    // Waiting: UPDATE, then the KEEPALIVE of the 30 s timer, then two
+    // ROUTE-REFRESHes.
+    handle.update_sender().send(update(1)).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    handle.send_route_refresh(refresh.clone()).await;
+    handle.send_route_refresh(other.clone()).await;
+    settle().await;
+    // All but the last go out.
+    peer.take(3);
+    settle().await;
+
+    handle.send_route_refresh(refresh.clone()).await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    peer.set_reading(true);
+    settle().await;
+
+    let sent: Vec<_> = peer.sent().into_iter().map(|s| s.msg).collect();
+    assert_eq!(
+        sent,
+        vec![
+            update_msg(1),
+            BgpMessage::Keepalive,
+            BgpMessage::RouteRefresh(refresh.clone()),
+            BgpMessage::RouteRefresh(other),
+            BgpMessage::RouteRefresh(refresh),
+            BgpMessage::Keepalive,
+        ]
+    );
 }
 
 #[tokio::test(start_paused = true)]

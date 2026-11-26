@@ -25,7 +25,8 @@ event-channel sends inline. Reproduced before the fix:
 **RFC 9687 (Send Hold Timer, updates RFC 4271)** was not implemented. A peer that kept sending
 KEEPALIVEs behind a closed TCP window kept the session up for ever. It is now implemented, enabled
 by default at the greater of 8 minutes and twice the negotiated hold time, and configurable per
-session with the validated `SendHoldTime`.
+session with the validated `SendHoldTime`. It restarts for each message written, including each one
+of a batch the peer is taking slowly; part of a message does not count (`transport/sink.rs`).
 
 **Behaviour changes**
 
@@ -46,7 +47,7 @@ session with the validated `SendHoldTime`.
 **Breaking API changes (`pathvector-session`)**
 
 - `BgpTransport` is now `into_split()` into a `BgpReader` and a `BgpWriter` (`queue` without waiting,
-  cancel-safe `flush`).
+  cancel-safe `flush` that resolves as messages complete, with a `MessagesWritten` count).
 - `SessionConfig` and `FsmConfig` have a new `send_hold_time` field.
 - New variants: `FsmInput::SendHoldTimerExpired`, `FsmOutput::{Start,Stop}SendHoldTimer`,
   `NotificationError::SendHoldTimerExpired`, `TerminationReason::SendHoldTimerExpired`.
@@ -55,6 +56,8 @@ New metrics: `pathvector_session_send_hold_expired_total`,
 `pathvector_session_event_backlog_resets_total`.
 
 **Measurements**
+
+Taken before the per-message flush reporting above was added, and not repeated.
 
 `pathvector-loadtest`, one loader with a 1,133,510-prefix RIPE RIS table plus a 9 s control peer,
 loopback, release build, Apple M2 Max; base is the commit this change sits on. One loader only, so

@@ -5,16 +5,16 @@
 //! session loop is waiting for, so a peer that stops reading cannot stop the
 //! session reading, serving commands or running its timers.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 
-use bytes::{Buf, BytesMut};
 use futures::{FutureExt, StreamExt};
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio_util::codec::{Encoder, FramedRead};
+use tokio_util::codec::FramedRead;
 
+use super::sink::MessageSink;
 use crate::framing::{BgpCodec, FramingError};
 use crate::message::{AsnWidth, BgpMessage, RouteRefreshMessage};
 
@@ -52,10 +52,17 @@ pub trait BgpReader: Send + 'static {
     fn set_asn_width(&mut self, _width: AsnWidth) {}
 }
 
+/// How many whole messages one [`BgpWriter::flush`] call wrote.
+///
+/// Messages, not bytes: the session restarts the `SendHoldTimer` for a message
+/// that has been sent (RFC 9687 §4.3), and part of one has not been.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessagesWritten(pub usize);
+
 /// The sending direction of a [`BgpTransport`].
 pub trait BgpWriter: Send + 'static {
     /// Encode and buffer one message without waiting, and return how many
-    /// bytes it added. The session limits how much it queues before it waits
+    /// bytes it added. Each successful call buffers exactly one message. The session limits how much it queues before it waits
     /// for [`Self::flush`].
     ///
     /// # Errors
@@ -64,11 +71,18 @@ pub trait BgpWriter: Send + 'static {
     /// encoded.
     fn queue(&mut self, msg: BgpMessage) -> io::Result<usize>;
 
-    /// Write everything queued.
+    /// Write queued messages, oldest first, until at least one more of them
+    /// has been written in full, and resolve with how many were. Zero means
+    /// that nothing is queued. Call again for the rest.
+    ///
+    /// Must not stay pending once it has finished a message, however much is
+    /// still queued behind it: this is the only way the session learns that a
+    /// message was sent.
     ///
     /// Must be cancel safe: when this future is dropped, unwritten bytes stay
-    /// queued and the next call carries on from them.
-    fn flush(&mut self) -> impl Future<Output = io::Result<()>> + Send + '_;
+    /// queued and the next call carries on from them, and no finished message
+    /// goes unreported.
+    fn flush(&mut self) -> impl Future<Output = io::Result<MessagesWritten>> + Send + '_;
 
     /// Set the width of AS numbers for encoding queued UPDATEs (RFC 6793 §4).
     /// Default implementation is a no-op.
@@ -92,11 +106,7 @@ impl FramedBgpTransport {
         let (r, w) = stream.into_split();
         Self {
             reader: SocketReader(FramedRead::new(r, BgpCodec::new())),
-            writer: SocketWriter {
-                half: w,
-                codec: BgpCodec::new(),
-                buf: BytesMut::new(),
-            },
+            writer: SocketWriter(MessageSink::new(w)),
         }
     }
 }
@@ -115,7 +125,8 @@ impl BgpTransport for FramedBgpTransport {
 impl FramedBgpTransport {
     pub(super) async fn send(&mut self, msg: BgpMessage) -> io::Result<()> {
         self.writer.queue(msg)?;
-        self.writer.flush().await
+        while self.writer.flush().await?.0 > 0 {}
+        Ok(())
     }
 
     pub(super) async fn recv(&mut self) -> Option<Result<BgpMessage, FramingError>> {
@@ -124,7 +135,7 @@ impl FramedBgpTransport {
 
     /// Shut down the local write half, so that the next write fails.
     pub(super) async fn shutdown_write(&mut self) -> io::Result<()> {
-        self.writer.half.shutdown().await
+        tokio::io::AsyncWriteExt::shutdown(self.writer.0.io_mut()).await
     }
 }
 
@@ -144,41 +155,25 @@ impl BgpReader for SocketReader {
     }
 }
 
-pub(super) struct SocketWriter {
-    half: OwnedWriteHalf,
-    // A separate codec instance from the reader's: it must be told the ASN
-    // width too, or the outbound side would keep encoding four-octet ASNs to an
-    // OLD peer.
-    codec: BgpCodec,
-    buf: BytesMut,
-}
+pub(super) struct SocketWriter(MessageSink<OwnedWriteHalf>);
 
 impl BgpWriter for SocketWriter {
     fn queue(&mut self, msg: BgpMessage) -> io::Result<usize> {
-        let before = self.buf.len();
-        self.codec.encode(msg, &mut self.buf)?;
-        Ok(self.buf.len() - before)
+        self.0.queue(msg)
     }
 
-    async fn flush(&mut self) -> io::Result<()> {
-        while self.buf.has_remaining() {
-            // `write_buf` is cancel safe: it has either written and advanced
-            // `buf`, or written nothing.
-            if self.half.write_buf(&mut self.buf).await? == 0 {
-                return Err(io::ErrorKind::WriteZero.into());
-            }
-        }
-        Ok(())
+    async fn flush(&mut self) -> io::Result<MessagesWritten> {
+        self.0.flush().await
     }
 
     fn set_asn_width(&mut self, width: AsnWidth) {
-        self.codec.set_asn_width(width);
+        self.0.set_asn_width(width);
     }
 
     fn abort(&mut self) {
         // A zero linger makes close() reset the connection and free the send
         // buffer, instead of retrying it against a closed window.
-        let stream: &TcpStream = self.half.as_ref();
+        let stream: &TcpStream = self.0.io().as_ref();
         if let Err(e) = socket2::SockRef::from(stream).set_linger(Some(std::time::Duration::ZERO)) {
             tracing::debug!(error = %e, "could not set zero linger on a stalled connection");
         }
@@ -195,74 +190,83 @@ pub(super) fn ready_now<F: Future>(future: F) -> Option<F::Output> {
     tokio::task::unconstrained(future).now_or_never()
 }
 
+/// A queued message, as far as the session needs to remember it.
+#[derive(PartialEq)]
+enum Queued {
+    Keepalive,
+    RouteRefresh(RouteRefreshMessage),
+    Other,
+}
+
 /// A writer plus what it still has to write.
 pub(super) struct Outbound<W> {
     writer: W,
-    flushing: bool,
-    // Set when queued messages have been written out.
+    // Messages queued and not yet written, oldest first.
+    waiting: VecDeque<Queued>,
+    // Set when a message has been written.
     sent: bool,
-    // Idempotent messages already waiting in the buffer. Queuing another copy
-    // behind them would grow the buffer without telling the peer anything.
-    keepalive_waiting: bool,
-    refresh_waiting: Vec<RouteRefreshMessage>,
 }
 
 impl<W: BgpWriter> Outbound<W> {
     fn new(writer: W) -> Self {
         Self {
             writer,
-            flushing: false,
+            waiting: VecDeque::new(),
             sent: false,
-            keepalive_waiting: false,
-            refresh_waiting: Vec::new(),
         }
     }
 
-    /// Whether queued bytes are still waiting to be written.
+    /// Whether queued messages are still waiting to be written.
     pub(super) fn is_flushing(&self) -> bool {
-        self.flushing
+        !self.waiting.is_empty()
     }
 
     /// Buffer `msg`, returning the bytes added. A KEEPALIVE or ROUTE-REFRESH
-    /// identical to one still waiting to be written adds nothing.
+    /// identical to one still waiting to be written adds nothing: queuing it
+    /// would grow the buffer without telling the peer anything.
     pub(super) fn queue(&mut self, msg: BgpMessage) -> io::Result<usize> {
-        match &msg {
-            BgpMessage::Keepalive => {
-                if std::mem::replace(&mut self.keepalive_waiting, true) {
-                    return Ok(0);
-                }
-            }
-            BgpMessage::RouteRefresh(rr) => {
-                if self.refresh_waiting.contains(rr) {
-                    return Ok(0);
-                }
-                self.refresh_waiting.push(rr.clone());
-            }
-            _ => {}
+        let queued = match &msg {
+            BgpMessage::Keepalive => Queued::Keepalive,
+            BgpMessage::RouteRefresh(rr) => Queued::RouteRefresh(rr.clone()),
+            _ => Queued::Other,
+        };
+        if queued != Queued::Other && self.waiting.contains(&queued) {
+            return Ok(0);
         }
         let added = self.writer.queue(msg)?;
-        self.flushing = true;
+        self.waiting.push_back(queued);
         Ok(added)
     }
 
-    /// Write everything queued. Cancel safe.
-    pub(super) async fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush().await?;
-        self.sent |= self.flushing;
-        self.flushing = false;
-        self.keepalive_waiting = false;
-        self.refresh_waiting.clear();
+    /// Write until at least one more message is out. Cancel safe.
+    pub(super) async fn flush_some(&mut self) -> io::Result<()> {
+        let MessagesWritten(written) = self.writer.flush().await?;
+        if written == 0 {
+            // The writer holds nothing, so nothing is waiting.
+            self.waiting.clear();
+        } else {
+            self.waiting.drain(..written.min(self.waiting.len()));
+            self.sent = true;
+        }
         Ok(())
     }
 
-    /// Whether messages were written out since the last call.
+    /// Write everything queued. Cancel safe.
+    pub(super) async fn drain(&mut self) -> io::Result<()> {
+        while self.is_flushing() {
+            self.flush_some().await?;
+        }
+        Ok(())
+    }
+
+    /// Whether a message was written since the last call.
     pub(super) fn take_sent(&mut self) -> bool {
         std::mem::take(&mut self.sent)
     }
 
     /// Write as much as can be written without waiting. `None` if some is left.
     pub(super) fn try_flush(&mut self) -> Option<io::Result<()>> {
-        ready_now(self.flush())
+        ready_now(self.drain())
     }
 
     pub(super) fn set_asn_width(&mut self, width: AsnWidth) {

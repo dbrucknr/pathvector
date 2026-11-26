@@ -230,7 +230,7 @@ One task runs each session, and it waits in exactly one place. Writing, emitting
 | Pressure | What the session does |
 |---|---|
 | Input continuously ready | Overdue timers and ready input alternate, so at most one input is processed ahead of each overdue timer. |
-| Peer not reading | Writes are buffered and flushed in the background. At most one 8 KiB batch of UPDATEs (plus one KEEPALIVE) is buffered; after that the 256-entry UPDATE channel fills, and its sender sees `Full`. Reading and timers carry on. `SendHoldTimer` bounds how long. |
+| Peer not reading | Writes are buffered and flushed in the background. At most one 8 KiB batch of UPDATEs is buffered, plus one unsent KEEPALIVE and one of each distinct ROUTE-REFRESH; after that the 256-entry UPDATE channel fills, and its sender sees `Full`. Reading and timers carry on. `SendHoldTimer` bounds how long. |
 | Consumer not taking events | Once the 64-entry event channel is full the session stops reading, so TCP flow control holds the peer back. KEEPALIVEs and commands carry on. |
 | Hold timer expires with input unread | Up to 16 already-received messages are read first; a KEEPALIVE or UPDATE among them restarts the timer. A silent peer still expires. |
 | Consumer never resumes | While the peer keeps talking, each hold period admits one more message. At 64 held events the session is reset with Cease / Out of Resources. |
@@ -239,6 +239,8 @@ One task runs each session, and it waits in exactly one place. Writing, emitting
 ### Custom transports
 
 `spawn_with` takes any `BgpTransport`, which splits into a `BgpReader` and a `BgpWriter`. Both `recv` and `flush` must be cancel safe, and `queue` must not wait.
+
+`flush` resolves as soon as it has written at least one more message in full, with the number written (`MessagesWritten`), and must not stay pending after finishing one. That is how the session restarts the `SendHoldTimer` for each message sent (RFC 9687 §4.3) while others are still waiting. Part of a message does not count.
 
 ### Metrics
 
