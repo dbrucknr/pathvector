@@ -330,34 +330,17 @@ impl DaemonState {
             })
             .unwrap_or(local_bgp_id);
         let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
-        let is_rr = !self.rib.rr_clients.is_empty();
-        let dest_is_client = self.rib.rr_clients.contains(&peer_ip);
         let rr_clients = &self.rib.rr_clients;
-        let peer_types = &self.rib.peer_types;
         let loc_rib = &self.rib.loc_rib;
 
         let decisions: Vec<PrefixDecision> = all_nlris
             .into_iter()
             .map(|nlri| {
-                // RFC 4456 §8 split-horizon: as an RR, a non-client iBGP peer
-                // must not receive routes learned from other non-client iBGP
-                // peers.
-                if is_rr
-                    && peer_type == PeerType::Internal
-                    && let Some(src) = loc_rib.best_peer(&nlri)
-                    && let IpAddr::V4(src_ip) = src.ip()
-                {
-                    let src_is_client = rr_clients.contains(&IpAddr::V4(src_ip));
-                    let src_is_ibgp =
-                        peer_types.get(&IpAddr::V4(src_ip)).copied() == Some(PeerType::Internal);
-                    if src_is_ibgp && !src_is_client && !dest_is_client {
-                        return PrefixDecision::NoChange;
-                    }
-                }
                 propagate_prefix(
                     nlri,
                     loc_rib,
                     adj_rib_out,
+                    rr_clients,
                     export_policy,
                     peer_type,
                     local_as,
@@ -418,31 +401,17 @@ impl DaemonState {
         let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_ipv6 = self.rib.local_ipv6;
         let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
-        let is_rr = !self.rib.rr_clients.is_empty();
-        let dest_is_client = self.rib.rr_clients.contains(&peer_ip);
         let rr_clients = &self.rib.rr_clients;
-        let peer_types = &self.rib.peer_types;
         let loc_rib_v6 = &self.rib.loc_rib_v6;
 
         let decisions_v6: Vec<PrefixDecisionV6> = all_nlris_v6
             .into_iter()
             .map(|nlri| {
-                if is_rr
-                    && peer_type == PeerType::Internal
-                    && let Some(src) = loc_rib_v6.best_peer(&nlri)
-                    && let IpAddr::V4(src_ip) = src.ip()
-                {
-                    let src_is_client = rr_clients.contains(&IpAddr::V4(src_ip));
-                    let src_is_ibgp =
-                        peer_types.get(&IpAddr::V4(src_ip)).copied() == Some(PeerType::Internal);
-                    if src_is_ibgp && !src_is_client && !dest_is_client {
-                        return PrefixDecisionV6::NoChange;
-                    }
-                }
                 propagate_prefix_v6(
                     nlri,
                     loc_rib_v6,
                     adj_rib_out_v6,
+                    rr_clients,
                     export_policy_v6,
                     peer_type,
                     local_as,

@@ -50,6 +50,18 @@ fn program_effects<A: IpAddress>(
     }
 }
 
+/// The prefixes whose best path a batch of Loc-RIB mutations removed or
+/// replaced.
+pub(super) fn changed_nlris<A: IpAddress>(changes: &[BestPathChange<A>]) -> Vec<Nlri<A>> {
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            BestPathChange::Announced(n, _) | BestPathChange::Withdrawn(n) => Some(*n),
+            BestPathChange::Unchanged => None,
+        })
+        .collect()
+}
+
 impl DaemonState {
     /// Programs one IPv4 batch of RIB effects into the FIB port, if there is one.
     pub(super) fn program_fib_v4(&self, effects: RibEffects<Ipv4Addr>) {
@@ -166,21 +178,8 @@ impl DaemonState {
         let fib_changes_v4 = self.rib_recompute_all_v4();
         let fib_changes_v6 = self.rib_recompute_all_v6();
 
-        let changed_nlris_v4: Vec<Nlri<Ipv4Addr>> = fib_changes_v4
-            .iter()
-            .filter_map(|c| match c {
-                BestPathChange::Announced(n, _) | BestPathChange::Withdrawn(n) => Some(*n),
-                BestPathChange::Unchanged => None,
-            })
-            .collect();
-
-        let changed_nlris_v6: Vec<Nlri<Ipv6Addr>> = fib_changes_v6
-            .iter()
-            .filter_map(|c| match c {
-                BestPathChange::Announced(n, _) | BestPathChange::Withdrawn(n) => Some(*n),
-                BestPathChange::Unchanged => None,
-            })
-            .collect();
+        let changed_nlris_v4 = changed_nlris(&fib_changes_v4);
+        let changed_nlris_v6 = changed_nlris(&fib_changes_v6);
 
         if !changed_nlris_v4.is_empty() || !changed_nlris_v6.is_empty() {
             tracing::debug!(

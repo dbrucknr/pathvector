@@ -172,6 +172,7 @@ of UPDATE messages lives in `pathvector-session`.
 | iBGP peers pass-through: LOCAL_PREF preserved, AS_PATH unchanged, NEXT_HOP unchanged | `src/outbound.rs` | ✅ | `test_prepare_outbound_ibgp_preserves_attributes` |
 | LOCAL_PREF received from an eBGP peer MUST be ignored by the receiving speaker, except confederation Member-AS peers (RFC 4271 §5.1.5, RFC 5065 §5.2) | `src/daemon/route.rs` | ✅ | `test_local_pref_ignored_from_ebgp_peer`, `test_local_pref_honored_from_ibgp_peer`, `test_local_pref_honored_from_confed_member_peer`, `test_ebgp_local_pref_cannot_win_best_path_over_shorter_as_path`. Original eBGP-ignore gap fixed 2026-07-xx (`RFC_AUDIT.md` §5); widened to the RFC 5065 confederation exception 2026-08-04 (`feature/rfc5065-confederation-member-support`). |
 | Withdrawal sent to all peers when a best path is removed | `src/daemon.rs` | ✅ | `test_propagate_prefix_sends_withdraw_when_route_removed`, `test_on_terminated_propagates_withdraw_to_other_established_peers` |
+| Session loss (RFC 4271 §3.1, §8.2.2): routes with no remaining path are withdrawn and replacements advertised in both address families; IPv6 via `MP_UNREACH_NLRI` / `MP_REACH_NLRI`, only to peers that negotiated IPv6 unicast (RFC 4760 §8) | `src/daemon/peer.rs`, `src/daemon/gr.rs` | ✅ | Fixed 2026-11-25 (issue #160). `session_loss_withdraws_v6_from_every_peer`, `session_loss_advertises_the_v6_replacement`, `session_loss_sends_no_v6_update_to_a_v4_only_peer`, `remove_peer_withdraws_v6`; against buffered announcements and reflector exclusion, `session_loss_is_not_undone_by_a_buffered_v4_announcement` / `_v6_`, `session_loss_withdraws_v4_from_a_non_client_excluded_from_the_replacement` / `_v6_` |
 | eBGP split-horizon: route received from eBGP peer not re-advertised back to that peer | `src/daemon.rs` | ✅ | `test_propagate_prefix_ebgp_source_peer_not_readvertised` |
 | iBGP split-horizon: route received from iBGP peer not re-advertised to other iBGP peers | `src/daemon.rs` | ✅ | `test_propagate_prefix_ibgp_split_horizon_no_send`, `test_propagate_prefix_ibgp_split_horizon_eviction_sends_withdraw` |
 | NLRI batching: announcements with same path attributes packed into fewest UPDATEs within `max_len` | `src/outbound.rs` | ✅ | `test_flush_same_attrs_batched_into_one_message`, `test_flush_splits_when_exceeding_max_len`, `test_flush_withdrawal_split_delivers_all_nlris` |
@@ -538,7 +539,7 @@ carries it, and never advertising it.
 ## RFC 4456 — BGP Route Reflection
 
 **Owns:** Route Reflector configuration, inbound attribute processing (ORIGINATOR_ID,
-CLUSTER_LIST, loop detection), RR-aware iBGP split-horizon in the propagation loop, and
+CLUSTER_LIST, loop detection), RR-aware iBGP split-horizon in the outbound decision, and
 outbound inclusion of reflection attributes in UPDATE messages.  
 **Boundary:** ORIGINATOR_ID / CLUSTER_LIST wire codec lives in `pathvector-session`.
 Route struct fields for carrying the attributes live in `pathvector-rib`.  
@@ -565,6 +566,8 @@ Route struct fields for carrying the attributes live in `pathvector-rib`.
 | adj_ribs_out_v6 reflecting mode preserved after session reconnect | `src/daemon.rs` | ✅ | `test_rr_v6_adj_rib_out_reflecting_restored_after_reconnect` |
 | IPv6 split-horizon: non-client iBGP → non-client iBGP blocked in propagation | `src/daemon.rs` | ✅ | `test_rr_v6_split_horizon_blocks_non_client_to_non_client` |
 | IPv6 split-horizon: non-client iBGP → non-client iBGP blocked in full-table dump | `src/daemon.rs` | ✅ | `test_rr_v6_established_dump_applies_split_horizon` |
+| §6 non-client → non-client exclusion applied on **every** send path (incremental, table dump, session loss, GR stale marking / End-of-RIB prune / deadline expiry, export-policy change), IPv4 and IPv6, including while the source's session is down (routes retained for GR) and for peers on IPv6 transport (issue #168) | `src/outbound.rs` `excluded_by_reflection`, called from `propagate_prefix` / `propagate_prefix_v6` | ✅ | `src/daemon/rr_split_horizon_tests.rs` |
+| RFC 4271 §9.1.3: a destination the §6 rule excludes is sent a withdrawal for what it was previously advertised (a non-client's path replacing a client's as best) | `src/outbound.rs` | ✅ | `rr_split_horizon_tests::{update_taking_over_from_client_withdraws_v4_and_v6, session_loss_withdraws_when_non_client_takes_over_v4, gr_expiry_withdraws_when_non_client_takes_over_v4_and_v6, eor_prune_withdraws_when_non_client_takes_over_v4_and_v6}` |
 
 ---
 

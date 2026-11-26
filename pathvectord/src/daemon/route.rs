@@ -385,7 +385,7 @@ impl DaemonState {
         self.sync_received(peer_ip);
 
         // Propagate best-path changes for affected prefixes to all established
-        // peers (iBGP split-horizon is enforced by AdjRibOut).
+        // peers (`propagate_prefix` applies the split-horizon rules).
         self.propagate_to_all_peers(&affected);
         if !affected_v6.is_empty() {
             self.propagate_to_all_peers_v6(&affected_v6);
@@ -413,7 +413,6 @@ impl DaemonState {
         let local_as = self.rib.local_as;
         let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_bgp_id = self.rib.local_bgp_id;
-        let is_rr = !self.rib.rr_clients.is_empty();
         // RFC 4724 §4.1: while the IPv4 selection-deferral gate is closed,
         // incremental propagation is suppressed the same way the initial
         // dump is — nothing is written to AdjRibOut until the gate opens.
@@ -443,9 +442,7 @@ impl DaemonState {
                 continue;
             };
             let rr_clients = &self.rib.rr_clients;
-            let peer_types = &self.rib.peer_types;
             let loc_rib = &self.rib.loc_rib;
-            let dest_is_client = rr_clients.contains(&peer_ip);
             let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
             // RFC 4271 §9.2.1.1: MRAI is applied to eBGP peers only (option
             // (b) of the iBGP SHOULD), per destination. The gate wraps the
@@ -456,28 +453,12 @@ impl DaemonState {
             let decisions: Vec<PrefixDecision> = nlris
                 .iter()
                 .map(|&nlri| {
-                    // RR split-horizon (RFC 4456 §8): when acting as an RR,
-                    // block propagation between two non-client iBGP peers.
-                    // All other source/dest combinations are allowed; the
-                    // AdjRibOut `reflects` flag suppresses the regular iBGP
-                    // split-horizon so it does not re-block reflected routes.
-                    if is_rr
-                        && peer_type == PeerType::Internal
-                        && let Some(src) = loc_rib.best_peer(&nlri)
-                        && let IpAddr::V4(src_ip) = src.ip()
-                    {
-                        let src_is_client = rr_clients.contains(&IpAddr::V4(src_ip));
-                        let src_is_ibgp = peer_types.get(&IpAddr::V4(src_ip)).copied()
-                            == Some(PeerType::Internal);
-                        if src_is_ibgp && !src_is_client && !dest_is_client {
-                            return PrefixDecision::NoChange;
-                        }
-                    }
                     let propagate = |adj: &mut AdjRibOut<Ipv4Addr>| {
                         propagate_prefix(
                             nlri,
                             loc_rib,
                             adj,
+                            rr_clients,
                             export_policy,
                             peer_type,
                             local_as,
@@ -569,6 +550,32 @@ impl DaemonState {
         }
     }
 
+    /// IPv6 counterpart of [`emit_route_events`](Self::emit_route_events).
+    pub(super) fn emit_route_events_v6(&self, affected: &[Nlri<Ipv6Addr>]) {
+        for &nlri in affected {
+            let event = match self.rib.loc_rib_v6.best(&nlri) {
+                Some(route) => {
+                    let peer_id = self
+                        .rib
+                        .loc_rib_v6
+                        .best_peer(&nlri)
+                        .unwrap_or_else(|| PeerId::from(Ipv4Addr::UNSPECIFIED));
+                    proto::RouteEvent {
+                        r#type: proto::RouteEventType::Announced as i32,
+                        route: Some(grpc::route_v6_to_proto(peer_id, nlri, route)),
+                        withdrawn_prefix: None,
+                    }
+                }
+                None => proto::RouteEvent {
+                    r#type: proto::RouteEventType::Withdrawn as i32,
+                    route: None,
+                    withdrawn_prefix: Some(nlri.to_string()),
+                },
+            };
+            let _ = self.route_tx.send(event);
+        }
+    }
+
     pub(super) fn propagate_to_all_peers_v6(&mut self, nlris: &[Nlri<Ipv6Addr>]) {
         // Only send IPv6 UPDATEs to peers that negotiated the Multi-Protocol
         // capability for IPv6 unicast (RFC 4760).
@@ -579,7 +586,6 @@ impl DaemonState {
             .copied()
             .filter(|ip| self.ipv6_capable_peers.contains(ip))
             .collect();
-        let is_rr = !self.rib.rr_clients.is_empty();
         let local_as = self.rib.local_as;
         let public_as = self.rib.confederation_id.unwrap_or(local_as);
         let local_ipv6 = self.rib.local_ipv6;
@@ -600,9 +606,7 @@ impl DaemonState {
                 continue;
             };
             let rr_clients = &self.rib.rr_clients;
-            let peer_types = &self.rib.peer_types;
             let loc_rib_v6 = &self.rib.loc_rib_v6;
-            let dest_is_client = rr_clients.contains(&peer_ip);
             let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
             // RFC 4271 §9.2.1.1 is per destination, not per address family,
             // and RFC 4760 does not exempt MP_REACH_NLRI: same eBGP gate as
@@ -612,25 +616,12 @@ impl DaemonState {
             let decisions: Vec<PrefixDecisionV6> = nlris
                 .iter()
                 .map(|&nlri| {
-                    // RFC 4456 §8 split-horizon: block non-client iBGP →
-                    // non-client iBGP for IPv6 routes (same rule as IPv4).
-                    if is_rr
-                        && peer_type == PeerType::Internal
-                        && let Some(src) = loc_rib_v6.best_peer(&nlri)
-                        && let IpAddr::V4(src_ip) = src.ip()
-                    {
-                        let src_is_client = rr_clients.contains(&IpAddr::V4(src_ip));
-                        let src_is_ibgp = peer_types.get(&IpAddr::V4(src_ip)).copied()
-                            == Some(PeerType::Internal);
-                        if src_is_ibgp && !src_is_client && !dest_is_client {
-                            return PrefixDecisionV6::NoChange;
-                        }
-                    }
                     let propagate = |adj: &mut AdjRibOut<Ipv6Addr>| {
                         propagate_prefix_v6(
                             nlri,
                             loc_rib_v6,
                             adj,
+                            rr_clients,
                             export_policy_v6,
                             peer_type,
                             local_as,
