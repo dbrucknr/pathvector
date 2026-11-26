@@ -5,12 +5,11 @@
 //! "If the local system does not send any BGP messages within the period
 //! specified in `SendHoldTime`, then a NOTIFICATION message with the "Send Hold
 //! Timer Expired" Error Code MAY be sent and the BGP connection MUST be closed.
-//! Additionally, an error MUST be logged".
+//! Additionally, an error MUST be logged". The log is asserted in
+//! `send_hold_log.rs`.
 
 mod supervision_support;
 
-use std::io::Write;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -68,45 +67,6 @@ async fn peer_that_stops_reading_is_closed_after_the_default_send_hold_time() {
     // §4.3: closing must not wait for the NOTIFICATION to be written.
     assert!(!peer.connection_open(), "still open after expiry");
     assert!(peer.aborted(), "unwritten data was not discarded");
-}
-
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// §5: "an error MUST be logged in the local system, indicating the "Send Hold
-/// Timer Expired" Error Code."
-#[tokio::test(start_paused = true)]
-async fn send_hold_expiry_logs_an_error_naming_the_error_code() {
-    let log = Captured::default();
-    let writer = log.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(move || writer.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-
-    let (mut handle, peer) = established(config(90)).await;
-    peer.set_reading(false);
-    handle.update_sender().send(update(1)).await.unwrap();
-    expect_send_hold_expiry(talk_for(&mut handle, &peer, 600).await.as_ref());
-
-    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
-    let line = text
-        .lines()
-        .find(|l| l.contains("Send Hold Timer Expired"))
-        .expect("nothing logged");
-    assert!(line.contains("ERROR"), "{line}");
-    assert!(line.contains("error_code=8"), "{line}");
 }
 
 /// A healthy session sends its KEEPALIVEs, which restart the timer (§4.3).
