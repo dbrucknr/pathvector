@@ -74,8 +74,8 @@ impl DaemonState {
         let pt = config_peer_type(local_as, peer.remote_as, confed_member);
         let peer_id = PeerId::from(peer.address);
 
-        let is_rr = !self.rib.rr_clients.is_empty();
-        let (adj_out, adj_out_v6) = make_adj_ribs_out_pair(peer_id, pt, is_rr);
+        let (adj_out, adj_out_v6) =
+            make_adj_ribs_out_pair(peer_id, pt, self.rib.reflector_cluster_id());
 
         self.adj_ribs_in
             .insert(peer.address, AdjRibIn::new(peer_id));
@@ -338,8 +338,8 @@ impl DaemonState {
         };
         self.negotiated_max_len.insert(peer_ip, max_len);
 
-        let is_rr = !self.rib.rr_clients.is_empty();
-        let (new_aro, new_aro_v6) = make_adj_ribs_out_pair(peer_id, peer_type, is_rr);
+        let (new_aro, new_aro_v6) =
+            make_adj_ribs_out_pair(peer_id, peer_type, self.rib.reflector_cluster_id());
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
             *aro = new_aro;
         }
@@ -748,8 +748,8 @@ impl DaemonState {
             .get(&peer_ip)
             .copied()
             .unwrap_or(PeerType::External);
-        let is_rr = !self.rib.rr_clients.is_empty();
-        let (new_aro, new_aro_v6) = make_adj_ribs_out_pair(peer_id, cfg_pt, is_rr);
+        let (new_aro, new_aro_v6) =
+            make_adj_ribs_out_pair(peer_id, cfg_pt, self.rib.reflector_cluster_id());
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
             *aro = new_aro;
         }

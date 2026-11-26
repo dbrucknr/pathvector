@@ -411,10 +411,9 @@ fn assert_rr_attributes_discarded_from(peer_type: PeerType) {
 
 /// RFC 4456 §8: "When an RR reflects a route, it MUST prepend the local
 /// `CLUSTER_ID` to the `CLUSTER_LIST`", and the `ORIGINATOR_ID` "will be created
-/// by an RR in reflecting a route". The RR inserts both on ingress, and the
-/// IPv6 path used to drop them before storing the route — so a reflected
-/// IPv6 route left this RR without either attribute, defeating RFC 4456
-/// loop detection downstream. The other client must now receive both.
+/// by an RR in reflecting a route". A reflected IPv6 route once left this RR
+/// without either attribute, defeating RFC 4456 loop detection downstream.
+/// The other client must receive both.
 #[test]
 fn ipv6_route_reflected_to_another_client_carries_originator_id_and_cluster_list() {
     let cluster_id: u32 = 69;
