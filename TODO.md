@@ -2381,9 +2381,8 @@ What remains as optional future work:
 - Timer jitter (RFC 4271 §10 SHOULD): multiply the KeepaliveTimer and ConnectRetryTimer by a fresh random factor in 0.75–1.0 each time they are set (issue #102 audit)
 - `pathvectord` has no `send_hold_time` setting; sessions use the RFC 9687 default. RFC 9687 §6 allows a per-peer value, and `SendHoldTime::from_secs` already validates one
 - RFC 9687 has not been exercised against GoBGP, FRR or BIRD
-- The `SendHoldTimer` counts from the last write the socket accepted, so an idle session behind a closed window is only detected once the kernel send buffer fills. `TCP_NOTSENT_LOWAT` or `TCP_USER_TIMEOUT` would tighten this
+- The `SendHoldTimer` counts from the last message the socket accepted in full, so an idle session behind a closed window is only detected once the kernel send buffer fills. `TCP_NOTSENT_LOWAT` or `TCP_USER_TIMEOUT` would tighten this
 - `RemovePeer` without a shutdown message sends Cease "Administrative Shutdown". RFC 4486 §4 says a speaker de-configuring a peer SHOULD send "Peer De-configured"; RFC 9003 allows a shutdown message only with "Administrative Shutdown" or "Administrative Reset", so a configured message needs its own decision
-- `send_hold_expiry_logs_an_error_naming_the_error_code` fails under `cargo test` when the rest of `send_hold_timer.rs` runs in parallel ("nothing logged"); it passes alone, single-threaded and under nextest. Suspected: the thread-local subscriber against tracing's global callsite cache
 - Needs investigation: Hold Timer expiry is reported as `TerminationReason::Unclean`, so GR retention applies without the RFC 8538 N bit even though a NOTIFICATION was sent
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - RFC 9234 strict mode — reject a session at OPEN when only one side advertises the

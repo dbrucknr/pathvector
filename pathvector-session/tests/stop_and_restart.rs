@@ -184,6 +184,66 @@ async fn automatic_stop_reconnects() {
         .unwrap();
 }
 
+/// An operator or latching NOTIFICATION arriving while a reset's restart is
+/// pending cancels it.
+#[tokio::test]
+async fn notification_after_automatic_stop_cancels_the_restart() {
+    let (mut handle, listener, _reader, _writer) = established().await;
+    let cease = |subcode| NotificationMessage {
+        error: NotificationError::Cease(subcode),
+        data: vec![],
+    };
+    for command in [
+        SessionCommand::AutomaticStop(cease(CeaseError::OutOfResources)),
+        SessionCommand::Notification(cease(CeaseError::MaximumNumberOfPrefixesReached)),
+    ] {
+        handle.stop_sender().send(command).await.unwrap();
+    }
+    assert_terminated(&mut handle).await;
+    assert_no_redial(&listener).await;
+}
+
+/// The session may have reconnected on its own by the time the command to hold
+/// it down arrives, so it must stop from `OpenSent` too.
+#[tokio::test]
+async fn notification_before_established_stops_the_session() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let handle = spawn(SessionConfig {
+        local_as: 65001,
+        local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+        hold_time: 90,
+        capabilities: vec![Capability::FourByteAsn(65001)],
+        required_capabilities: vec![],
+        peer_as: Some(65002),
+        confederation_member: false,
+        public_as: 65001,
+        peer_addr: listener.local_addr().unwrap(),
+        tcp_md5: None,
+        connect_retry_time: CONNECT_RETRY,
+        send_hold_time: pathvector_session::fsm::SendHoldTime::default(),
+    });
+    handle.start().await;
+    let (stream, _) = listener.accept().await.unwrap();
+    let (r, _w) = stream.into_split();
+    let mut reader = FramedRead::new(r, BgpCodec::new());
+    assert!(matches!(recv(&mut reader).await, Some(BgpMessage::Open(_))));
+
+    let cease = NotificationMessage {
+        error: NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached),
+        data: vec![],
+    };
+    handle
+        .stop_sender()
+        .send(SessionCommand::Notification(cease.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        recv(&mut reader).await,
+        Some(BgpMessage::Notification(cease))
+    );
+    assert_no_redial(&listener).await;
+}
+
 /// The session is already in Idle with a retry pending when the stop arrives.
 #[tokio::test]
 async fn stop_while_a_retry_is_pending_cancels_it() {

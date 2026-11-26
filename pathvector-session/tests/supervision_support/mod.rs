@@ -17,8 +17,8 @@ use pathvector_session::message::{
     BgpMessage, Capability, OpenMessage, PathAttribute, UpdateMessage,
 };
 use pathvector_session::transport::{
-    BgpReader, BgpTransport, BgpWriter, DEFAULT_CONNECT_RETRY_TIME, SessionConfig, SessionEvent,
-    SessionHandle, SpawnedSessionHandle, spawn_with,
+    BgpReader, BgpTransport, BgpWriter, DEFAULT_CONNECT_RETRY_TIME, MessagesWritten, SessionConfig,
+    SessionEvent, SessionHandle, SpawnedSessionHandle, spawn_with,
 };
 use pathvector_types::{Nlri, Origin};
 
@@ -47,6 +47,8 @@ pub struct MockWriter {
     sent: mpsc::UnboundedSender<Sent>,
     consumed: Arc<AtomicUsize>,
     writable: watch::Receiver<bool>,
+    // Messages a peer that is not reading will still take, one at a time.
+    credits: Arc<AtomicUsize>,
     broken: Arc<AtomicBool>,
     aborted: Arc<AtomicBool>,
     _alive: Arc<()>,
@@ -58,6 +60,7 @@ pub struct MockPeer {
     sent: mpsc::UnboundedReceiver<Sent>,
     consumed: Arc<AtomicUsize>,
     writable: watch::Sender<bool>,
+    credits: Arc<AtomicUsize>,
     broken: Arc<AtomicBool>,
     aborted: Arc<AtomicBool>,
     alive: std::sync::Weak<()>,
@@ -69,6 +72,7 @@ pub fn mock() -> (MockTransport, MockPeer) {
     let (sent_tx, sent_rx) = mpsc::unbounded_channel();
     let (writable_tx, writable_rx) = watch::channel(true);
     let consumed = Arc::new(AtomicUsize::new(0));
+    let credits = Arc::new(AtomicUsize::new(0));
     let alive = Arc::new(());
     let broken = Arc::new(AtomicBool::new(false));
     let aborted = Arc::new(AtomicBool::new(false));
@@ -85,6 +89,7 @@ pub fn mock() -> (MockTransport, MockPeer) {
                 sent: sent_tx,
                 consumed: Arc::clone(&consumed),
                 writable: writable_rx,
+                credits: Arc::clone(&credits),
                 broken: Arc::clone(&broken),
                 aborted: Arc::clone(&aborted),
                 _alive: alive,
@@ -95,6 +100,7 @@ pub fn mock() -> (MockTransport, MockPeer) {
             sent: sent_rx,
             consumed,
             writable: writable_tx,
+            credits,
             broken,
             aborted,
             alive: weak,
@@ -133,20 +139,24 @@ impl BgpWriter for MockWriter {
         Ok(len)
     }
 
-    async fn flush(&mut self) -> io::Result<()> {
-        while !*self.writable.borrow_and_update() {
+    async fn flush(&mut self) -> io::Result<MessagesWritten> {
+        loop {
+            let reading = *self.writable.borrow_and_update();
+            let mut written = 0;
+            while if reading {
+                self.write_one()
+            } else {
+                self.take_credit()
+            } {
+                written += 1;
+            }
+            if written > 0 || self.queued.is_empty() {
+                return Ok(MessagesWritten(written));
+            }
             if self.writable.changed().await.is_err() {
                 return Err(io::ErrorKind::BrokenPipe.into());
             }
         }
-        while let Some(msg) = self.queued.pop_front() {
-            let _ = self.sent.send(Sent {
-                msg,
-                at: Instant::now(),
-                consumed: self.consumed.load(Ordering::SeqCst),
-            });
-        }
-        Ok(())
     }
 
     fn abort(&mut self) {
@@ -154,7 +164,42 @@ impl BgpWriter for MockWriter {
     }
 }
 
+impl MockWriter {
+    fn write_one(&mut self) -> bool {
+        let Some(msg) = self.queued.pop_front() else {
+            return false;
+        };
+        let _ = self.sent.send(Sent {
+            msg,
+            at: Instant::now(),
+            consumed: self.consumed.load(Ordering::SeqCst),
+        });
+        true
+    }
+
+    /// Write one message on a credit, if there is one of each.
+    fn take_credit(&mut self) -> bool {
+        if self.queued.is_empty() || self.credits.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        self.credits.fetch_sub(1, Ordering::SeqCst);
+        self.write_one()
+    }
+}
+
 impl MockPeer {
+    /// While not reading, take `messages` more queued messages, one at a time.
+    pub fn take(&self, messages: usize) {
+        self.take_quietly(messages);
+        self.writable.send_modify(|_| {});
+    }
+
+    /// [`Self::take`] without waking the writer, like a socket that has become
+    /// writable before the task was told. The next poll of the writer finds it.
+    pub fn take_quietly(&self, messages: usize) {
+        self.credits.fetch_add(messages, Ordering::SeqCst);
+    }
+
     pub fn push(&self, msg: BgpMessage) {
         if let Some(inbound) = &self.inbound {
             let _ = inbound.send(Ok(msg));

@@ -23,6 +23,7 @@ mod outbox;
 #[cfg(test)]
 mod prop_tests;
 mod schedule;
+mod sink;
 pub mod tcp_md5;
 
 use std::future::Future;
@@ -44,7 +45,7 @@ use crate::message::{
     NotificationMessage, OpenMessage, OpenMsgError, UpdateMessage,
 };
 
-pub use link::{BgpReader, BgpTransport, BgpWriter};
+pub use link::{BgpReader, BgpTransport, BgpWriter, MessagesWritten};
 use link::{FramedBgpTransport, Link, Outbound, ready_now};
 use outbox::Outbox;
 use schedule::{
@@ -284,15 +285,18 @@ pub enum SessionCommand {
     /// To reset a session that should come back, use [`Self::AutomaticStop`].
     Stop,
     /// Like `Stop`, with a caller-chosen NOTIFICATION (e.g. an RFC 9003
-    /// shutdown message). The session stays down until [`Self::Start`].
+    /// shutdown message, or CEASE/Maximum Number of Prefixes Reached). The
+    /// session stays down until [`Self::Start`], whatever state it was in. See
+    /// [`FsmInput::NotificationToSend`].
     Notification(crate::message::NotificationMessage),
     /// Reset an Established session on the caller's own authority: send the
     /// NOTIFICATION, drop the connection, and reconnect after
     /// [`SessionConfig::connect_retry_time`]. Ignored in other states.
     ///
-    /// For RFC 4271 §8.1.2 `AutomaticStop` conditions (such as a maximum
-    /// prefix limit) and UPDATE errors the caller detects (§8.2.2 Event 28).
-    /// See [`FsmInput::AutomaticStop`].
+    /// For RFC 4271 §8.1.2 `AutomaticStop` conditions that should be retried
+    /// and UPDATE errors the caller detects (§8.2.2 Event 28). To keep the
+    /// session down, as after a maximum-prefix limit, use
+    /// [`Self::Notification`]. See [`FsmInput::AutomaticStop`].
     AutomaticStop(crate::message::NotificationMessage),
     /// An inbound TCP connection from this peer was accepted by the daemon's
     /// BGP listener.  The session applies RFC 4271 §6.8 collision detection
@@ -732,7 +736,7 @@ impl<T: BgpTransport> Session<T> {
         let closing = self.closing.take();
         let flush = async {
             if let Some(mut link) = closing
-                && tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, link.out.flush())
+                && tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, link.out.drain())
                     .await
                     .is_err()
             {
@@ -805,7 +809,7 @@ impl<T: BgpTransport> Session<T> {
                     }
                 }
 
-                _ = flush_pending(closing) => {
+                _ = drain_pending(closing) => {
                     self.closing = None;
                     self.deadlines.cancel(Timer::CloseFlush);
                 }
@@ -974,12 +978,17 @@ impl<T: BgpTransport> Session<T> {
     /// RFC 9687 §4.3: "Each time the local system sends a BGP message, it
     /// restarts the `SendHoldTimer`". "Sent" means accepted by the transport:
     /// for TCP, written to the socket.
-    fn restart_send_hold_timer(&mut self) {
+    ///
+    /// Returns whether a message was sent since the last call. A write resolves
+    /// as each message finishes (see [`BgpWriter::flush`]), and every path from
+    /// one to here is synchronous, so "now" is when it was sent.
+    fn restart_send_hold_timer(&mut self) -> bool {
         let sent = self.link.as_mut().is_some_and(|l| l.out.take_sent());
         if sent && let Some(interval) = self.send_hold_interval {
             self.deadlines
                 .arm(Timer::SendHold, Instant::now() + interval);
         }
+        sent
     }
 
     /// Service one overdue timer.
@@ -987,11 +996,13 @@ impl<T: BgpTransport> Session<T> {
         match timer {
             Timer::SendHold => {
                 // The connection may have become writable since the last turn.
-                if let Some(link) = &mut self.link
-                    && link.out.is_flushing()
-                    && matches!(link.out.try_flush(), Some(Ok(())))
-                {
-                    self.restart_send_hold_timer();
+                // A message that goes out now restarts the timer, whether or
+                // not others are still waiting behind it. A write error is met
+                // again by the flush in `wait_for_input`.
+                if let Some(link) = &mut self.link {
+                    let _ = link.out.try_flush();
+                }
+                if self.restart_send_hold_timer() {
                     return None;
                 }
                 self.deadlines.cancel(Timer::SendHold);
@@ -1517,11 +1528,13 @@ impl<T: BgpTransport> Session<T> {
     /// send failed; the caller is responsible for feeding
     /// [`FsmInput::TcpFailed`] back to the FSM.
     ///
-    /// A failed send does not skip the actions after it: when they are a
-    /// teardown, the FSM has already left the state, and `SessionTerminated`
-    /// would otherwise never reach the consumer.
+    /// A failed send drops the connection but does not abandon the batch. The
+    /// FSM has already changed state, so the outputs that follow (timers,
+    /// `SessionTerminated`) will not be produced again: from `Idle` the
+    /// `TcpFailed` fed back is ignored. Later sends find no transport and are
+    /// skipped.
     fn execute(&mut self, outputs: Vec<FsmOutput>) -> bool {
-        let mut sent_all = true;
+        let mut all_sent = true;
         for output in outputs {
             match output {
                 FsmOutput::InitiateTcpConnect => {
@@ -1549,7 +1562,7 @@ impl<T: BgpTransport> Session<T> {
                     self.close_connection();
                 }
                 FsmOutput::SendMessage(msg) => {
-                    sent_all &= self.send_message(msg);
+                    all_sent &= self.send_message(msg);
                 }
                 FsmOutput::StartHoldTimer(d) => {
                     self.deadlines.arm(Timer::Hold, Instant::now() + d);
@@ -1619,7 +1632,7 @@ impl<T: BgpTransport> Session<T> {
                 }
             }
         }
-        sent_all
+        all_sent
     }
 
     /// Turns one decoded (or failed-to-decode) message from the primary
@@ -1818,11 +1831,20 @@ async fn recv_message<R: BgpReader>(
     }
 }
 
-/// Resolves when `out` has written everything queued, or never if there is
-/// nothing to write.
+/// Resolves when `out` has written at least one more message, or never if
+/// there is nothing to write.
 async fn flush_pending<W: BgpWriter>(out: Option<&mut Outbound<W>>) -> io::Result<()> {
     match out {
-        Some(o) if o.is_flushing() => o.flush().await,
+        Some(o) if o.is_flushing() => o.flush_some().await,
+        _ => std::future::pending().await,
+    }
+}
+
+/// Resolves when `out` has written everything queued, or never if there is
+/// nothing to write.
+async fn drain_pending<W: BgpWriter>(out: Option<&mut Outbound<W>>) -> io::Result<()> {
+    match out {
+        Some(o) if o.is_flushing() => o.drain().await,
         _ => std::future::pending().await,
     }
 }
@@ -1858,13 +1880,15 @@ mod tests {
 
     use super::{
         BgpReader, BgpTransport, BgpWriter, COLLISION_CANDIDATE_OPEN_TIMEOUT, ConnectionIdentity,
-        ConnectionOrigin, DEFAULT_CONNECT_RETRY_TIME, FramedBgpTransport, SessionCommand,
-        SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle, TerminationReason, spawn,
-        spawn_with, spawn_with_collision_timeout,
+        ConnectionOrigin, DEFAULT_CONNECT_RETRY_TIME, FramedBgpTransport, Link, MessagesWritten,
+        Session, SessionCommand, SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle,
+        TerminationReason, spawn, spawn_with, spawn_with_collision_timeout,
     };
     use crate::framing::FramingError;
     use pathvector_types::Nlri;
 
+    use super::schedule::Timer;
+    use crate::fsm::FsmInput;
     use crate::message::{
         AttributeDecodeError, AttributeErrorPolicy, BgpMessage, Capability, CeaseError, CodecError,
         MalformedUpdate, MsgHeaderError, NotificationError, NotificationMessage, OpenMessage,
@@ -1910,6 +1934,7 @@ mod tests {
     struct MockWriter {
         send_tx: mpsc::UnboundedSender<BgpMessage>,
         fail_send: Arc<AtomicBool>,
+        unreported: usize,
     }
 
     impl BgpTransport for MockTransport {
@@ -1922,6 +1947,7 @@ mod tests {
                 MockWriter {
                     send_tx: self.send_tx,
                     fail_send: self.fail_send,
+                    unreported: 0,
                 },
             )
         }
@@ -1942,11 +1968,84 @@ mod tests {
                 ));
             }
             let _ = self.send_tx.send(msg);
+            self.unreported += 1;
             Ok(1)
         }
 
-        async fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+        async fn flush(&mut self) -> io::Result<MessagesWritten> {
+            Ok(MessagesWritten(std::mem::take(&mut self.unreported)))
+        }
+    }
+
+    // ── A peer that takes one message at a time ──────────────────────────────
+
+    /// Takes `room` more messages, one per `flush`, then blocks.
+    #[derive(Default)]
+    struct Trickle {
+        queued: usize,
+        room: usize,
+    }
+
+    impl BgpWriter for Trickle {
+        fn queue(&mut self, _: BgpMessage) -> io::Result<usize> {
+            self.queued += 1;
+            Ok(1)
+        }
+
+        async fn flush(&mut self) -> io::Result<MessagesWritten> {
+            if self.queued == 0 {
+                return Ok(MessagesWritten(0));
+            }
+            if self.room == 0 {
+                std::future::pending::<()>().await;
+            }
+            self.queued -= 1;
+            self.room -= 1;
+            Ok(MessagesWritten(1))
+        }
+    }
+
+    struct TrickleTransport(Trickle);
+
+    impl BgpTransport for TrickleTransport {
+        type Reader = MockReader;
+        type Writer = Trickle;
+
+        fn into_split(self) -> (MockReader, Trickle) {
+            (MockReader(mpsc::unbounded_channel().1), self.0)
+        }
+    }
+
+    /// RFC 9687 §4.3 on the timer's own path: the deadline is due, and the
+    /// connection turns out to take one of the two waiting messages. That one
+    /// is sent, so it restarts the timer. When nothing can be sent, it expires.
+    #[tokio::test(start_paused = true)]
+    async fn due_send_hold_timer_is_restarted_by_one_message_of_several() {
+        let period = Duration::from_secs(480);
+        let (mut session, _handle) = Session::<TrickleTransport>::new(test_config());
+        let mut link = Link::new(TrickleTransport(Trickle { queued: 0, room: 1 }));
+        for _ in 0..2 {
+            link.out.queue(BgpMessage::Update(announcement())).unwrap();
+        }
+        session.link = Some(link);
+        session.send_hold_interval = Some(period);
+        let now = tokio::time::Instant::now();
+        session.deadlines.arm(Timer::SendHold, now);
+
+        assert!(session.on_timer(Timer::SendHold).is_none());
+        assert_eq!(session.deadlines.get(Timer::SendHold), Some(now + period));
+
+        assert!(matches!(
+            session.on_timer(Timer::SendHold),
+            Some(FsmInput::SendHoldTimerExpired)
+        ));
+    }
+
+    fn announcement() -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![Nlri::new(Ipv4Addr::new(192, 0, 2, 0), 24).expect("valid /24")],
         }
     }
 
@@ -1985,7 +2084,16 @@ mod tests {
     /// `spawn_with` and NOT yet called `start`.
     async fn drive_to_established(handle: &mut SpawnedSessionHandle, peer: &mut MockPeer) {
         handle.start().await;
+        complete_handshake(handle, peer, peer_open()).await;
+    }
 
+    /// The handshake half of `drive_to_established`, for a session that has
+    /// already been started.
+    async fn complete_handshake(
+        handle: &mut SpawnedSessionHandle,
+        peer: &mut MockPeer,
+        open: BgpMessage,
+    ) {
         let msg = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
             .await
             .expect("timed out waiting for OPEN from session")
@@ -1995,7 +2103,7 @@ mod tests {
             "expected OPEN from session, got {msg:?}"
         );
 
-        peer.recv_tx.send(Ok(peer_open())).unwrap();
+        peer.recv_tx.send(Ok(open)).unwrap();
 
         let msg = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
             .await
@@ -2219,6 +2327,180 @@ mod tests {
             matches!(event, SessionEvent::Terminated(_)),
             "expected Terminated after UPDATE write failure, got {event:?}"
         );
+    }
+
+    // ── Failed NOTIFICATION writes ──────────────────────────────────────────
+    //
+    // RFC 4271 §8.2.2 lists sending the NOTIFICATION as one action alongside
+    // deleting the routes, dropping the TCP connection and changing state to
+    // Idle; none of the others depends on the write succeeding.
+
+    /// A [`MockTransport`] that fails every NOTIFICATION write and nothing
+    /// else, so a keepalive cannot be what ends the session.
+    struct NotificationWriteFails(MockTransport);
+
+    struct NotificationWriterFails(MockWriter);
+
+    impl BgpTransport for NotificationWriteFails {
+        type Reader = MockReader;
+        type Writer = NotificationWriterFails;
+
+        fn into_split(self) -> (MockReader, NotificationWriterFails) {
+            let (reader, writer) = self.0.into_split();
+            (reader, NotificationWriterFails(writer))
+        }
+    }
+
+    impl BgpWriter for NotificationWriterFails {
+        fn queue(&mut self, msg: BgpMessage) -> io::Result<usize> {
+            if matches!(msg, BgpMessage::Notification(_)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "mock: send failed",
+                ));
+            }
+            self.0.queue(msg)
+        }
+
+        async fn flush(&mut self) -> io::Result<MessagesWritten> {
+            self.0.flush().await
+        }
+    }
+
+    const SHORT_RETRY: Duration = Duration::from_millis(200);
+
+    /// A session that dials a loopback listener and wraps each connection in a
+    /// fresh [`NotificationWriteFails`]. Every dial yields one `MockPeer`, which
+    /// is how a test sees whether the session reconnected.
+    async fn spawn_with_failing_notifications(
+        hold_time: u16,
+    ) -> (
+        SpawnedSessionHandle,
+        mpsc::UnboundedReceiver<MockPeer>,
+        TcpListener,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.hold_time = hold_time;
+        config.peer_addr = listener.local_addr().unwrap();
+        config.connect_retry_time = SHORT_RETRY;
+
+        let (peers_tx, peers_rx) = mpsc::unbounded_channel();
+        let (mut session, handle) = Session::<NotificationWriteFails>::new(config);
+        session.connect_factory = Some(Box::new(move |_stream| {
+            let (mock, peer) = MockTransport::pair();
+            let _ = peers_tx.send(peer);
+            NotificationWriteFails(mock)
+        }));
+        tokio::spawn(session.run());
+        (handle, peers_rx, listener)
+    }
+
+    async fn next_peer(peers: &mut mpsc::UnboundedReceiver<MockPeer>) -> MockPeer {
+        tokio::time::timeout(Duration::from_secs(2), peers.recv())
+            .await
+            .expect("timed out waiting for the session to dial")
+            .expect("session task ended")
+    }
+
+    async fn expect_terminated(
+        handle: &mut SpawnedSessionHandle,
+        within: Duration,
+    ) -> TerminationReason {
+        match tokio::time::timeout(within, handle.next_event()).await {
+            Ok(Some(SessionEvent::Terminated(reason))) => reason,
+            other => panic!("expected Terminated, got {other:?}"),
+        }
+    }
+
+    /// RFC 4271 §8.2.2 Established, Event 8 (`AutomaticStop`).
+    #[tokio::test]
+    async fn failed_notification_write_on_automatic_stop_still_terminates_and_reconnects() {
+        let (mut handle, mut peers, _listener) = spawn_with_failing_notifications(90).await;
+        handle.start().await;
+        let mut peer = next_peer(&mut peers).await;
+        complete_handshake(&mut handle, &mut peer, peer_open()).await;
+
+        handle
+            .stop_sender()
+            .send(SessionCommand::AutomaticStop(NotificationMessage {
+                error: NotificationError::Cease(CeaseError::OutOfResources),
+                data: vec![],
+            }))
+            .await
+            .unwrap();
+
+        let reason = expect_terminated(&mut handle, Duration::from_secs(1)).await;
+        assert!(
+            matches!(reason, TerminationReason::OperatorStop),
+            "{reason:?}"
+        );
+        next_peer(&mut peers).await;
+    }
+
+    /// RFC 4271 §8.2.2 Established, Event 10 (`HoldTimer_Expires`).
+    #[tokio::test]
+    async fn failed_notification_write_on_hold_expiry_still_terminates_and_reconnects() {
+        let (mut handle, mut peers, _listener) = spawn_with_failing_notifications(3).await;
+        handle.start().await;
+        let mut peer = next_peer(&mut peers).await;
+        complete_handshake(&mut handle, &mut peer, peer_open()).await;
+
+        // The peer says nothing more, so the 3 s hold timer expires.
+        let reason = expect_terminated(&mut handle, Duration::from_secs(5)).await;
+        assert!(matches!(reason, TerminationReason::Unclean), "{reason:?}");
+        next_peer(&mut peers).await;
+    }
+
+    /// RFC 4271 §8.2.2 Established, Event 2 (`ManualStop`), and the same stop
+    /// carrying a caller's NOTIFICATION: Idle, with no reconnect.
+    #[tokio::test]
+    async fn failed_notification_write_on_stop_still_terminates_and_stays_down() {
+        let max_prefix = SessionCommand::Notification(NotificationMessage {
+            error: NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached),
+            data: vec![],
+        });
+        for command in [SessionCommand::Stop, max_prefix] {
+            let (mut handle, mut peers, _listener) = spawn_with_failing_notifications(90).await;
+            handle.start().await;
+            let mut peer = next_peer(&mut peers).await;
+            complete_handshake(&mut handle, &mut peer, peer_open()).await;
+
+            handle.stop_sender().send(command).await.unwrap();
+
+            let reason = expect_terminated(&mut handle, Duration::from_secs(1)).await;
+            assert!(
+                matches!(reason, TerminationReason::OperatorStop),
+                "{reason:?}"
+            );
+            assert!(
+                tokio::time::timeout(SHORT_RETRY * 3, peers.recv())
+                    .await
+                    .is_err(),
+                "a stopped session dialled again"
+            );
+        }
+    }
+
+    /// RFC 4271 §8.2.2 `OpenSent`, Event 10. The session never reached
+    /// Established, so there is no `Terminated`, but the reconnect this
+    /// implementation schedules on hold expiry must survive the failed write.
+    #[tokio::test]
+    async fn failed_notification_write_in_open_sent_still_reconnects() {
+        let (handle, mut peers, _listener) = spawn_with_failing_notifications(90).await;
+        handle.start().await;
+        let mut peer = next_peer(&mut peers).await;
+        let sent = tokio::time::timeout(Duration::from_secs(1), peer.send_rx.recv())
+            .await
+            .expect("timed out waiting for OPEN");
+        assert!(matches!(sent, Some(BgpMessage::Open(_))), "{sent:?}");
+
+        // Skip the 4-minute OpenSent hold timer, then dial in real time.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(241)).await;
+        tokio::time::resume();
+
+        next_peer(&mut peers).await;
     }
 
     /// `stop_sender` returns a live `Sender` that can enqueue a `Stop` command.
@@ -2933,8 +3215,13 @@ mod tests {
         );
     }
 
-    /// `FramedBgpTransport::send` maps `FramingError::Io` to the underlying
-    /// `io::Error` when the TCP write half has been closed.
+    /// `FramedBgpTransport::send` returns the socket's own `io::Error` when the
+    /// write fails.
+    ///
+    /// The failure is induced by shutting down our own write half, which takes
+    /// effect before `shutdown` returns. Closing the peer instead would not:
+    /// writes keep succeeding until the peer's reset arrives, and no number of
+    /// `yield_now` calls guarantees that it has.
     #[tokio::test]
     async fn test_framed_transport_send_io_error_is_forwarded() {
         use tokio::net::TcpListener;
@@ -2944,26 +3231,20 @@ mod tests {
         let (client_stream, server_accept) =
             tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
         let client_stream = client_stream.unwrap();
-        let (server_stream, _addr) = server_accept.unwrap();
-
-        // Close the server side so that writing to the client eventually fails.
-        drop(server_stream);
+        // Kept open, so the local shutdown is the only thing that can fail the write.
+        let (_server_stream, _addr) = server_accept.unwrap();
 
         let mut transport = FramedBgpTransport::from_stream(client_stream);
+        transport.shutdown_write().await.unwrap();
 
-        // Keep sending until we get an io::Error (a closed peer may buffer briefly).
-        let mut result = Ok(());
-        for _ in 0..20 {
-            result = transport.send(BgpMessage::Keepalive).await;
-            if result.is_err() {
-                break;
-            }
-            // Real time for the peer's reset to arrive.
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let err = transport
+            .send(BgpMessage::Keepalive)
+            .await
+            .expect_err("send on a shut-down write half must fail");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
         assert!(
-            result.is_err(),
-            "expected FramedBgpTransport::send to fail after peer closed"
+            err.raw_os_error().is_some(),
+            "expected the OS error itself, got {err:?}"
         );
     }
 
@@ -3601,6 +3882,11 @@ mod tests {
     /// the daemon just removed. Pre-fix, this candidate would have survived
     /// (only `ManualStop` was covered) and been adopted once its OPEN
     /// arrived, since `Idle` alone said "nothing left to protect."
+    ///
+    /// The candidate never sends anything here. Writing to it after the
+    /// teardown would draw a TCP reset (RFC 9293 §3.6.1, SHLD-3) that races
+    /// the read of the session's FIN, making the result `None` or
+    /// `ConnectionReset` by chance.
     #[tokio::test]
     async fn test_collision_candidate_pending_closed_on_notification_to_send() {
         let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2);
@@ -3615,17 +3901,14 @@ mod tests {
         establish_with_gr(peer_bgp_id, &mut existing_peer, &mut handle).await;
 
         // A GR-purpose candidate is staged, but held back before it ever
-        // sends its OPEN.
+        // sends its OPEN. It shares a channel with the teardown below, so
+        // the session is certain to stage it first.
         let (incoming, mut candidate_peer) = candidate_pair().await;
         handle
             .incoming_sender()
             .send(SessionCommand::IncomingConnection(incoming))
             .await
             .unwrap();
-
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
 
         // The daemon issues a locally initiated administrative teardown
         // (e.g. RFC 9003 peer removal) while the candidate is still
@@ -3672,22 +3955,9 @@ mod tests {
              got {terminated_event:?}"
         );
 
-        // Only now does the candidate send its OPEN — same BGP Identifier
-        // and GR, exactly what a genuine GR reconnect would look like. If
-        // the bug were still present, this would be adopted and recreate
-        // the session the daemon just deliberately tore down.
-        let mut candidate_open = peer_open();
-        if let BgpMessage::Open(ref mut o) = candidate_open {
-            o.bgp_id = peer_bgp_id;
-            o.capabilities.push(Capability::GracefulRestart {
-                restart_flags: 0,
-                restart_time: 120,
-                families: vec![],
-            });
-        }
-        candidate_peer.send(candidate_open).await.unwrap();
-
-        // The candidate must be closed outright — not adopted.
+        // The teardown alone must close the candidate: left staged, it would
+        // stay open for `COLLISION_CANDIDATE_OPEN_TIMEOUT` waiting to send
+        // its OPEN, and be adopted when it did.
         let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
             .await
             .expect("timed out waiting for the pending candidate to close");
