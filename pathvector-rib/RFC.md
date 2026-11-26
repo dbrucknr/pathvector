@@ -9,6 +9,27 @@ wire protocol knowledge and no network I/O.
 
 ---
 
+## RFC 4271 §4.3 / RFC 4760 §5 — Prefix identity in the RIBs
+
+**Owns:** Which NLRI values name the same destination, for every RIB lookup, replacement
+and withdrawal.  
+**Boundary:** The wire decoders in `pathvector-session` already zero the padding bits;
+this requirement covers every other way an `Nlri` can be built (embedded callers, the
+management API).  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc4271#section-4.3
+
+RFC 4271 §4.3 says of the bits that pad a prefix to an octet boundary that "the value of
+[the] trailing bits is irrelevant" (Withdrawn Routes and NLRI alike), and RFC 4760 §5
+repeats it for `MP_REACH_NLRI`/`MP_UNREACH_NLRI`. RFC 7606 and RFC 7911 do not change
+that sentence (RFC 7911 adds a Path Identifier, which this project does not implement).
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| Any spelling of a prefix names one entry in `LocRib`, `AdjRibIn`, `AdjRibOut` (insert, replace, lookup, withdraw, split-horizon eviction, peer teardown), IPv4 and IPv6 | `src/canonical.rs` | ✅ | `tests/canonical_prefix.rs`; `canonical::tests` (every length of both families) |
+| Hash-keyed views (`len`, `best`, `candidates`) agree with prefix-tree views (`best_routes`, `longest_match`) after any operation sequence | `src/loc_rib.rs`, `src/best_table.rs` | ✅ | proptests: `prop_loc_rib_hash_and_tree_views_agree_v4` / `_v6`, `prop_adj_ribs_key_on_the_destination_v4` / `_v6` |
+
+---
+
 ## RFC 4271 §9.1 — Decision Process (Best-Path Selection)
 
 **Owns:** All 10 steps of the BGP decision process applied to competing routes in Loc-RIB.  

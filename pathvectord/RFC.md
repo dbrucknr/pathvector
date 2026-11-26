@@ -172,11 +172,16 @@ of UPDATE messages lives in `pathvector-session`.
 | iBGP peers pass-through: LOCAL_PREF preserved, AS_PATH unchanged, NEXT_HOP unchanged | `src/outbound.rs` | ✅ | `test_prepare_outbound_ibgp_preserves_attributes` |
 | LOCAL_PREF received from an eBGP peer MUST be ignored by the receiving speaker, except confederation Member-AS peers (RFC 4271 §5.1.5, RFC 5065 §5.2) | `src/daemon/route.rs` | ✅ | `test_local_pref_ignored_from_ebgp_peer`, `test_local_pref_honored_from_ibgp_peer`, `test_local_pref_honored_from_confed_member_peer`, `test_ebgp_local_pref_cannot_win_best_path_over_shorter_as_path`. Original eBGP-ignore gap fixed 2026-07-xx (`RFC_AUDIT.md` §5); widened to the RFC 5065 confederation exception 2026-08-04 (`feature/rfc5065-confederation-member-support`). |
 | Withdrawal sent to all peers when a best path is removed | `src/daemon.rs` | ✅ | `test_propagate_prefix_sends_withdraw_when_route_removed`, `test_on_terminated_propagates_withdraw_to_other_established_peers` |
+| Session loss (RFC 4271 §3.1, §8.2.2): routes with no remaining path are withdrawn and replacements advertised in both address families; IPv6 via `MP_UNREACH_NLRI` / `MP_REACH_NLRI`, only to peers that negotiated IPv6 unicast (RFC 4760 §8) | `src/daemon/peer.rs`, `src/daemon/gr.rs` | ✅ | Fixed 2026-11-25 (issue #160). `session_loss_withdraws_v6_from_every_peer`, `session_loss_advertises_the_v6_replacement`, `session_loss_sends_no_v6_update_to_a_v4_only_peer`, `remove_peer_withdraws_v6`; against buffered announcements and reflector exclusion, `session_loss_is_not_undone_by_a_buffered_v4_announcement` / `_v6_`, `session_loss_withdraws_v4_from_a_non_client_excluded_from_the_replacement` / `_v6_` |
 | eBGP split-horizon: route received from eBGP peer not re-advertised back to that peer | `src/daemon.rs` | ✅ | `test_propagate_prefix_ebgp_source_peer_not_readvertised` |
 | iBGP split-horizon: route received from iBGP peer not re-advertised to other iBGP peers | `src/daemon.rs` | ✅ | `test_propagate_prefix_ibgp_split_horizon_no_send`, `test_propagate_prefix_ibgp_split_horizon_eviction_sends_withdraw` |
 | NLRI batching: announcements with same path attributes packed into fewest UPDATEs within `max_len` | `src/outbound.rs` | ✅ | `test_flush_same_attrs_batched_into_one_message`, `test_flush_splits_when_exceeding_max_len`, `test_flush_withdrawal_split_delivers_all_nlris` |
 | Announcement groups with distinct path attributes go into separate UPDATEs | `src/outbound.rs` | ✅ | `test_flush_different_attrs_two_messages` |
 | Withdrawals sent before announcements; withdrawal list packed within `max_len` | `src/outbound.rs` | ✅ | `test_flush_withdrawals_before_announces`, `test_flush_withdrawal_split_delivers_all_nlris` |
+| Applying the UPDATEs in the order sent yields the Adj-RIB-Out (§3.1 withdrawal and replacement, §9.2): a batch sends only the last announce/withdraw per NLRI, and every route-carrying send drains the peer's coalescing buffer, so nothing overtakes an older decision (issue #159) | `src/outbound.rs` `retain_last_per_nlri`, `src/daemon/route.rs` `flush_peer` | ✅ | `src/daemon/outbound_order_tests.rs`: `event_loop_announce_then_withdraw`, `event_loop_announce_then_session_loss`, `replaced_announcement_sharing_a_group_leaves_the_replacement`, `sent_updates_always_match_adj_rib_out` (property) |
+| RFC 4760 §3: one `MP_REACH_NLRI` carries only prefixes that share its next hop | `src/outbound.rs` `flush_updates_v6` | ✅ | `v6_prefixes_with_different_next_hops_keep_their_own` |
+| No IPv6 announcement exceeds the negotiated maximum (RFC 4271 §4.1; 4096, or 65535 toward an RFC 8654 §4 peer): each `MP_REACH_NLRI` group is split, repeating attributes and next hop, and measured at the session's AS number width (issue #178) | `src/outbound.rs` `flush_updates_v6` | ✅ | `outbound::v6_size_tests`, `coalesced_ipv6_announcements_stay_within_max_len` |
+| An IPv6 route too large for one UPDATE is not advertised (§9.2) and its prefix is withdrawn (RFC 8654 §4). IPv4 does not do this yet. RFC 8654 §4's SHOULD, discarding attributes to make it fit, is not implemented, and Adj-RIB-Out still lists the route | `src/outbound.rs` `flush_updates_v6` | ⚠️ | `route_too_large_for_one_message_is_not_advertised_but_withdrawn`, `size_is_measured_at_the_peers_as_number_width` |
 | Unrecognized transitive optional attributes stored on ingest (Optional+Transitive flags only; non-transitive quietly dropped) and forwarded unconditionally on egress regardless of peer type, with the Partial bit set (RFC 4271 §5) | `src/daemon/route.rs`, `src/outbound.rs` | ✅ | Fixed 2026-08-03 (`feature/rfc4271-unrecognized-transitive-attribute-storage`). See `RFC_AUDIT.md` §5 and `pathvector-rib/RFC.md`'s own section for the storage half. `test_handle_update_stores_unrecognized_transitive_attribute`, `test_handle_update_quietly_ignores_unrecognized_non_transitive_attribute`, `unrecognized_transitive_attribute_is_forwarded_with_optional_transitive_flags` |
 | e2e (2026-08-05, Codex review of PR #49): the complete decode → daemon storage → RIB → outbound-reconstruction → encode pipeline through a real two-hop relay, not just decode-level and daemon-storage-level unit tests — asserting the exact re-encoded flags octet, which a GoBGP CLI's rendered RIB text cannot express | `pathvector-e2e/src/bin/mock_bgp_attr_peer.rs`, `pathvector-e2e/tests/unknown_transitive_attribute.rs` | ✅ | `unknown_transitive_attribute_relayed_with_partial_bit_set` (a `source` mock injects an unrecognized Optional+Transitive attribute, Partial bit clear, plus an unrecognized Optional-only non-transitive negative control; an `observer` mock decodes pathvectord's re-advertised UPDATE with the real wire codec and confirms the transitive attribute survives with its value unchanged and Partial bit now set, while the non-transitive one is absent entirely) |
 
@@ -534,7 +539,7 @@ carries it, and never advertising it.
 ## RFC 4456 — BGP Route Reflection
 
 **Owns:** Route Reflector configuration, inbound loop detection (ORIGINATOR_ID,
-CLUSTER_LIST), RR-aware iBGP split-horizon in the propagation loop, and adding the
+CLUSTER_LIST), RR-aware iBGP split-horizon in the outbound decision, and adding the
 reflection attributes to routes as they are reflected.  
 **Boundary:** ORIGINATOR_ID / CLUSTER_LIST wire codec lives in `pathvector-session`.
 Route struct fields for carrying the attributes live in `pathvector-rib`.  
@@ -562,6 +567,8 @@ Route struct fields for carrying the attributes live in `pathvector-rib`.
 | adj_ribs_out_v6 reflecting mode preserved after session reconnect | `src/daemon.rs` | ✅ | `test_rr_v6_adj_rib_out_reflecting_restored_after_reconnect` |
 | IPv6 split-horizon: non-client iBGP → non-client iBGP blocked in propagation | `src/daemon.rs` | ✅ | `test_rr_v6_split_horizon_blocks_non_client_to_non_client` |
 | IPv6 split-horizon: non-client iBGP → non-client iBGP blocked in full-table dump | `src/daemon.rs` | ✅ | `test_rr_v6_established_dump_applies_split_horizon` |
+| §6 non-client → non-client exclusion applied on **every** send path (incremental, table dump, session loss, GR stale marking / End-of-RIB prune / deadline expiry, export-policy change), IPv4 and IPv6, including while the source's session is down (routes retained for GR) and for peers on IPv6 transport (issue #168) | `src/outbound.rs` `excluded_by_reflection`, called from `propagate_prefix` / `propagate_prefix_v6` | ✅ | `src/daemon/rr_split_horizon_tests.rs` |
+| RFC 4271 §9.1.3: a destination the §6 rule excludes is sent a withdrawal for what it was previously advertised (a non-client's path replacing a client's as best) | `src/outbound.rs` | ✅ | `rr_split_horizon_tests::{update_taking_over_from_client_withdraws_v4_and_v6, session_loss_withdraws_when_non_client_takes_over_v4, gr_expiry_withdraws_when_non_client_takes_over_v4_and_v6, eor_prune_withdraws_when_non_client_takes_over_v4_and_v6}` |
 
 ---
 
@@ -600,8 +607,10 @@ to the `pathvector-session` transport layer via `SessionHandle`.
 ## RFC 4486 §4 — Maximum Number of Prefixes (Daemon Integration)
 
 **Owns:** Per-AFI Adj-RIB-In size checking after each UPDATE; sending
-`CEASE/MaximumNumberOfPrefixesReached`; enforcing an idle-hold period before the peer
-may reconnect.  
+`CEASE/MaximumNumberOfPrefixesReached`; keeping the session down afterwards, or starting it
+again after `max_prefixes_restart` seconds. RFC 4271 §6.7 and RFC 4486 §4 require only the
+Cease: whether and when to start again is local policy (RFC 4271 §8.1.1
+`AllowAutomaticStart`, `IdleHoldTimer`).  
 **Boundary:** The `CeaseError::MaximumNumberOfPrefixesReached` subcode constant and NOTIFICATION
 wire encoding live in `pathvector-session`.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc4486#section-4
@@ -615,9 +624,13 @@ wire encoding live in `pathvector-session`.
 | No CEASE when count is at or below limit | `src/daemon/route.rs` | ✅ | `no_cease_at_exact_limit`, `no_cease_when_under_limit` |
 | Send `CEASE/MaximumNumberOfPrefixesReached` when limit exceeded | `src/daemon/route.rs` | ✅ | `cease_when_limit_exceeded` |
 | Set idle-hold deadline when `max_prefixes_restart > 0` | `src/daemon/route.rs` | ✅ | `idle_hold_inserted_when_restart_configured` |
-| No idle-hold when `max_prefixes_restart` is absent or zero | `src/daemon/route.rs` | ✅ | `no_idle_hold_without_restart` |
-| Block `SessionEvent::Established` during idle-hold; send Stop | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect` |
-| Block reconnect during idle-hold via coalesced drain loop | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect_in_drain_loop`, `idle_hold_reconnect_is_stopped_when_batch_ends_in_notification` |
+| Absent or zero `max_prefixes_restart`: no idle-hold; the peer is latched down | `src/daemon/route.rs` | ✅ | `no_idle_hold_without_restart` |
+| A latched session neither redials nor accepts a connection (RFC 4271 §8.2.2 Idle) | `src/daemon/mod.rs` | ✅ | `max_prefix_without_restart_time_stays_down`, `max_prefix_with_zero_restart_time_stays_down` |
+| Another reset queued for the same peer does not undo the latch | `src/daemon/mod.rs` | ✅ | `stalled_reset_does_not_undo_the_latch_first_event_path`, `stalled_reset_does_not_undo_the_latch_drain_loop_path` |
+| Removing the peer completes while it is held down, so it can be added again | `src/daemon/peer.rs` | ✅ | `removing_and_adding_the_peer_clears_the_latch`, `removing_a_peer_cancels_its_pending_restart` |
+| Positive N: session started N seconds after the CEASE, independently of `connect_retry_time` (RFC 4271 §8.1.3 `IdleHoldTimer_Expires`) | `src/daemon/mod.rs` | ✅ | `max_prefix_restart_shorter_than_connect_retry`, `max_prefix_restart_longer_than_connect_retry` |
+| Do not register a session that reaches Established while held down; stop it with CEASE/Connection Rejected | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect` |
+| Same via the coalesced drain loop | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_blocks_reconnect_in_drain_loop`, `idle_hold_reconnect_is_stopped_when_batch_ends_in_notification` |
 | Ignore UPDATEs from a session refused during idle-hold, or otherwise unregistered (RFC 4271 §9) | `src/daemon/route.rs` | ✅ | `update_behind_rejected_established_is_ignored`, `coalesced_update_behind_rejected_established_is_ignored`, `update_from_rejected_session_does_not_rearm_idle_hold`, `update_from_unregistered_session_is_ignored` |
 | Clear idle-hold deadline when timer expires (event loop) | `src/daemon/mod.rs` | ✅ | `event_loop_idle_hold_timer_clears_expired_deadline` |
 | `add_peer` populates `peer_max_prefixes_v4/v6` + `peer_max_prefixes_restart` | `src/daemon/peer.rs` | ✅ | `add_peer_populates_max_prefix_maps` |
@@ -625,11 +638,16 @@ wire encoding live in `pathvector-session`.
 | No limit enforced when `max_prefixes_v4`/`v6` is not configured | `src/daemon/route.rs` | ✅ | `no_limit_when_unconfigured` |
 | LocRib reverts correctly when over-limit peer displaces an existing best path | `src/daemon/mod.rs` | ✅ | `displaced_best_path_reverts_after_termination` |
 
+**Clearing a latched peer** (no `max_prefixes_restart`): restart the daemon, which reads the
+peer's limits from the config again, or `RemovePeer` then `AddPeer`. A peer re-added that way has
+only the settings `AddPeer` carries, which do not include a prefix limit, until the daemon
+restarts. `AddPeer` on its own and `SoftReset` do not clear it. The latch is held in memory only.
+
 **Deferred:**
-- RFC 4486 §4 does not specify behaviour when the peer reconnects after the idle-hold
-  expires and immediately re-floods the same table. pathvectord will CEASE again —
-  this is correct but can produce rapid reconnect loops. Operators should size
-  `max_prefixes_restart` to allow time for the peer's operator to intervene.
+- No operator action restarts a latched peer while keeping its limits, short of restarting the
+  daemon.
+- A peer that floods the same table after each restart is reset again every
+  `max_prefixes_restart` seconds; there is no upper bound on the number of retries.
 
 ---
 

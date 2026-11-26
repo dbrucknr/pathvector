@@ -172,6 +172,7 @@ impl DaemonState {
         self.peer_max_prefixes_v6.remove(&peer_ip);
         self.peer_max_prefixes_restart.remove(&peer_ip);
         self.max_prefix_idle.remove(&peer_ip);
+        self.max_prefix_latched.remove(&peer_ip);
         let rib = Arc::make_mut(&mut self.rib);
         rib.peer_remote_as.remove(&peer_ip);
         rib.peer_types.remove(&peer_ip);
@@ -223,12 +224,18 @@ impl DaemonState {
         self.rib_mut().prefixes_advertised.insert(peer_ip, v4 + v6);
     }
 
+    /// Whether a max-prefix CEASE is keeping this peer's session down, either
+    /// until its restart time or until an operator acts.
+    pub(super) fn is_max_prefix_held(&self, peer_ip: IpAddr) -> bool {
+        self.max_prefix_idle.contains_key(&peer_ip) || self.max_prefix_latched.contains(&peer_ip)
+    }
+
     /// Drains and returns the list of peers whose outbound UPDATE channel
     /// overflowed during the most recent event.
     ///
-    /// The event loop calls this after each event and sends
-    /// [`SessionCommand::Stop`] to each returned peer so the session can
-    /// re-establish and perform a fresh full-table dump.
+    /// The event loop calls this after each event and resets each returned
+    /// peer's session ([`SessionCommand::AutomaticStop`]) so it re-establishes
+    /// and performs a fresh full-table dump.
     pub(super) fn take_stalled_peers(&mut self) -> Vec<IpAddr> {
         std::mem::take(&mut self.stalled_peers)
     }
@@ -565,6 +572,7 @@ impl DaemonState {
         );
         self.program_fib_v6(effects);
         self.repropagate_peer_prefixes_v6(peer_ip, &nlris);
+        self.emit_route_events_v6(&nlris);
     }
 
     ///
@@ -712,8 +720,8 @@ impl DaemonState {
             ari.clear();
         }
 
-        // Snapshot affected prefixes before withdrawal so we can propagate the
-        // changes to other established peers below.
+        // Snapshot affected IPv4 prefixes before withdrawal so we can propagate
+        // the changes to other established peers below.
         let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
 
@@ -728,6 +736,9 @@ impl DaemonState {
             best: self.rib_withdraw_peer_v6(&peer_id),
             blackhole: self.blackholes.v6.release_peer(peer_id),
         };
+        // IPv6 prefixes whose best path this teardown removed or replaced.
+        let mut changed_v6 = changed_nlris(&fx_v6.best);
+        changed_v6.sort_unstable();
         self.program_fib_v4(fx_v4);
         self.program_fib_v6(fx_v6);
 
@@ -749,6 +760,10 @@ impl DaemonState {
         // Tell all other established peers about the best-path changes caused
         // by this teardown.
         //
+        // RFC 4271 §3.1 / §8.2.2 delete the lost peer's routes; §9.2 requires
+        // the newly unfeasible and newly installed ones to be advertised. That
+        // holds per address family: IPv4 below, IPv6 after it.
+        //
         // WARNING: this loop runs synchronously while holding the DaemonState
         // write lock.  For a peer with a large route table the loop can stall
         // BGP event processing (including KEEPALIVE handling) for tens of
@@ -767,7 +782,7 @@ impl DaemonState {
         let local_bgp_id = self.rib.local_bgp_id;
         let v4_deferred = self.selection_deferral.v4_deferred();
         let propagation_start = std::time::Instant::now();
-        let prefix_count = prev_prefixes.len();
+        let prefix_count = prev_prefixes.len() + changed_v6.len();
         for other_ip in other_peers {
             let other_type = self
                 .rib
@@ -775,11 +790,6 @@ impl DaemonState {
                 .get(&other_ip)
                 .copied()
                 .unwrap_or(PeerType::External);
-            let max_len = self
-                .negotiated_max_len
-                .get(&other_ip)
-                .copied()
-                .unwrap_or(MAX_LEN);
             let Some(export_policy) = self.export_policies.get(&other_ip) else {
                 tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation on Terminated");
                 continue;
@@ -788,10 +798,10 @@ impl DaemonState {
                 tracing::error!(peer = %other_ip, "adj_ribs_out missing peer — skipping propagation on Terminated");
                 continue;
             };
-            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+            if !self.update_senders.contains_key(&other_ip) {
                 tracing::error!(peer = %other_ip, "update_senders missing peer — skipping propagation on Terminated");
                 continue;
-            };
+            }
 
             let decisions: Vec<PrefixDecision> = prev_prefixes
                 .iter()
@@ -810,6 +820,7 @@ impl DaemonState {
                         nlri,
                         &self.rib.loc_rib,
                         adj_rib_out,
+                        &self.rib.rr_clients,
                         export_policy,
                         other_type,
                         local_as,
@@ -820,19 +831,10 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            let other_four_byte = self.four_byte_peers.contains(&other_ip);
-            if !flush_updates(
-                other_ip,
-                decisions,
-                max_len,
-                update_tx,
-                other_type,
-                other_four_byte,
-            ) {
-                self.stalled_peers.push(other_ip);
-            }
+            self.send_decisions(other_ip, decisions);
             self.sync_advertised(other_ip);
         }
+        self.repropagate_peer_prefixes_v6(peer_ip, &changed_v6);
 
         let elapsed = propagation_start.elapsed();
         if elapsed.as_millis() > 100 {
@@ -850,6 +852,7 @@ impl DaemonState {
         // (or Announced if another peer's route was promoted). Without this,
         // the dashboard shows stale routes after a peer disconnects.
         self.emit_route_events(&prev_prefixes);
+        self.emit_route_events_v6(&changed_v6);
 
         if notify {
             let _ = self.peer_tx.send(proto::PeerEvent {
@@ -993,13 +996,18 @@ pub(super) async fn run_command_processor<H, F, P>(
             DaemonCommand::RemovePeer(peer_ip) => {
                 // Mark for removal so the Terminated handler in the event loop
                 // performs a full state purge instead of a reconnect reset.
-                let existed = {
+                // `held_down`: max-prefix stopped the session and its
+                // teardown has been processed, so no further `Terminated` is
+                // coming from it.
+                let (existed, held_down) = {
                     let mut s = state.write().await;
                     if s.adj_ribs_in.contains_key(&peer_ip) {
                         s.pending_removal.insert(peer_ip);
-                        true
+                        let held_down = s.is_max_prefix_held(peer_ip)
+                            && !s.rib.peer_types.contains_key(&peer_ip);
+                        (true, held_down)
                     } else {
-                        false
+                        (false, false)
                     }
                 };
 
@@ -1031,6 +1039,16 @@ pub(super) async fn run_command_processor<H, F, P>(
                         let _ = tx.send(cmd).await;
                     } else {
                         let _ = tx.send(SessionCommand::Stop).await;
+                    }
+                    if held_down {
+                        // The session is already stopped, so it will not report
+                        // another teardown: complete the removal here.
+                        let _ = event_tx
+                            .send((
+                                peer_ip,
+                                SessionEvent::Terminated(TerminationReason::OperatorStop),
+                            ))
+                            .await;
                     }
                 } else {
                     // No live session actor (peer is idle / between reconnects and the

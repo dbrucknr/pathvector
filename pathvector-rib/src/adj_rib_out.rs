@@ -5,7 +5,7 @@ use ahash::AHashMap;
 use ipnetx::interfaces::IpAddress;
 use pathvector_types::{Nlri, PeerType};
 
-use crate::{peer::PeerId, route::Route};
+use crate::{canonical::CanonicalNlri, peer::PeerId, route::Route};
 
 /// Outcome of [`AdjRibOut::insert`].
 ///
@@ -38,6 +38,12 @@ pub enum InsertOutcome<A: IpAddress> {
 /// to compute route change messages: compare the new best route against what
 /// is already in `AdjRibOut` — if it changed, send an UPDATE; if it was
 /// removed, send a WITHDRAW.
+///
+/// # Prefix identity
+///
+/// Bits beyond the prefix length are irrelevant (RFC 4271 §4.3, RFC 4760 §5):
+/// every method accepts any spelling of an NLRI, and stored routes and keys are
+/// canonical, with those bits zero.
 ///
 /// # iBGP split horizon
 ///
@@ -77,7 +83,7 @@ pub struct AdjRibOut<A: IpAddress> {
     /// [`insert`](AdjRibOut::insert) is bypassed: the caller has already
     /// enforced the correct split-horizon at the propagation level.
     cluster_id: Option<u32>,
-    routes: AHashMap<Nlri<A>, Route<A>>,
+    routes: AHashMap<CanonicalNlri<A>, Route<A>>,
 }
 
 impl<A: IpAddress> AdjRibOut<A> {
@@ -147,21 +153,24 @@ impl<A: IpAddress> AdjRibOut<A> {
     /// Returns [`InsertOutcome::Accepted`] otherwise.  For eBGP peers,
     /// `AS_CONFED_SEQUENCE` and `AS_CONFED_SET` segments are stripped from the
     /// route's `AS_PATH` before it is stored (RFC 5065 §5.1).  The inner
-    /// `Option` is the previous route for this prefix, if any.
-    pub fn insert(&mut self, route: Route<A>) -> InsertOutcome<A> {
+    /// `Option` is the previous route for this prefix, if any.  The route is
+    /// stored with its NLRI in canonical form (see [prefix
+    /// identity](AdjRibOut#prefix-identity)).
+    pub fn insert(&mut self, mut route: Route<A>) -> InsertOutcome<A> {
+        let key = CanonicalNlri::new(route.nlri);
+        route.nlri = key.nlri();
         if !self.reflects()
             && self.peer_type == PeerType::Internal
             && route.peer_type == PeerType::Internal
         {
-            return InsertOutcome::Filtered(self.routes.remove(&route.nlri));
+            return InsertOutcome::Filtered(self.routes.remove(&key));
         }
 
-        let mut route = route;
         if self.peer_type == PeerType::External {
             route.as_path = Arc::new(route.as_path.strip_confed_segments());
         }
 
-        InsertOutcome::Accepted(self.routes.insert(route.nlri, route))
+        InsertOutcome::Accepted(self.routes.insert(key, route))
     }
 
     /// Removes the route for a prefix and returns it, if present.
@@ -169,18 +178,20 @@ impl<A: IpAddress> AdjRibOut<A> {
     /// A `Some` return value means a WITHDRAW message should be sent to the
     /// peer.
     pub fn withdraw(&mut self, nlri: &Nlri<A>) -> Option<Route<A>> {
-        self.routes.remove(nlri)
+        self.routes.remove(&CanonicalNlri::new(*nlri))
     }
 
     /// Returns the route currently advertised for `nlri`, if any.
     #[must_use]
     pub fn get(&self, nlri: &Nlri<A>) -> Option<&Route<A>> {
-        self.routes.get(nlri)
+        self.routes.get(&CanonicalNlri::new(*nlri))
     }
 
     /// Iterates over all `(prefix, route)` pairs being advertised to this peer.
     pub fn routes(&self) -> impl Iterator<Item = (&Nlri<A>, &Route<A>)> {
-        self.routes.iter()
+        self.routes
+            .iter()
+            .map(|(key, route)| (key.as_nlri(), route))
     }
 
     /// Returns the number of prefixes currently being advertised.

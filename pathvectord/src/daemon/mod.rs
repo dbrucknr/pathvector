@@ -34,6 +34,7 @@ use pathvector_session::{
 use pathvector_types::{
     AfiSafi, AsPath, Asn, LocalPref, Med, NextHop, Nlri, Origin, PeerType, Role, UnknownAttribute,
 };
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 
 use crate::outbound::{
@@ -69,6 +70,12 @@ mod peer;
 mod peer_stats;
 mod policy;
 mod route;
+// Issue #160: session loss must withdraw or replace routes in both families.
+#[cfg(test)]
+mod session_loss_tests;
+// Issue #178: UPDATEs stay within the negotiated maximum message size.
+#[cfg(test)]
+mod update_size_tests;
 
 // Issues #81 and #82: BLACKHOLE authorization and import eligibility through
 // Graceful Restart.
@@ -89,6 +96,18 @@ mod rr_tie_break_tests;
 #[cfg(test)]
 mod rr_reflection_tests;
 
+// Issue #168: RFC 4456 §6 non-client split-horizon on every send path.
+#[cfg(test)]
+mod rr_split_horizon_tests;
+
+// Issue #159: UPDATEs sent to a peer, applied in order, match its Adj-RIB-Out.
+#[cfg(test)]
+mod outbound_order_tests;
+
+// Sessions the daemon resets on its own authority must reconnect.
+#[cfg(test)]
+mod session_restart_tests;
+
 // Re-exports so that sibling submodules using `use super::*` can call
 // items defined in other sibling submodules.
 use blackhole::{BlackholeBook, BlackholeBooks, BlackholeChange, PeerBlackhole};
@@ -97,7 +116,7 @@ use capabilities::{
     set_listener_key, warn_if_md5_best_effort,
 };
 use deferral::SelectionDeferral;
-use fib::withdraw_stale_bgp_routes;
+use fib::{changed_nlris, withdraw_stale_bgp_routes};
 use gr::GracefulRestartState;
 #[cfg(test)]
 use import::reapply_without_blackholes;
@@ -404,17 +423,20 @@ pub(crate) struct DaemonState {
     /// Peers whose outbound UPDATE channel overflowed during the current event.
     ///
     /// The event loop drains this list after each event via [`take_stalled_peers`]
-    /// and sends [`SessionCommand::Stop`] to each affected session so it can
-    /// re-establish and perform a clean full-table dump.
+    /// and resets each affected session ([`SessionCommand::AutomaticStop`]) so it
+    /// re-establishes and performs a clean full-table dump.
     ///
     /// [`take_stalled_peers`]: DaemonState::take_stalled_peers
     stalled_peers: Vec<IpAddr>,
-    /// Per-peer coalescing buffers for outbound IPv4 prefix decisions.
+    /// Per-peer coalescing buffers for outbound IPv4 prefix decisions, in the
+    /// order the decisions were made.
     ///
     /// `on_route_update` accumulates decisions here instead of calling
     /// `flush_updates` immediately. The event loop calls `flush_pending` when
     /// the event channel drains (natural quiescence), batching all decisions
     /// that arrived during one burst into the fewest possible UPDATE messages.
+    /// Paths that must send at once go through `send_decisions`, which drains
+    /// this buffer with them so that nothing overtakes an older decision.
     pub(crate) pending_decisions: HashMap<IpAddr, Vec<PrefixDecision>>,
     /// Per-peer coalescing buffers for outbound IPv6 prefix decisions.
     pub(crate) pending_decisions_v6: HashMap<IpAddr, Vec<PrefixDecisionV6>>,
@@ -457,16 +479,21 @@ pub(crate) struct DaemonState {
     pub(crate) peer_max_prefixes_v6: HashMap<IpAddr, u32>,
     /// Idle-hold duration (seconds) after a max-prefix CEASE.
     ///
-    /// When non-zero, pathvectord blocks the peer from re-establishing for
-    /// this many seconds after dropping the session. `0` means reconnect
-    /// immediately according to the normal `connect_retry_time`.
+    /// When non-zero, the session is started again this many seconds after the
+    /// CEASE. A peer with no entry (`max_prefixes_restart` absent or `0`)
+    /// stays down: see `max_prefix_latched`.
     pub(crate) peer_max_prefixes_restart: HashMap<IpAddr, u16>,
     /// Active max-prefix idle-hold deadlines, keyed by peer address.
     ///
     /// Inserted when a max-prefix CEASE is sent and `max_prefixes_restart > 0`.
-    /// The event loop polls this map and blocks `SessionEvent::Established`
-    /// until the deadline passes.
+    /// The session stays stopped until the deadline, when the event loop sends
+    /// it [`SessionCommand::Start`] (RFC 4271 §8.1.3 `IdleHoldTimer_Expires`).
     pub(crate) max_prefix_idle: HashMap<IpAddr, Instant>,
+    /// Peers stopped by a max-prefix CEASE with no `max_prefixes_restart`.
+    ///
+    /// Nothing starts these sessions again; only removing the peer (or
+    /// restarting the daemon) clears the entry. Held in memory only.
+    pub(crate) max_prefix_latched: HashSet<IpAddr>,
     /// Broadcast channel for Loc-RIB events (announced / withdrawn).
     ///
     /// `WatchRoutes` gRPC handlers subscribe at call time. Slow subscribers
@@ -734,6 +761,7 @@ impl DaemonState {
             peer_max_prefixes_v6,
             peer_max_prefixes_restart,
             max_prefix_idle: HashMap::new(),
+            max_prefix_latched: HashSet::new(),
             route_tx,
             peer_tx,
             fib_manager: None,
@@ -1442,6 +1470,37 @@ fn handle_session_terminated(
     })
 }
 
+/// Stops a session that must not come back by itself
+/// ([`SessionCommand::Notification`]), with a Cease of the given subcode.
+fn hold_down(subcode: CeaseError) -> SessionCommand {
+    SessionCommand::Notification(NotificationMessage {
+        error: NotificationError::Cease(subcode),
+        data: vec![],
+    })
+}
+
+/// The command for a NOTIFICATION that `on_route_update` asks for.
+///
+/// After a maximum-prefix CEASE the session stays stopped: the daemon starts it
+/// again itself if `max_prefixes_restart` is set, and otherwise only an
+/// operator does. Any other (an UPDATE error) reconnects by itself.
+fn route_reset(notification: NotificationMessage) -> SessionCommand {
+    if notification.error == NotificationError::Cease(CeaseError::MaximumNumberOfPrefixesReached) {
+        SessionCommand::Notification(notification)
+    } else {
+        SessionCommand::AutomaticStop(notification)
+    }
+}
+
+/// A reset of a session that should come back by itself
+/// ([`SessionCommand::AutomaticStop`]), with a Cease of the given subcode.
+fn automatic_stop(subcode: CeaseError) -> SessionCommand {
+    SessionCommand::AutomaticStop(NotificationMessage {
+        error: NotificationError::Cease(subcode),
+        data: vec![],
+    })
+}
+
 pub(crate) async fn run_event_loop(
     mut event_rx: mpsc::Receiver<(IpAddr, SessionEvent)>,
     state: Arc<RwLock<DaemonState>>,
@@ -1475,21 +1534,20 @@ pub(crate) async fn run_event_loop(
                 let mut s = crate::lock_timing::write_timed(&state, "event_batch").await;
                 match event {
                     SessionEvent::Established(info) => {
-                        // RFC 4486 §4 — max-prefix idle-hold: if the peer is
-                        // still within its post-CEASE idle window, reject the
-                        // reconnect attempt immediately with Stop so it retries
-                        // after connect_retry_time elapses. Skipping
+                        // A peer held down after a max-prefix CEASE is not
+                        // registered, even if its session got as far as
+                        // Established before the stop reached it. Skipping
                         // `on_established` leaves the session unregistered, so
                         // `on_route_update` ignores any UPDATE already queued.
-                        if s.max_prefix_idle.contains_key(&peer_ip) {
+                        if s.is_max_prefix_held(peer_ip) {
                             tracing::info!(
                                 peer = %peer_ip,
-                                "max-prefix idle-hold active — rejecting reconnect"
+                                "held down after max-prefix — rejecting session"
                             );
                             drop(s);
                             let tx = stop_senders.lock().unwrap().get(&peer_ip).cloned();
                             if let Some(tx) = tx {
-                                let _ = tx.send(SessionCommand::Stop).await;
+                                let _ = tx.send(hold_down(CeaseError::ConnectionRejected)).await;
                             }
                             continue;
                         }
@@ -1558,13 +1616,13 @@ pub(crate) async fn run_event_loop(
                             drop(s);
                             let tx = stop_senders.lock().unwrap().get(&peer_ip).cloned();
                             if let Some(tx) = tx {
-                                let _ = tx.send(SessionCommand::Notification(err)).await;
+                                let _ = tx.send(route_reset(err)).await;
                             }
                             // Process any stalled peers before next iteration.
                             for peer in stalled {
                                 let tx = stop_senders.lock().unwrap().get(&peer).cloned();
                                 if let Some(tx) = tx {
-                                    let _ = tx.send(SessionCommand::Stop).await;
+                                    let _ = tx.send(automatic_stop(CeaseError::OutOfResources)).await;
                                 }
                             }
                             continue;
@@ -1584,8 +1642,9 @@ pub(crate) async fn run_event_loop(
                 // one place. Leave the loop only with `break`: skipping that
                 // code drops commands the batch has already promised.
                 //
-                // Peers that reconnected during a max-prefix idle-hold window;
-                // their Stop is sent after the drain loop alongside stalled peers
+                // Peers that reconnected while held down after a max-prefix
+                // CEASE; their stop is sent after the drain loop alongside the
+                // stalled peers' resets
                 // to avoid dropping and re-acquiring the write lock mid-iteration.
                 let mut idle_hold_rejected: Vec<IpAddr> = Vec::new();
                 // Owed by coalesced `Terminated` events.
@@ -1603,11 +1662,11 @@ pub(crate) async fn run_event_loop(
                     batch_events += 1;
                     match extra_event {
                         SessionEvent::Established(info) => {
-                            // Same idle-hold guard as the primary Established arm.
-                            if s.max_prefix_idle.contains_key(&extra_ip) {
+                            // Same max-prefix guard as the primary Established arm.
+                            if s.is_max_prefix_held(extra_ip) {
                                 tracing::info!(
                                     peer = %extra_ip,
-                                    "max-prefix idle-hold active — rejecting reconnect (coalesced)"
+                                    "held down after max-prefix — rejecting session (coalesced)"
                                 );
                                 idle_hold_rejected.push(extra_ip);
                                 continue;
@@ -1676,18 +1735,18 @@ pub(crate) async fn run_event_loop(
                 let stalled = s.take_stalled_peers();
                 drop(s);
 
-                // Before any Stop below: a session being stopped still needs
+                // Before any reset below: a session being reset still needs
                 // the new set for its next OPEN.
                 for refresh in capability_refreshes {
                     refresh.send().await;
                 }
 
-                // Before the Stops, so a session that is also stalled still
-                // reports why it is being reset.
+                // Before the other resets, so a session that is also stalled
+                // still reports why it is being reset.
                 if let Some((peer, err)) = notification {
                     let tx = stop_senders.lock().unwrap().get(&peer).cloned();
                     if let Some(tx) = tx {
-                        let _ = tx.send(SessionCommand::Notification(err)).await;
+                        let _ = tx.send(route_reset(err)).await;
                     }
                 }
 
@@ -1699,14 +1758,14 @@ pub(crate) async fn run_event_loop(
                     );
                     let tx = stop_senders.lock().unwrap().get(&peer).cloned();
                     if let Some(tx) = tx {
-                        let _ = tx.send(SessionCommand::Stop).await;
+                        let _ = tx.send(automatic_stop(CeaseError::OutOfResources)).await;
                     }
                 }
 
                 for peer in idle_hold_rejected {
                     let tx = stop_senders.lock().unwrap().get(&peer).cloned();
                     if let Some(tx) = tx {
-                        let _ = tx.send(SessionCommand::Stop).await;
+                        let _ = tx.send(hold_down(CeaseError::ConnectionRejected)).await;
                     }
                 }
             }
@@ -1726,7 +1785,7 @@ pub(crate) async fn run_event_loop(
                     );
                     let tx = stop_senders.lock().unwrap().get(&peer).cloned();
                     if let Some(tx) = tx {
-                        let _ = tx.send(SessionCommand::Stop).await;
+                        let _ = tx.send(automatic_stop(CeaseError::OutOfResources)).await;
                     }
                 }
             }
@@ -1761,7 +1820,7 @@ pub(crate) async fn run_event_loop(
                         );
                         let tx = stop_senders.lock().unwrap().get(&peer).cloned();
                         if let Some(tx) = tx {
-                            let _ = tx.send(SessionCommand::Stop).await;
+                            let _ = tx.send(automatic_stop(CeaseError::OutOfResources)).await;
                         }
                     }
                 }
@@ -1800,12 +1859,12 @@ pub(crate) async fn run_event_loop(
                     );
                     let tx = stop_senders.lock().unwrap().get(&peer).cloned();
                     if let Some(tx) = tx {
-                        let _ = tx.send(SessionCommand::Stop).await;
+                        let _ = tx.send(automatic_stop(CeaseError::OutOfResources)).await;
                     }
                 }
             }
 
-            // RFC 4486 §4 — max-prefix idle-hold expiry timer.  When no
+            // Max-prefix idle-hold expiry timer.  When no
             // idle-hold is active, `pending()` keeps this branch dormant.
             //
             // The deadline is read with a temporary read guard (no local
@@ -1827,11 +1886,25 @@ pub(crate) async fn run_event_loop(
                     .filter(|(_, deadline)| *deadline <= &now)
                     .map(|(ip, _)| *ip)
                     .collect();
-                for peer_ip in &expired {
-                    s.max_prefix_idle.remove(peer_ip);
+                for peer_ip in expired {
+                    s.max_prefix_idle.remove(&peer_ip);
+                    // A peer being removed has been sent its stop already.
+                    if s.pending_removal.contains(&peer_ip) {
+                        continue;
+                    }
+                    let session = stop_senders.lock().unwrap().get(&peer_ip).cloned();
+                    let Some(session) = session else { continue };
+                    // Sent without releasing the state lock, so a concurrent
+                    // `RemovePeer` cannot queue its stop ahead of this start.
+                    // That rules out waiting for room in the channel.
+                    if let Err(TrySendError::Full(_)) = session.try_send(SessionCommand::Start) {
+                        s.max_prefix_idle
+                            .insert(peer_ip, now + std::time::Duration::from_millis(100));
+                        continue;
+                    }
                     tracing::info!(
                         peer = %peer_ip,
-                        "max-prefix idle-hold expired — peer may now reconnect"
+                        "max-prefix idle-hold expired — restarting session"
                     );
                 }
             }
@@ -1861,7 +1934,7 @@ pub(crate) async fn run_event_loop(
                         );
                         let tx = stop_senders.lock().unwrap().get(&peer).cloned();
                         if let Some(tx) = tx {
-                            let _ = tx.send(SessionCommand::Stop).await;
+                            let _ = tx.send(automatic_stop(CeaseError::OutOfResources)).await;
                         }
                     }
                 }
@@ -6186,6 +6259,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::Internal,
             65001,
@@ -6216,6 +6290,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::External,
             65001,
@@ -6251,6 +6326,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::External,
             65001,
@@ -6281,6 +6357,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::Internal,
             65001,
@@ -6296,6 +6373,7 @@ mod tests {
             nlri_v6("2001:db8::/32"),
             &rib_v6,
             &mut aro,
+            &std::collections::HashSet::new(),
             &accept_all_v6(),
             PeerType::Internal,
             65001,
@@ -8585,7 +8663,17 @@ mod tests {
     ) -> bool {
         let peer_ip = aro.peer().ip();
         let decision = propagate_prefix(
-            nlri, rib, aro, policy, peer_type, local_as, local_as, bgp_id, false, false,
+            nlri,
+            rib,
+            aro,
+            &std::collections::HashSet::new(),
+            policy,
+            peer_type,
+            local_as,
+            local_as,
+            bgp_id,
+            false,
+            false,
         );
         flush_updates(peer_ip, vec![decision], MAX_LEN, tx, peer_type, true)
     }
@@ -12881,14 +12969,14 @@ mod coalescing_tests {
         state.on_route_update(IpAddr::V4(peer_a), announce(peer_a, &["10.0.0.0/8"]));
 
         // `pending_decisions[peer_b]` now has one entry.  Call set_export_default
-        // (which writes directly to the channel, bypassing the pending buffer).
+        // (which sends at once, draining the buffer ahead of its own decisions).
         // In production this is always serialized by the write lock — the event
         // loop always flushes before releasing — but we simulate the direct call
         // here to verify the buffer is not corrupted.
         state.set_export_default(IpAddr::V4(peer_b), pathvector_policy::DefaultAction::Accept);
 
-        // set_export_default fires first (direct channel write), then flush_pending
-        // sends the buffered decision.  Peer_b must receive both.
+        // Peer_b must receive the route whether set_export_default or this
+        // flush_pending sends it.
         state.flush_pending();
 
         let mut received_prefixes = std::collections::HashSet::new();
@@ -13340,7 +13428,7 @@ mod event_loop_tests {
     }
 
     /// A peer that reconnects while its max-prefix idle-hold is running is
-    /// owed a `Stop`, also when a later event in the same batch makes the
+    /// owed a stop, also when a later event in the same batch makes the
     /// drain loop leave early to send a NOTIFICATION. The idle-hold itself is
     /// local policy: RFC 4486 §4 requires only the Cease.
     #[tokio::test]
@@ -13394,7 +13482,7 @@ mod event_loop_tests {
 
         let b_commands = drain_commands(&mut b);
         assert!(
-            matches!(b_commands.as_slice(), [SessionCommand::Notification(_)]),
+            matches!(b_commands.as_slice(), [SessionCommand::AutomaticStop(_)]),
             "precondition: the batch must end on the NOTIFICATION path, got {b_commands:?}"
         );
         assert!(
@@ -13413,15 +13501,15 @@ mod event_loop_tests {
                 [
                     SessionCommand::Notification(_),
                     SessionCommand::SetCapabilities(_),
-                    SessionCommand::Stop
+                    SessionCommand::Notification(_)
                 ]
             ),
-            "expected the Cease, the post-teardown refresh, then Stop for the \
-             rejected reconnect, got {a_commands:?}"
+            "expected the Cease, the post-teardown refresh, then a stop for \
+             the rejected reconnect, got {a_commands:?}"
         );
     }
 
-    /// The `Stop` owed on the early exit is sent after the state write lock is
+    /// The stop owed on the early exit is sent after the state write lock is
     /// released, so a session slow to take commands does not stall the lock.
     #[tokio::test]
     async fn early_exit_idle_hold_stop_is_sent_without_the_state_lock() {
@@ -13429,7 +13517,7 @@ mod event_loop_tests {
             make_state(&[(DRAIN_PEER_A, 65002), (DRAIN_PEER_B, 65003)], 64);
         let mut a = capture_commands(&stop_senders, DRAIN_PEER_A);
         let _b = capture_commands(&stop_senders, DRAIN_PEER_B);
-        // Fill A's channel with a command that cannot be mistaken for Stop.
+        // Fill A's channel with a command that cannot be mistaken for a stop.
         let a_sender = stop_senders.lock().unwrap()[&DRAIN_PEER_A].clone();
         while a_sender
             .try_send(SessionCommand::SetCapabilities(vec![]))
@@ -13462,7 +13550,7 @@ mod event_loop_tests {
             None,
         ));
 
-        // The Stop cannot be delivered until A's channel is drained, yet the
+        // The stop cannot be delivered until A's channel is drained, yet the
         // lock must become free once the batch has been applied.
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -13475,13 +13563,13 @@ mod event_loop_tests {
             }
         })
         .await
-        .expect("state lock still held while the Stop is blocked");
+        .expect("state lock still held while the stop is blocked");
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while !matches!(a.recv().await, Some(SessionCommand::Stop)) {}
+            while !matches!(a.recv().await, Some(SessionCommand::Notification(_))) {}
         })
         .await
-        .expect("the rejected reconnect was never sent Stop");
+        .expect("the rejected reconnect was never stopped");
     }
 
     /// Events coalesced ahead of the one that needs a NOTIFICATION have
@@ -13617,7 +13705,7 @@ mod event_loop_tests {
         assert_nothing_installed_from_a(&*state.read().await);
         let commands = drain_commands(&mut a);
         assert!(
-            matches!(commands.as_slice(), [SessionCommand::Stop]),
+            matches!(commands.as_slice(), [SessionCommand::Notification(_)]),
             "got {commands:?}"
         );
     }
@@ -13657,7 +13745,7 @@ mod event_loop_tests {
         }
         let commands = drain_commands(&mut a);
         assert!(
-            matches!(commands.as_slice(), [SessionCommand::Stop]),
+            matches!(commands.as_slice(), [SessionCommand::Notification(_)]),
             "got {commands:?}"
         );
     }
@@ -13693,7 +13781,7 @@ mod event_loop_tests {
         assert_eq!(state.read().await.max_prefix_idle[&DRAIN_PEER_A], deadline);
         let commands = drain_commands(&mut a);
         assert!(
-            matches!(commands.as_slice(), [SessionCommand::Stop]),
+            matches!(commands.as_slice(), [SessionCommand::Notification(_)]),
             "got {commands:?}"
         );
     }
@@ -13949,13 +14037,17 @@ mod event_loop_tests {
 
         run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
 
-        // The event loop must have sent SessionCommand::Stop to peer_b.
+        // The event loop must have reset peer_b.
         let cmd = cmd_rx_b
             .try_recv()
-            .expect("event loop must send Stop to stalled peer_b");
+            .expect("event loop must reset stalled peer_b");
         assert!(
-            matches!(cmd, SessionCommand::Stop),
-            "expected Stop command, got {cmd:?}"
+            matches!(
+                &cmd,
+                SessionCommand::AutomaticStop(n)
+                    if n.error == NotificationError::Cease(CeaseError::OutOfResources)
+            ),
+            "expected AutomaticStop(Out of Resources), got {cmd:?}"
         );
     }
 
@@ -17020,7 +17112,7 @@ mod run_with_tests {
         assert_post_session_drop_refresh(next_command(&mut b.stop_rx).await);
         let cmd = next_command(&mut a.stop_rx).await;
         assert!(
-            matches!(cmd, SessionCommand::Notification(_)),
+            matches!(cmd, SessionCommand::AutomaticStop(_)),
             "precondition: the batch must end on the NOTIFICATION path, got {cmd:?}"
         );
     }
@@ -18432,7 +18524,8 @@ mod test_gr_phase2 {
         // PEER_IP is the only source of the prefix; OBS_IP observes.
         state.on_route_update(IpAddr::V4(PEER_IP), announce(&["198.51.100.0/24"]));
 
-        // Drain the initial advertisement so the channel is quiet.
+        // Send and drain the initial advertisement so the channel is quiet.
+        state.flush_pending();
         let obs_rx = rxs.get_mut(&IpAddr::V4(OBS_IP)).unwrap();
         while obs_rx.try_recv().is_ok() {}
 
@@ -20742,7 +20835,7 @@ mod test_max_prefix {
         assert!(deadline > Instant::now(), "deadline must be in the future");
     }
 
-    /// Without restart, no idle-hold deadline is set.
+    /// Without restart, no idle-hold deadline is set and the peer is latched.
     #[test]
     fn no_idle_hold_without_restart() {
         let (mut state, _rxs) = make_state_with_limit(1, 0);
@@ -20756,6 +20849,10 @@ mod test_max_prefix {
             !state.max_prefix_idle.contains_key(&IpAddr::V4(PEER_IP)),
             "max_prefix_idle must NOT be set when max_prefixes_restart is not configured"
         );
+        assert!(state.max_prefix_latched.contains(&IpAddr::V4(PEER_IP)));
+        // Removing the peer is what clears the latch.
+        state.remove_peer(IpAddr::V4(PEER_IP));
+        assert!(!state.max_prefix_latched.contains(&IpAddr::V4(PEER_IP)));
     }
 
     /// Peer with no max_prefixes configured is never subject to the limit.
@@ -20945,7 +21042,10 @@ mod test_max_prefix {
         limit: u32,
         restart_secs: u16,
     ) -> EventLoopFixture {
-        let (update_tx, _) = mpsc::channel::<UpdateMessage>(64);
+        // Keep the receiver alive: a closed outbound channel marks the peer
+        // stalled, and its reset would be mistaken for the idle-hold one.
+        let (update_tx, mut update_rx) = mpsc::channel::<UpdateMessage>(64);
+        tokio::spawn(async move { while update_rx.recv().await.is_some() {} });
         let (stop_tx, stop_rx) = mpsc::channel::<SessionCommand>(8);
         let peer_cfg = config::PeerConfig {
             address: peer_ip,
@@ -21106,7 +21206,7 @@ mod test_max_prefix {
     }
 
     /// Idle-hold: a reconnect attempt during the hold window must be rejected
-    /// with SessionCommand::Stop; the peer must NOT be established.
+    /// with a stop; the peer must NOT be established.
     #[tokio::test]
     async fn event_loop_idle_hold_blocks_reconnect() {
         let peer_ip = PEER_IP;
@@ -21173,13 +21273,18 @@ mod test_max_prefix {
             "first command must be CEASE/MaximumNumberOfPrefixesReached"
         );
 
-        // Second command: Stop for the blocked reconnect.
-        let second = stop_rx
-            .try_recv()
-            .expect("second command must be Stop for blocked reconnect");
+        // Next, apart from the post-teardown capability refresh: stop the
+        // blocked reconnect.
+        let second = std::iter::from_fn(|| stop_rx.try_recv().ok())
+            .find(|c| !matches!(c, SessionCommand::SetCapabilities(_)))
+            .expect("second command must stop the blocked reconnect");
         assert!(
-            matches!(second, SessionCommand::Stop),
-            "reconnect during idle-hold must receive Stop, got: {second:?}"
+            matches!(
+                &second,
+                SessionCommand::Notification(n)
+                    if n.error == NotificationError::Cease(CeaseError::ConnectionRejected)
+            ),
+            "reconnect during idle-hold must be stopped, got: {second:?}"
         );
 
         // Peer must not be established (no peer_type entry).
@@ -21326,12 +21431,18 @@ mod test_max_prefix {
                     )
             )
         });
-        let has_stop = cmds.iter().any(|c| matches!(c, SessionCommand::Stop));
+        let has_stop = cmds.iter().any(|c| {
+            matches!(
+                c,
+                SessionCommand::Notification(n)
+                    if n.error == NotificationError::Cease(CeaseError::ConnectionRejected)
+            )
+        });
 
         assert!(has_cease, "peer must receive CEASE for over-limit update");
         assert!(
             has_stop,
-            "peer must receive Stop for reconnect during idle-hold (drain-loop path)"
+            "reconnect during idle-hold must be stopped (drain-loop path)"
         );
         assert!(
             !state
