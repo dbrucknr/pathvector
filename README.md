@@ -103,8 +103,8 @@ against a live `pathvectord` over a loopback BGP TCP session.
 | Metric | Result | Context |
 |---|---|---|
 | Prefixes announced | 1,133,510 | Full internet routing table |
-| Announcement time | 2.20 s | Sender-side wall-clock to write every UPDATE |
-| **Announcement throughput** | **514,287 prefixes/sec** | Rate at which the replayer wrote to the session |
+| Announcement time | 2.20 s | Sender-side wall-clock to build and write every UPDATE |
+| **Announcement throughput** | **514,287 prefixes/sec** | The replayer's UPDATE construction plus transmission throughput |
 | Unique path-attribute sets | 168,840 | The replayer packs prefixes that share a set into the same UPDATE |
 | **RIB convergence time** | **2.88 s** | From the end of the announcement until the route count stops changing |
 | Routes accepted into Loc-RIB | 1,133,415 / 1,133,510 | 95 rejected: MRT records multiple peer views per prefix |

@@ -27,12 +27,13 @@ via gRPC until the RIB stabilises.
 
 This measures two things:
 
-1. **Announcement throughput** — how fast can pathvectord accept BGP UPDATEs?
-2. **RIB convergence time** — how long from the first UPDATE until the Loc-RIB is stable?
+1. **Announcement throughput** — how fast does the replayer build and send the table as
+   BGP UPDATEs?
+2. **RIB convergence time** — how long after the announcement until the Loc-RIB is stable?
 
 Convergence is detected by snapshot polling: open a fresh `watch_routes` stream, count
-`Current` events until `EndInitial`, repeat at `--idle-ms` intervals until two consecutive
-snapshots report the same route count. This avoids the broadcast-channel overflow problem
+`Current` events until `EndInitial`, and repeat until the route count has not changed for
+`--idle-ms`. This avoids the broadcast-channel overflow problem
 that affects stream-based detection at high update rates.
 
 ---
@@ -92,8 +93,10 @@ Waiting for RIB convergence (snapshot polling)...
 
 ### Interpreting the results
 
-- **Announcement time** — wall-clock from the first UPDATE to the last. Limited by TCP
-  throughput; pathvectord accepts updates as fast as the socket buffer allows.
+- **Announcement time** — sender-side wall-clock for the replayer to build every UPDATE
+  (grouping prefixes by attribute set and encoding them) and write it to the session.
+  The prefixes/sec figure covers both steps, so it does not isolate how fast
+  pathvectord processes UPDATEs.
 - **RIB convergence** — from the end of the announcement until the route count has been
   stable for `--idle-ms`, so it includes that quiet window. **Total** adds the
   announcement time.
@@ -107,7 +110,7 @@ has later figures.
 
 | Metric | Result | Context |
 |---|---|---|
-| Announcement throughput | **343,920 prefixes/sec** | Sender-side write rate |
+| Announcement throughput | **343,920 prefixes/sec** | UPDATE construction plus transmission, at the sender |
 | RIB convergence | **3.70 s** | Measured after the announcement finished |
 | Total | **7.00 s** | Announcement + convergence |
 
