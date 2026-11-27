@@ -9,9 +9,11 @@ use std::{
 
 use pathvector_rib::oracle::NextHopOracle;
 use pathvector_session::fsm::SessionInfo;
-use pathvector_session::message::{Capability, UpdateMessage};
+use pathvector_session::message::{
+    Capability, GracefulRestartFamily, PathAttribute, UpdateMessage,
+};
 use pathvector_session::transport::{SessionCommand, SessionEvent, TerminationReason};
-use pathvector_types::{AsPath, Asn, NextHop, Nlri, Origin, PeerType};
+use pathvector_types::{AfiSafi, AsPath, Asn, NextHop, Nlri, Origin, PeerType};
 use tokio::sync::mpsc;
 
 use crate::config;
@@ -2121,6 +2123,205 @@ async fn removal_broadcasts_one_removed_event_with_correct_fields() {
     assert_eq!(ps.address, peer_ip.to_string(), "address must match");
     assert_eq!(ps.remote_as, remote_as, "remote_as must not be zeroed");
     assert_eq!(ps.local_as, local_as, "local_as must not be zeroed");
+}
+
+// ── One teardown per removal ──────────────────────────────────────────────
+
+const REMOVED: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+const BYSTANDER: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
+
+/// Establishes `peer_ip` and has it announce `prefix`.
+fn establish_and_announce(
+    s: &mut DaemonState,
+    peer_ip: IpAddr,
+    capabilities: &[Capability],
+    prefix: &str,
+) {
+    s.on_established(
+        peer_ip,
+        Ipv4Addr::new(10, 0, 0, 2),
+        PeerType::External,
+        65099,
+        90,
+        capabilities,
+        None,
+    );
+    s.on_route_update(peer_ip, announcement(prefix));
+    s.flush_pending();
+}
+
+fn announcement(prefix: &str) -> UpdateMessage {
+    UpdateMessage {
+        withdrawn: vec![],
+        attributes: vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::from_sequence(vec![Asn::new(65099)])),
+            PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+        ],
+        announced: vec![nlri(prefix)],
+    }
+}
+
+/// Runs the event loop over `events`, all from `peer_ip`.
+async fn run_events(
+    state: &Arc<RwLock<DaemonState>>,
+    stop_senders: &Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
+    peer_ip: IpAddr,
+    events: Vec<SessionEvent>,
+) {
+    let (event_tx, event_rx) = mpsc::channel(events.len());
+    for event in events {
+        event_tx.send((peer_ip, event)).await.unwrap();
+    }
+    drop(event_tx);
+    run_event_loop(event_rx, Arc::clone(state), Arc::clone(stop_senders), None).await;
+}
+
+/// An Established peer's removal delivers `Terminated` and then `Retired`.
+/// The teardown must run for only one of them: `WatchRoutes` subscribers see
+/// what one teardown emits, not the same events twice.
+#[tokio::test]
+async fn removing_an_established_peer_tears_it_down_once() {
+    let (state, _rxs, stop_senders) = make_state(&[(REMOVED, 65099), (BYSTANDER, 65099)], 8);
+    let mut route_rx = {
+        let mut s = state.write().await;
+        s.on_established(
+            REMOVED,
+            Ipv4Addr::new(10, 0, 0, 2),
+            PeerType::External,
+            65099,
+            90,
+            &[],
+            None,
+        );
+        establish_and_announce(&mut s, BYSTANDER, &[], "192.0.2.0/24");
+        s.pending_removal.insert(REMOVED);
+        s.route_tx.subscribe()
+    };
+
+    run_events(
+        &state,
+        &stop_senders,
+        REMOVED,
+        vec![
+            SessionEvent::Terminated(TerminationReason::OperatorStop),
+            SessionEvent::Retired,
+        ],
+    )
+    .await;
+
+    let mut events = vec![];
+    while let Ok(event) = route_rx.try_recv() {
+        events.push(event);
+    }
+    assert_eq!(
+        events.len(),
+        1,
+        "the other peer's route must be reported once; got {events:?}"
+    );
+    assert!(!state.read().await.adj_ribs_in.contains_key(&REMOVED));
+}
+
+/// A session can flap just ahead of `RemovePeer`, leaving a later session's
+/// events queued behind a `Terminated` that is handled while the peer is
+/// already marked. That later session's routes still have to go.
+#[tokio::test]
+async fn retired_withdraws_routes_learned_after_the_removed_peers_terminated() {
+    let (state, _rxs, stop_senders) = make_state(&[(REMOVED, 65099)], 8);
+    state.write().await.pending_removal.insert(REMOVED);
+
+    run_events(
+        &state,
+        &stop_senders,
+        REMOVED,
+        vec![
+            SessionEvent::Terminated(TerminationReason::Unclean),
+            SessionEvent::Established(established_info(65099)),
+            SessionEvent::RouteUpdate(announcement("192.0.2.0/24")),
+            SessionEvent::Retired,
+        ],
+    )
+    .await;
+
+    assert_eq!(state.read().await.rib.loc_rib.len(), 0);
+}
+
+/// A session task that dies while Established reports no `Terminated`.
+#[tokio::test]
+async fn retired_alone_withdraws_an_established_peers_routes() {
+    let (state, _rxs, stop_senders) = make_state(&[(REMOVED, 65099)], 8);
+    {
+        let mut s = state.write().await;
+        establish_and_announce(&mut s, REMOVED, &[], "192.0.2.0/24");
+        assert_eq!(s.rib.loc_rib.len(), 1);
+        s.pending_removal.insert(REMOVED);
+    }
+
+    run_events(&state, &stop_senders, REMOVED, vec![SessionEvent::Retired]).await;
+
+    assert_eq!(state.read().await.rib.loc_rib.len(), 0);
+}
+
+/// Between sessions with Graceful Restart routes retained, `Retired` is all a
+/// removal gets. An earlier removal at the same address must not change that.
+#[tokio::test]
+async fn retired_withdraws_routes_retained_for_graceful_restart() {
+    let (state, _rxs, stop_senders) = make_state(&[(REMOVED, 65099)], 8);
+    let (update_tx, _update_rx) = mpsc::channel(8);
+    let peer_config = config::PeerConfig {
+        address: REMOVED,
+        port: 179,
+        remote_as: 65099,
+        import_default: Some(config::ImportDefault::Accept),
+        export_default: Some(config::ExportDefault::Accept),
+        import_default_v6: None,
+        md5_password: None,
+        is_rr_client: false,
+        next_hop_self: false,
+        hold_time: None,
+        shutdown_message: None,
+        connect_retry_time: None,
+        max_prefixes_v4: None,
+        max_prefixes_v6: None,
+        max_prefixes_restart: None,
+        role: None,
+        confederation_member: false,
+        blackhole_authorized_prefixes: None,
+    };
+
+    // A first removal that got both events, then the address is reused.
+    state.write().await.pending_removal.insert(REMOVED);
+    run_events(
+        &state,
+        &stop_senders,
+        REMOVED,
+        vec![
+            SessionEvent::Terminated(TerminationReason::OperatorStop),
+            SessionEvent::Retired,
+        ],
+    )
+    .await;
+    assert!(state.write().await.add_peer(&peer_config, update_tx));
+
+    let graceful_restart = Capability::GracefulRestart {
+        restart_flags: 0,
+        restart_time: 120,
+        families: vec![GracefulRestartFamily {
+            afi_safi: AfiSafi::IPV4_UNICAST,
+            forwarding_preserved: true,
+        }],
+    };
+    {
+        let mut s = state.write().await;
+        establish_and_announce(&mut s, REMOVED, &[graceful_restart], "192.0.2.0/24");
+        s.on_terminated(REMOVED, TerminationReason::Unclean, true);
+        assert_eq!(s.rib.loc_rib.len(), 1, "the route is retained");
+        s.pending_removal.insert(REMOVED);
+    }
+
+    run_events(&state, &stop_senders, REMOVED, vec![SessionEvent::Retired]).await;
+
+    assert_eq!(state.read().await.rib.loc_rib.len(), 0);
 }
 
 /// When a normal peer (not in `pending_removal`) receives `Terminated`, the

@@ -113,6 +113,9 @@ pub(crate) struct DaemonState {
     /// `AddPeer` for its address is ignored. When `Retired` arrives, the event
     /// loop calls [`DaemonState::remove_peer`] to erase all per-peer state.
     pub(crate) pending_removal: HashSet<IpAddr>,
+    /// Peers in `pending_removal` that `Terminated` has already torn down, so
+    /// that `Retired` does not do it again.
+    pub(super) removal_torn_down: HashSet<IpAddr>,
     /// RFC 4724 §4.2 GR state: active windows, stale-NLRI snapshots, peer families.
     ///
     /// See [`GracefulRestartState`] for field-level documentation.
@@ -400,6 +403,7 @@ impl DaemonState {
             pending_decisions: HashMap::new(),
             pending_decisions_v6: HashMap::new(),
             pending_removal: HashSet::new(),
+            removal_torn_down: HashSet::new(),
             gr: GracefulRestartState::new(),
             selection_deferral: SelectionDeferral::disabled(),
             shutdown_messages,
