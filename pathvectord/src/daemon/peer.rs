@@ -1,4 +1,5 @@
 // daemon/peer.rs — Peer lifecycle: add, remove, establish, terminate; session listener and command processor.
+use super::peering::import_policy_pair;
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
@@ -85,23 +86,19 @@ impl DaemonState {
         self.adj_ribs_out_v6.insert(peer.address, adj_out_v6);
         self.peer_config_types.insert(peer.address, pt);
 
-        let mut import_policy = Policy::new(resolve_import_default(peer.import_default, is_ebgp));
-        let default_v6 = peer.import_default_v6.or(peer.import_default);
-        let mut import_policy_v6 = Policy::new(resolve_import_default(default_v6, is_ebgp));
         let mut export_policy = Policy::new(resolve_export_default(peer.export_default, is_ebgp));
         // No separate `export_default_v6` knob — see the matching comment in
         // `DaemonState::new`.
         let mut export_policy_v6 =
             Policy::new(resolve_export_default(peer.export_default, is_ebgp));
         let resolved_role: Option<Role> = effective_role(peer, local_as).inspect(|&role| {
-            let peer_asn = Asn::new(peer.remote_as);
-            install_otc_import_term(&mut import_policy, role, peer_asn);
-            install_otc_import_term(&mut import_policy_v6, role, peer_asn);
             install_otc_export_term(&mut export_policy, role, Asn::new(local_as));
             install_otc_export_term(&mut export_policy_v6, role, Asn::new(local_as));
         });
         self.blackhole_sessions
             .insert(peer.address, peer_blackhole(peer, resolved_role));
+        let (import_policy, import_policy_v6) =
+            import_policy_pair(peer, local_as, resolved_role, self.rov_reject.as_ref());
         self.import_policies.insert(peer.address, import_policy);
         self.import_policies_v6
             .insert(peer.address, import_policy_v6);

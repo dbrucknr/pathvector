@@ -1,15 +1,17 @@
 //! Domain rules that turn a peer's configuration into session semantics:
-//! peer type, presented AS number, BGP Role, default policies and outbound
-//! tables. Pure functions: no I/O, no async, no shared state.
+//! peer type, presented AS number, BGP Role, import and export policies and
+//! outbound tables. No I/O, no async; the only shared state is the RPKI cache
+//! handle an RFC 6811 policy term reads.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use pathvector_policy::{
-    AnyCondition, BgpRoute, DefaultAction, OtcLeakCondition, OtcPropagationCondition, Policy,
-    Reject, SetOtc, Term,
+    AnyCondition, BgpRoute, Condition, DefaultAction, OtcLeakCondition, OtcPropagationCondition,
+    Policy, Reject, RoaValidityCondition, SetOtc, Term,
 };
-use pathvector_rib::{AdjRibOut, PeerId};
-use pathvector_types::{Asn, PeerType, Role};
+use pathvector_rib::{AdjRibOut, PeerId, Route};
+use pathvector_rpki::{RoaValidity, RtrHandle};
+use pathvector_types::{Asn, IpAddress, PeerType, Role};
 
 use super::blackhole::PeerBlackhole;
 use crate::config;
@@ -222,9 +224,55 @@ pub(super) fn install_otc_export_term<R: BgpRoute>(
     }
 }
 
-/// A peer's import policy as configured: the RFC 8212 default for its type,
-/// plus the RFC 9234 ingress terms when it has a role.
-pub(super) fn base_import_policy<R: BgpRoute>(
+/// The RFC 6811 reject-Invalid import term (`[daemon.rpki] reject_invalid`).
+///
+/// RFC 6811 §3 leaves the use of the validation state to route policy.
+/// `Valid` and `NotFound` routes do not match, so they fall through to the
+/// policy's default action.
+pub(super) fn install_rov_import_term<A>(
+    policy: &mut Policy<Route<A>>,
+    rtr: &RtrHandle,
+    local_as: Asn,
+) where
+    A: IpAddress,
+    Route<A>: BgpRoute,
+    RoaValidityCondition<A>: Condition<Route<A>> + 'static,
+{
+    policy.add_term(Term::new(
+        RoaValidityCondition::<A>::new(rtr.clone(), RoaValidity::Invalid, local_as),
+        Reject,
+    ));
+}
+
+/// A peer's IPv4 and IPv6 import policies: the RFC 8212 default for its type,
+/// the RFC 9234 ingress terms when it has a role, and the RFC 6811
+/// reject-Invalid term when `rov` is set.
+///
+/// Startup and `AddPeer` both build import policy here, so a term added here
+/// reaches every peer. `rov` is `None` at startup only because the RPKI client
+/// does not exist yet; `DaemonState::install_rpki_import_terms` appends the
+/// same term to those peers later.
+pub(super) fn import_policy_pair(
+    peer: &config::PeerConfig,
+    local_as: u32,
+    role: Option<Role>,
+    rov: Option<&RtrHandle>,
+) -> (Policy<Route<Ipv4Addr>>, Policy<Route<Ipv6Addr>>) {
+    // import_default_v6 takes precedence; falls back to import_default,
+    // then to the RFC 8212 default for the peer type.
+    let default_v6 = peer.import_default_v6.or(peer.import_default);
+    let mut v4 = base_import_policy(peer.import_default, local_as, peer.remote_as, role);
+    let mut v6 = base_import_policy(default_v6, local_as, peer.remote_as, role);
+    if let Some(rtr) = rov {
+        install_rov_import_term(&mut v4, rtr, Asn::new(local_as));
+        install_rov_import_term(&mut v6, rtr, Asn::new(local_as));
+    }
+    (v4, v6)
+}
+
+/// One address family's import policy before any RPKI term: the RFC 8212
+/// default, plus the RFC 9234 ingress terms when the peer has a role.
+fn base_import_policy<R: BgpRoute>(
     default: Option<config::ImportDefault>,
     local_as: u32,
     remote_as: u32,

@@ -150,8 +150,7 @@ use import::{
 use ingress::{Disposition, IngressDrop, IngressGate};
 use peering::{
     config_peer_type, effective_confederation_member, effective_role, effective_session_as,
-    install_otc_export_term, install_otc_import_term, make_adj_ribs_out_pair, peer_blackhole,
-    resolve_export_default, resolve_import_default,
+    install_otc_export_term, make_adj_ribs_out_pair, peer_blackhole, resolve_export_default,
 };
 
 // Used only by the test suites.
@@ -175,6 +174,8 @@ use pathvector_policy::BgpRoute;
 use pathvector_rib::oracle::AlwaysReachable;
 #[cfg(test)]
 use peer::{run_bgp_listener, run_command_processor};
+#[cfg(test)]
+use peering::{install_otc_import_term, resolve_import_default};
 #[cfg(test)]
 use route::MraiTracker;
 #[cfg(test)]

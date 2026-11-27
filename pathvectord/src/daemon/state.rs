@@ -26,8 +26,8 @@ use super::{
     deferral::SelectionDeferral,
     gr::GracefulRestartState,
     peering::{
-        base_export_policy, base_import_policy, config_peer_type, effective_role,
-        make_adj_ribs_out_pair, peer_blackhole,
+        base_export_policy, config_peer_type, effective_role, import_policy_pair,
+        install_rov_import_term, make_adj_ribs_out_pair, peer_blackhole,
     },
     route::MraiTracker,
 };
@@ -177,6 +177,10 @@ pub(crate) struct DaemonState {
     /// Cheap to clone (Arc-backed); gRPC handlers clone it per-request like
     /// `fib_manager`.
     pub(crate) rpki: Option<pathvector_rpki::RtrHandle>,
+    /// Set when import policy rejects RPKI-Invalid routes
+    /// (`reject_invalid = true`), so `add_peer` gives a new peer the same term.
+    /// `None` in monitoring-only mode, even though `rpki` is set then.
+    pub(super) rov_reject: Option<pathvector_rpki::RtrHandle>,
     /// RFC 7999 §3.3: each session's BLACKHOLE agreement and authorized prefix
     /// scope. A peer without an entry, or whose entry is denied (the default),
     /// has every BLACKHOLE-tagged announcement refused with no FIB effect.
@@ -235,26 +239,14 @@ impl DaemonState {
             })
             .collect();
 
-        let import_policies = peers
+        let (import_policies, import_policies_v6) = peers
             .iter()
             .map(|p| {
                 let role = peer_roles.get(&p.address).copied();
-                let policy = base_import_policy(p.import_default, local_as, p.remote_as, role);
-                (p.address, policy)
+                let (v4, v6) = import_policy_pair(p, local_as, role, None);
+                ((p.address, v4), (p.address, v6))
             })
-            .collect();
-
-        let import_policies_v6 = peers
-            .iter()
-            .map(|p| {
-                let role = peer_roles.get(&p.address).copied();
-                // import_default_v6 takes precedence; falls back to import_default,
-                // then to the RFC 8212 default for the peer type.
-                let default_v6 = p.import_default_v6.or(p.import_default);
-                let policy = base_import_policy(default_v6, local_as, p.remote_as, role);
-                (p.address, policy)
-            })
-            .collect();
+            .unzip();
 
         let export_policies = peers
             .iter()
@@ -420,6 +412,7 @@ impl DaemonState {
             peer_tx,
             fib_manager: None,
             rpki: None,
+            rov_reject: None,
             blackhole_sessions,
             blackholes: BlackholeBooks::default(),
             oracle_v4: Arc::new(AlwaysReachable),
@@ -427,36 +420,22 @@ impl DaemonState {
         }
     }
 
-    /// Injects a `RoaValidityCondition` "reject Invalid" term into every
-    /// configured peer's IPv4 and IPv6 import policy (RFC 6811 ROV).
+    /// Turns on RFC 6811 reject-Invalid: appends the term to every configured
+    /// peer's IPv4 and IPv6 import policy, and records `rtr` so peers added
+    /// later get it too.
     ///
     /// Called once, right after the RTR client is spawned — `DaemonState::new`
     /// itself takes no RPKI parameter, since the RTR handle isn't available
     /// until after construction and threading it through would touch this
-    /// struct's many existing test call sites. `Valid` and `NotFound` routes
-    /// are unaffected — they simply don't match this term and fall through to
-    /// each peer's existing default action, exactly as before this call.
+    /// struct's many existing test call sites.
     pub(crate) fn install_rpki_import_terms(&mut self, rtr: &pathvector_rpki::RtrHandle) {
         let local_as = Asn::new(self.rib.local_as);
         for policy in self.import_policies.values_mut() {
-            policy.add_term(pathvector_policy::Term::new(
-                pathvector_policy::RoaValidityCondition::<Ipv4Addr>::new(
-                    rtr.clone(),
-                    pathvector_rpki::RoaValidity::Invalid,
-                    local_as,
-                ),
-                pathvector_policy::Reject,
-            ));
+            install_rov_import_term(policy, rtr, local_as);
         }
         for policy in self.import_policies_v6.values_mut() {
-            policy.add_term(pathvector_policy::Term::new(
-                pathvector_policy::RoaValidityCondition::<Ipv6Addr>::new(
-                    rtr.clone(),
-                    pathvector_rpki::RoaValidity::Invalid,
-                    local_as,
-                ),
-                pathvector_policy::Reject,
-            ));
+            install_rov_import_term(policy, rtr, local_as);
         }
+        self.rov_reject = Some(rtr.clone());
     }
 }
