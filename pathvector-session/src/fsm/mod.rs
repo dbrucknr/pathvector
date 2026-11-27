@@ -13,11 +13,13 @@ use pathvector_types::{PeerType, ReservedAsZero, SpeakerAsn};
 #[cfg(test)]
 mod open_as_zero_tests;
 mod recovery;
+mod send_hold;
 
 use recovery::Outcome;
 pub use recovery::UpdateRecovery;
 #[cfg(test)]
 pub(crate) use recovery::make_treat_as_withdraw;
+pub use send_hold::{InvalidSendHoldTime, SendHoldTime};
 
 use crate::message::{
     BgpMessage, Capability, CeaseError, NotificationError, NotificationMessage, OpenMessage,
@@ -79,6 +81,8 @@ pub struct FsmConfig {
     /// [`PeerType::External`] when `peer_as != local_as`. Has no effect when
     /// `peer_as == local_as` (already classified `Internal`).
     pub confederation_member: bool,
+    /// RFC 9687 `SendHoldTime` for this peer.
+    pub send_hold_time: SendHoldTime,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -97,6 +101,9 @@ pub enum FsmInput {
     HoldTimerExpired,
     /// The keepalive timer fired.
     KeepaliveTimerExpired,
+    /// The send hold timer fired: no BGP message could be sent for the
+    /// `SendHoldTime` (RFC 9687 §4.2, Event 29).
+    SendHoldTimerExpired,
     /// Outbound TCP connection was successfully established.
     TcpConnected,
     /// TCP connection attempt failed or was refused.
@@ -184,6 +191,11 @@ pub enum FsmOutput {
     StartKeepaliveTimer(Duration),
     /// Cancel the keepalive timer.
     StopKeepaliveTimer,
+    /// Start the RFC 9687 `SendHoldTimer`. Each time a BGP message is sent
+    /// while it runs, the transport restarts it with this value.
+    StartSendHoldTimer(Duration),
+    /// Cancel the `SendHoldTimer`.
+    StopSendHoldTimer,
     /// The session reached [`State::Established`].
     SessionEstablished(SessionInfo),
     /// The session was torn down (after being Established).
@@ -238,7 +250,7 @@ pub enum State {
 ///
 /// ```rust
 /// use std::net::Ipv4Addr;
-/// use pathvector_session::fsm::{Fsm, FsmConfig, FsmInput, State};
+/// use pathvector_session::fsm::{Fsm, FsmConfig, FsmInput, SendHoldTime, State};
 ///
 /// let fsm = Fsm::new(FsmConfig {
 ///     local_as: 65001,
@@ -249,6 +261,7 @@ pub enum State {
 ///     peer_as: Some(65002),
 ///     confederation_member: false,
 ///     public_as: 65001,
+///     send_hold_time: SendHoldTime::RECOMMENDED,
 /// });
 /// assert_eq!(fsm.state(), State::Idle);
 /// ```
@@ -259,6 +272,8 @@ pub struct Fsm {
     peer_open: Option<OpenMessage>,
     /// Negotiated hold time, set on entry to [`State::OpenConfirm`].
     negotiated_hold_time: u16,
+    /// Whether the `SendHoldTimer` was started and not yet stopped.
+    send_hold_running: bool,
 }
 
 impl Fsm {
@@ -270,6 +285,7 @@ impl Fsm {
             config,
             peer_open: None,
             negotiated_hold_time: 0,
+            send_hold_running: false,
         }
     }
 
@@ -331,14 +347,21 @@ impl Fsm {
             }
             other => other,
         };
-        match self.state {
+        let mut outputs = match self.state {
             State::Idle => self.on_idle(&input),
             State::Connect => self.on_connect(&input),
             State::Active => self.on_active(&input),
             State::OpenSent => self.on_open_sent(input),
             State::OpenConfirm => self.on_open_confirm(&input),
             State::Established => self.on_established(input),
+        };
+        // RFC 9687 §4.3: "The SendHoldTimer is stopped following any
+        // transition out of the Established state". First, so that sending the
+        // NOTIFICATION of that transition does not restart it.
+        if self.state != State::Established && std::mem::take(&mut self.send_hold_running) {
+            outputs.insert(0, FsmOutput::StopSendHoldTimer);
         }
+        outputs
     }
 
     // ── Per-state handlers ────────────────────────────────────────────────────
@@ -547,6 +570,16 @@ impl Fsm {
                     out.push(FsmOutput::StartHoldTimer(ht));
                     out.push(FsmOutput::StartKeepaliveTimer(ka));
                 }
+                // RFC 9687 §4.3, OpenConfirm/Event 26: "starts the
+                // SendHoldTimer if the SendHoldTime is non-zero".
+                if let Some(value) = self
+                    .config
+                    .send_hold_time
+                    .resolve(self.negotiated_hold_time)
+                {
+                    self.send_hold_running = true;
+                    out.push(FsmOutput::StartSendHoldTimer(value));
+                }
                 out
             }
             FsmInput::MessageReceived(BgpMessage::Notification(_)) | FsmInput::TcpFailed => {
@@ -694,6 +727,15 @@ impl Fsm {
                     FsmOutput::StartConnectRetryTimer(CONNECT_RETRY_INTERVAL),
                 ]
             }
+            // RFC 9687 §4.3, Established/Event 29: optionally send the
+            // NOTIFICATION "if the local system can determine that doing so
+            // will not delay" the teardown (the transport does not wait for
+            // it), release resources, drop the connection, go to Idle. As for
+            // Hold Timer expiry, restarting later is local policy.
+            FsmInput::SendHoldTimerExpired => self.notify_and_restart(NotificationMessage {
+                error: NotificationError::SendHoldTimerExpired,
+                data: vec![],
+            }),
             FsmInput::ManualStop => {
                 self.state = State::Idle;
                 vec![
@@ -1128,6 +1170,9 @@ mod prop_tests;
 mod update_error_tests;
 
 #[cfg(test)]
+mod send_hold_tests;
+
+#[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
 
@@ -1148,6 +1193,7 @@ mod tests {
             peer_as: Some(65002),
             confederation_member: false,
             public_as: 65001,
+            send_hold_time: crate::fsm::SendHoldTime::default(),
         }
     }
 
@@ -1861,6 +1907,7 @@ mod tests {
             peer_as: Some(131_073),
             confederation_member: false,
             public_as: 131_072,
+            send_hold_time: crate::fsm::SendHoldTime::default(),
         };
         let mut fsm = Fsm::new(config);
         fsm.process(FsmInput::ManualStart);

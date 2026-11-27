@@ -598,6 +598,10 @@ impl DaemonState {
         // - Peer sent a NOTIFICATION (RFC 8538): eligible if BOTH sides negotiated
         //   the N-bit AND the notification is NOT CEASE/HardReset (subcode 9).
         //   Hard Reset always triggers an immediate flush regardless of N-bit.
+        // - Send Hold Timer Expired (RFC 9687): this side generated the
+        //   NOTIFICATION, so eligible only if BOTH sides negotiated the N-bit
+        //   (RFC 8538 §4: "The BGP speaker generating the BGP NOTIFICATION
+        //   message MUST also follow the rules for the Receiving Speaker").
         // - OperatorStop: never eligible — we initiated the teardown.
         //
         // Additional guards: peer must have advertised a non-zero restart_time,
@@ -618,15 +622,16 @@ impl DaemonState {
                 Capability::GracefulRestart { restart_flags, restart_time, .. }
                 if *restart_time > 0 && restart_flags & 0x04 != 0)
         });
+        let n_bit_exchanged =
+            we_have_n_bit && self.gr.notification_capable_peers.contains(&peer_ip);
         let notification_gr_eligible = match &reason {
             TerminationReason::Notification(n) => {
                 use pathvector_session::message::{CeaseError, NotificationError};
                 let is_hard_reset =
                     matches!(&n.error, NotificationError::Cease(CeaseError::HardReset));
-                !is_hard_reset
-                    && we_have_n_bit
-                    && self.gr.notification_capable_peers.contains(&peer_ip)
+                !is_hard_reset && n_bit_exchanged
             }
+            TerminationReason::SendHoldTimerExpired => n_bit_exchanged,
             _ => false,
         };
         let enter_gr = !pending
@@ -949,6 +954,8 @@ pub(super) async fn run_command_processor<H, F, P>(
                         .map_or(DEFAULT_CONNECT_RETRY_TIME, |s| {
                             std::time::Duration::from_secs(u64::from(s))
                         }),
+                    // RFC 9687 §6 RECOMMENDS enabling it without configuration.
+                    send_hold_time: SendHoldTime::RECOMMENDED,
                 };
 
                 // Before the peer can appear in incoming_senders (below).

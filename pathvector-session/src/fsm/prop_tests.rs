@@ -18,6 +18,7 @@ fn default_config() -> FsmConfig {
         peer_as: None,
         confederation_member: false,
         public_as: 65001,
+        send_hold_time: crate::fsm::SendHoldTime::default(),
     }
 }
 

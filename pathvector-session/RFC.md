@@ -100,12 +100,42 @@ keep.
 | §8.2.2 Idle refuses incoming connections | `src/transport/mod.rs` | ✅ | `inbound_connection_in_idle_is_closed` |
 | Keepalive timer fires at ⌊hold-time / 3⌋ seconds | `src/fsm/mod.rs` | ✅ | `test_keepalive_interval_is_third_of_hold_time` |
 | NOTIFICATION sent before session close | `src/fsm/mod.rs` | ✅ | `test_bad_peer_as_sends_notification`, `test_unacceptable_hold_time_sends_notification` |
+| §8.2.2 Events 9–11: expired timers are serviced however much input is ready, whether or not the peer reads and whether or not events are consumed (issue #102) | `src/transport/mod.rs`, `src/transport/schedule.rs` | ✅ | `overdue_keepalive_is_sent_while_updates_stay_ready`, `hold_timer_expires_under_a_flood_of_non_restarting_messages`, `overdue_connect_retry_is_serviced_while_commands_stay_ready`, `hold_timer_runs_while_a_write_is_blocked`, `keepalives_continue_while_the_event_channel_is_full`, `silent_peer_is_timed_out_while_the_event_channel_is_full`; `every_overdue_timer_is_serviced_within_a_bounded_number_of_turns`, `any_interleaving_stays_up_and_converges` (properties) |
+| §8.2.2 Established: sending a KEEPALIVE or UPDATE restarts the KeepaliveTimer | `src/transport/mod.rs` | ✅ | `sending_an_update_restarts_the_keepalive_timer` |
+| §4.4: KEEPALIVEs often enough not to expire the peer's HoldTimer, under load | `src/transport/mod.rs` | ✅ | `flooded_and_control_sessions_both_keep_cadence`, `any_interleaving_stays_up_and_converges` |
+| §8.2.2: a stop takes effect while writes are blocked or events are not being consumed | `src/transport/mod.rs` | ✅ | `terminated_is_emitted_when_the_notification_cannot_be_written`, `stop_takes_effect_while_a_write_is_blocked`, `stop_takes_effect_while_the_event_channel_is_full` |
+| §10: jitter SHOULD be applied to the KeepaliveTimer and ConnectRetryTimer | — | ❌ | — see `TODO.md` |
 | §8.2.2 a teardown completes (routes deleted, state Idle, any restart scheduled) when the NOTIFICATION cannot be written | `src/transport/mod.rs` | ✅ | `failed_notification_write_on_automatic_stop_still_terminates_and_reconnects`, `failed_notification_write_on_hold_expiry_still_terminates_and_reconnects`, `failed_notification_write_on_stop_still_terminates_and_stays_down`, `failed_notification_write_in_open_sent_still_reconnects` |
 | Hold time of 0 disables hold timer and keepalive | `src/fsm/mod.rs` | ✅ | `test_hold_time_zero_disables_timers` |
 | §8.1 ConnectRetry timer is configurable (`SessionConfig.connect_retry_time`); FSM respects value from transport layer | `src/transport/mod.rs` | ✅ | `DEFAULT_CONNECT_RETRY_TIME` constant; exercised by `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` (2 s config) |
 | §8.2.2 Events 27/28 (`UpdateMsg`/`UpdateMsgErr`) are handled by *state* before any RFC 7606 recovery: Idle ignores; Connect/Active stop the ConnectRetryTimer, drop TCP, → Idle; OpenSent/OpenConfirm send Finite State Machine Error (RFC 6608 subcode 1/2, Data = the 1-octet type of the unexpected message, 2 for UPDATE per §4), drop TCP, → Idle — for a normal UPDATE *and* every malformed-UPDATE outcome (session reset, treat-as-withdraw, attribute discard); no route event leaves the session before Established | `src/fsm/mod.rs`, `src/fsm/recovery.rs`, `src/transport/mod.rs` | ✅ | Fixed (issue #98). `rfc4271_8_2_2_idle_ignores_update_and_every_malformed_recovery_outcome`, `rfc4271_8_2_2_connect_and_active_drop_to_idle_on_update_and_every_malformed_outcome`, `rfc4271_8_2_2_open_sent_sends_fsm_error_for_update_and_every_malformed_outcome`, `rfc4271_8_2_2_open_confirm_sends_fsm_error_for_update_and_every_malformed_outcome`, `rfc4271_8_2_2_route_update_is_never_emitted_outside_established`, `rfc6608_4_fsm_error_data_is_the_unexpected_message_type`, `rfc4271_8_2_2_malformed_update_matches_normal_update_before_established` (FSM matrix, `src/fsm/update_error_tests.rs`); real-TCP/real-codec `open_sent_update_of_every_recovery_outcome_is_an_fsm_error_with_no_route_event`, `open_confirm_update_of_every_recovery_outcome_is_an_fsm_error_with_no_route_event` (`tests/malformed_update_fsm.rs`) |
 | §8.2.2 Established Event 27: a recovered (treat-as-withdraw / attribute-discard) UPDATE is processed like any UPDATE and **restarts the HoldTimer** (previously it did not) | `src/fsm/mod.rs` | ✅ | Fixed (issue #98). `rfc7606_2_attribute_discard_is_processed_as_event_27_with_hold_timer_restart`, `rfc7606_2_treat_as_withdraw_emits_withdrawal_and_restarts_hold_timer`; real-TCP `established_recovered_updates_restart_the_hold_timer` |
 | §8.2.2 Established Event 28: a session-reset recovery sends the exact Update-error NOTIFICATION (+ Data), drops TCP, deletes routes (`Terminated(OperatorStop)`) and schedules a reconnect | `src/fsm/mod.rs` | ✅ | `rfc4271_8_2_2_established_session_reset_sends_exact_update_error_and_reconnects`, `rfc7606_5_2_missing_nlri_escalates_to_malformed_attribute_list_reset`, `rfc7606_3_h_session_reset_beats_weaker_errors_in_the_same_update`; real-TCP `established_session_reset_sends_exact_notification_then_reconnects` |
+
+---
+
+## RFC 9687 — Send Hold Timer (updates RFC 4271)
+
+**Owns:** The `SendHoldTime` session attribute, `SendHoldTimer`, Event 29 and NOTIFICATION error code 8.  
+**Datatracker:** https://datatracker.ietf.org/doc/html/rfc9687
+
+| Requirement | File | Status | Verified by |
+|---|---|---|---|
+| §4.1 per-connection `SendHoldTime` | `src/fsm/send_hold.rs`, `SessionConfig::send_hold_time` | ✅ | `configured_send_hold_time_applies` |
+| §4.2 Event 29 `SendHoldTimer_Expires` | `src/fsm/mod.rs` (`FsmInput::SendHoldTimerExpired`) | ✅ | `send_hold_expiry_in_established_notifies_closes_and_goes_idle`, `send_hold_expiry_outside_established_is_ignored` |
+| §4.3 OpenConfirm/Event 26 starts the timer if `SendHoldTime` is non-zero | `src/fsm/mod.rs` | ✅ | `send_hold_timer_starts_on_entering_established_and_not_before` |
+| §4.3 Established/Event 29: log, release resources, drop TCP without waiting for the NOTIFICATION, → Idle | `src/fsm/mod.rs`, `src/transport/mod.rs` | ✅ | `peer_that_stops_reading_is_closed_after_the_default_send_hold_time`, `peer_with_a_closed_window_is_disconnected` (real TCP zero window) |
+| §4.3 each message sent restarts the timer, including each one of a partly written batch; part of a message does not | `src/transport/sink.rs`, `src/transport/link.rs`, `src/transport/mod.rs` | ✅ | `each_message_of_a_partly_written_batch_restarts_the_timer`, `a_message_found_sendable_at_the_deadline_restarts_the_timer`, `due_send_hold_timer_is_restarted_by_one_message_of_several`, `prop_reported_messages_are_exactly_those_fully_written`, `each_completed_send_restarts_the_send_hold_timer`, `healthy_idle_session_never_expires` |
+| §4.3 stopped when `SendHoldTime` or the negotiated `HoldTime` is zero | `src/fsm/send_hold.rs` | ✅ | `send_hold_timer_does_not_run_when_disabled_or_without_a_hold_time`, `zero_hold_time_session_has_no_send_hold_timer`. The OpenConfirm text starts the timer whenever `SendHoldTime` is non-zero; with a zero `HoldTime` there are no KEEPALIVEs to restart it, so it is not started at all |
+| §4.3 stopped on any transition out of Established | `src/fsm/mod.rs` | ✅ | `every_exit_from_established_stops_the_send_hold_timer_first` |
+| §4.4 non-zero `SendHoldTime` MUST exceed `HoldTime` | `src/fsm/send_hold.rs` | ✅ | `configured_value_must_exceed_hold_time`, `a_running_timer_always_exceeds_hold_time` (property) |
+| §5 connection MUST be closed and an error MUST be logged | `src/transport/mod.rs` | ✅ | `send_hold_expiry_logs_an_error_naming_the_error_code` (`tests/send_hold_log.rs`) |
+| §6 enabled by default; default is the greater of 8 minutes and 2 × negotiated `HoldTime` | `src/fsm/send_hold.rs` | ✅ | `recommended_value_is_the_greater_of_8_minutes_and_twice_hold_time`, `default_send_hold_time_follows_the_negotiated_hold_time` |
+| §6/§9 error code 8, subcode 0, no data | `src/message/notification.rs` | ✅ | `test_send_hold_timer_expired_is_code_8_subcode_0_without_data` |
+| §7 SHOULD expose the reason as operational state | `pathvectord/src/metrics.rs` | ✅ | `terminated_reason_is_labeled_correctly` (`reason="send_hold_timer_expired"`) |
+| §4.3 increment `ConnectRetryCounter`, peer oscillation damping | — | ❌ | Neither exists for any event (damping is optional) |
+
+No interoperability test against another implementation has been run for this RFC.
 
 ---
 

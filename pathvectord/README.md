@@ -224,7 +224,7 @@ INFO pathvectord: Prometheus metrics listening on http://0.0.0.0:9179/metrics
 | `pathvectord_bgp_adj_rib_out_prefixes` | Gauge | `peer` | Routes currently advertised to this peer (Adj-RIB-Out size) |
 | `pathvectord_bgp_loc_rib_prefixes` | Gauge | `afi` | Best-path routes in Loc-RIB (`afi=ipv4` or `afi=ipv6`) |
 | `pathvectord_bgp_sessions_established_total` | Counter | `peer` | Number of times this peer reached Established |
-| `pathvectord_bgp_sessions_terminated_total` | Counter | `peer`, `reason` | Session terminations by cause: `unclean`, `notification`, `operator_stop` |
+| `pathvectord_bgp_sessions_terminated_total` | Counter | `peer`, `reason` | Session terminations by cause: `unclean`, `notification`, `operator_stop`, `send_hold_timer_expired` (RFC 9687: nothing could be sent to the peer) |
 | `pathvectord_bgp_updates_received_total` | Counter | `peer` | BGP UPDATE messages received from this peer |
 | `pathvectord_bgp_updates_sent_total` | Counter | `peer` | BGP UPDATE messages sent to this peer |
 | `pathvectord_bgp_originated_routes` | Gauge | `afi` | Routes this daemon self-originates (bypasses import policy; `afi=ipv4` or `afi=ipv6`) |

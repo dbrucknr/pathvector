@@ -2378,6 +2378,12 @@ What remains as optional future work:
 
 ### Remaining
 
+- Timer jitter (RFC 4271 §10 SHOULD): multiply the KeepaliveTimer and ConnectRetryTimer by a fresh random factor in 0.75–1.0 each time they are set (issue #102 audit)
+- `pathvectord` has no `send_hold_time` setting; sessions use the RFC 9687 default. RFC 9687 §6 allows a per-peer value, and `SendHoldTime::from_secs` already validates one
+- RFC 9687 has not been exercised against GoBGP, FRR or BIRD
+- The `SendHoldTimer` counts from the last message the socket accepted in full, so an idle session behind a closed window is only detected once the kernel send buffer fills. `TCP_NOTSENT_LOWAT` or `TCP_USER_TIMEOUT` would tighten this
+- A removed peer's session task never ends: the daemon's forwarding task owns the handle and waits on `next_event`, so the session never sees its command channel close (read from the code during issue #102, not tested)
+- Needs investigation: Hold Timer expiry is reported as `TerminationReason::Unclean`, so GR retention applies without the RFC 8538 N bit even though a NOTIFICATION was sent
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - RFC 9234 strict mode — reject a session at OPEN when only one side advertises the
   Role capability. The RFC makes this optional and non-default (absence on either

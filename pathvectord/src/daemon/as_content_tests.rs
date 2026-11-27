@@ -61,6 +61,7 @@ fn session() -> Fsm {
         required_capabilities: vec![],
         peer_as: Some(AS_A),
         confederation_member: false,
+        send_hold_time: pathvector_session::fsm::SendHoldTime::default(),
     });
     fsm.process(FsmInput::ManualStart);
     fsm.process(FsmInput::TcpConnected);

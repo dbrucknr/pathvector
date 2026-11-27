@@ -25,8 +25,8 @@ use pathvector_session::{
         UpdateMessage, UpdateMsgError, encode_shutdown_message,
     },
     transport::{
-        self, DEFAULT_CONNECT_RETRY_TIME, SessionCommand, SessionConfig, SessionEvent,
-        SessionHandle, TerminationReason,
+        self, DEFAULT_CONNECT_RETRY_TIME, SendHoldTime, SessionCommand, SessionConfig,
+        SessionEvent, SessionHandle, TerminationReason,
         listener::{BgpListener, Inbound, ListenerKeys, ListenerProtection},
         tcp_md5::{KernelTcpMd5, Md5Enforcement, TcpMd5Auth, TcpMd5Port},
     },
@@ -1293,6 +1293,8 @@ where
                 .map_or(DEFAULT_CONNECT_RETRY_TIME, |s| {
                     std::time::Duration::from_secs(u64::from(s))
                 }),
+            // RFC 9687 §6 RECOMMENDS enabling it without configuration.
+            send_hold_time: SendHoldTime::RECOMMENDED,
         };
 
         // The listener key is configured before the peer can appear in
@@ -20455,6 +20457,56 @@ mod test_rfc8538 {
             !state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)),
             "no GR deadline when peer has no N-bit"
         );
+    }
+
+    /// RFC 9687 Send Hold Timer expiry is a NOTIFICATION this side generates.
+    /// RFC 8538 §4: "The BGP speaker generating the BGP NOTIFICATION message
+    /// MUST also follow the rules for the Receiving Speaker" — with the N bit
+    /// exchanged, the peer's routes are retained as stale.
+    #[test]
+    fn send_hold_expiry_with_n_bit_enters_gr_window() {
+        let mut state = make_state();
+        establish(&mut state, &[gr_cap_with_n_bit(120)]);
+        assert_eq!(
+            state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"])),
+            None
+        );
+
+        state.on_terminated(
+            IpAddr::V4(PEER_IP),
+            TerminationReason::SendHoldTimerExpired,
+            false,
+        );
+
+        assert_eq!(state.adj_ribs_in[&IpAddr::V4(PEER_IP)].len(), 1);
+        assert!(state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)));
+    }
+
+    /// Without the N bit it is an ordinary NOTIFICATION teardown (RFC 4271
+    /// §8.2.2, "releases all BGP resources"), not the silent TCP failure
+    /// RFC 4724 §4.2 retains routes for: a peer stuck badly enough to be
+    /// closed must not keep its routes installed.
+    #[test]
+    fn send_hold_expiry_without_n_bit_flushes() {
+        let mut state = make_state();
+        establish(&mut state, &[gr_cap_without_n_bit(120)]);
+        assert_eq!(
+            state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"])),
+            None
+        );
+
+        state.on_terminated(
+            IpAddr::V4(PEER_IP),
+            TerminationReason::SendHoldTimerExpired,
+            false,
+        );
+
+        let adj_len = state
+            .adj_ribs_in
+            .get(&IpAddr::V4(PEER_IP))
+            .map_or(0, pathvector_rib::AdjRibIn::len);
+        assert_eq!(adj_len, 0);
+        assert!(!state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)));
     }
 
     /// OperatorStop must always flush, regardless of GR capability or N-bit.
