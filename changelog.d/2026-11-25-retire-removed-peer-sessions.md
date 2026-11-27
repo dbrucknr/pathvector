@@ -17,11 +17,13 @@ being removed. Its routes stayed in the Loc-RIB with nothing left to withdraw th
 
 - `SessionCommand::Retire` stops a session and ends its task, whoever still holds a sender. The task
   first delivers the NOTIFICATION and every pending event, then `SessionEvent::Retired`.
-- `RemovePeer` sends it after the stop. `Terminated` completes the removal of an Established session
-  as before; `Retired` completes any other, including a peer held down after a max-prefix CEASE.
-- `RemovePeer` takes the session's sender under the same lock that marks the peer. A termination
-  already queued could otherwise complete the removal first, leaving the session never stopped.
-- A peer stays marked for removal while its termination is processed, so no restart window opens.
+- `RemovePeer` sends it after the stop. `Retired`, being the session's last event, is the only one
+  that completes a removal, from any state, including a peer held down after a max-prefix CEASE.
+- Until then the address stays taken and `AddPeer` for it is ignored, so no event of the removed
+  session can be mistaken for one of a later session. A repeated `RemovePeer` does nothing more.
+- `Terminated` for a peer being removed still withdraws its routes at once, and opens no restart
+  window.
+- If the session task has died, `RemovePeer` completes the removal itself.
 
 **API change:** `SessionCommand` has a new `Retire` variant and `SessionEvent` a new `Retired`
 variant.

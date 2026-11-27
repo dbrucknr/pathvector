@@ -913,7 +913,7 @@ pub(super) async fn run_command_processor<H, F, P>(
                 //
                 // Special case: if the peer is present but marked for removal
                 // (`pending_removal`), the teardown hasn't completed yet.  We
-                // still skip the add — the operator must wait for the Terminated
+                // still skip the add — the operator must wait for the Retired
                 // event to clear all per-peer state before re-adding.  A warning
                 // is logged so operators can diagnose a "silent drop" scenario.
                 {
@@ -1001,30 +1001,22 @@ pub(super) async fn run_command_processor<H, F, P>(
             }
 
             DaemonCommand::RemovePeer(peer_ip) => {
-                // Mark for removal so the Terminated handler in the event loop
-                // performs a full state purge instead of a reconnect reset.
-                //
-                // The session's sender is taken under the same write lock: once
-                // the peer is marked, a termination already queued can complete
-                // the removal and drop the map entry at any time, and the
-                // session must still be told to stop and retire.
-                let marked = {
+                // Mark for removal until the session reports `Retired`.
+                // `insert` is false while an earlier removal is outstanding:
+                // that one has told the session already, and its `Retired` is
+                // the one to wait for.
+                let newly_marked = {
                     let mut s = state.write().await;
-                    if s.adj_ribs_in.contains_key(&peer_ip) {
-                        s.pending_removal.insert(peer_ip);
-                        Some((
-                            stop_senders.lock().unwrap().get(&peer_ip).cloned(),
-                            s.shutdown_messages.get(&peer_ip).cloned(),
-                        ))
-                    } else {
-                        None
-                    }
+                    s.adj_ribs_in.contains_key(&peer_ip) && s.pending_removal.insert(peer_ip)
                 };
 
-                let Some((stop_tx, shutdown_reason)) = marked else {
-                    tracing::debug!(peer = %peer_ip, "RemovePeer: not a configured peer, skipping");
+                if !newly_marked {
+                    tracing::debug!(
+                        peer = %peer_ip,
+                        "RemovePeer: not configured or already being removed, skipping"
+                    );
                     continue;
-                };
+                }
 
                 // Stop accepting new inbound connections from this peer, then
                 // take its TCP MD5 key off the listener. In this order the
@@ -1033,8 +1025,7 @@ pub(super) async fn run_command_processor<H, F, P>(
                 incoming_senders.write().await.remove(&peer_ip);
                 remove_listener_key(&listener_keys, peer_ip);
 
-                // Send Cease NOTIFICATION; the session will emit Terminated which
-                // triggers full state cleanup in the event loop.
+                // Send Cease NOTIFICATION.
                 //
                 // If the peer has a configured shutdown_message (RFC 9003), encode it
                 // into the CEASE/AdministrativeShutdown payload instead of bare Stop.
@@ -1042,9 +1033,10 @@ pub(super) async fn run_command_processor<H, F, P>(
                 // Then retire the session, which ends its task and with it the
                 // forwarding task. It first delivers the NOTIFICATION and any
                 // Terminated, and finishes with Retired, which completes the
-                // removal of a session that had nothing to terminate, including
-                // one held down after a max-prefix CEASE.
-                if let Some(tx) = stop_tx {
+                // removal whatever state the session was in.
+                let shutdown_reason = state.read().await.shutdown_messages.get(&peer_ip).cloned();
+                let stop_tx = stop_senders.lock().unwrap().get(&peer_ip).cloned();
+                let retiring = if let Some(tx) = stop_tx {
                     if let Some(reason) = shutdown_reason {
                         let cmd = SessionCommand::Notification(NotificationMessage {
                             error: NotificationError::Cease(CeaseError::AdministrativeShutdown),
@@ -1054,20 +1046,14 @@ pub(super) async fn run_command_processor<H, F, P>(
                     } else {
                         let _ = tx.send(SessionCommand::Stop).await;
                     }
-                    let _ = tx.send(SessionCommand::Retire).await;
+                    tx.send(SessionCommand::Retire).await.is_ok()
                 } else {
-                    // No live session actor (peer is idle / between reconnects and the
-                    // stop sender was dropped).  Synthesize Terminated directly so the
-                    // event loop still performs the pending_removal cleanup path —
-                    // otherwise the peer would be stuck in pending_removal forever.
-                    // Operator-initiated removal with no live session — use
-                    // Clean so on_terminated does not open a GR window.
-                    let _ = event_tx
-                        .send((
-                            peer_ip,
-                            SessionEvent::Terminated(TerminationReason::OperatorStop),
-                        ))
-                        .await;
+                    false
+                };
+                if !retiring {
+                    // No session task is there to report: complete the removal
+                    // from here, or the address would stay taken for good.
+                    let _ = event_tx.send((peer_ip, SessionEvent::Retired)).await;
                 }
                 // stop_senders entry is cleaned up when the event loop completes
                 // the removal.

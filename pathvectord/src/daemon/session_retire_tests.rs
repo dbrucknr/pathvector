@@ -364,99 +364,169 @@ fn state_with_peer() -> Arc<RwLock<DaemonState>> {
     )))
 }
 
-/// A termination already queued when `RemovePeer` arrives can complete the
-/// removal, dropping the daemon's sender, before the command processor has
-/// stopped the session. The session must be stopped and retired all the same.
-#[tokio::test]
-async fn removal_completed_by_a_queued_termination_still_retires_the_session() {
-    let state = state_with_peer();
-    let (session_tx, mut session_rx) = mpsc::channel(8);
-    let stop_senders = stop_map(session_tx);
-    let incoming = Arc::new(RwLock::new(HashMap::new()));
-    let (event_tx, event_rx) = mpsc::channel(8);
-    let (commands, command_rx) = mpsc::channel(4);
-    // Holds the command processor just after it has marked the peer.
-    let hold = incoming.write().await;
-    tokio::spawn(run_command_processor::<Tracked, _, KernelTcpMd5>(
-        command_rx,
-        Arc::clone(&state),
-        Arc::clone(&stop_senders),
-        Arc::clone(&incoming),
-        Arc::new(ListenerKeys::default()),
-        event_tx.clone(),
-        |_| unreachable!("no peer is added"),
-        spawn_config(),
-        None,
-    ));
-    tokio::spawn(run_event_loop(
-        event_rx,
-        Arc::clone(&state),
-        Arc::clone(&stop_senders),
-        None,
-    ));
+/// The command processor over [`state_with_peer`], with the session played by
+/// the test: it reads the commands and sends the events.
+struct Processor {
+    state: Arc<RwLock<DaemonState>>,
+    stop_senders: Arc<Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>>,
+    commands: mpsc::Sender<DaemonCommand>,
+    session_rx: mpsc::Receiver<SessionCommand>,
+    event_tx: mpsc::Sender<(IpAddr, SessionEvent)>,
+    event_rx: mpsc::Receiver<(IpAddr, SessionEvent)>,
+    task: tokio::task::JoinHandle<()>,
+}
 
-    commands
-        .send(DaemonCommand::RemovePeer(PEER_IP))
-        .await
-        .ok()
-        .unwrap();
-    wait_until(&state, |s| s.pending_removal.contains(&PEER_IP)).await;
-    event_tx
-        .send((
-            PEER_IP,
-            SessionEvent::Terminated(TerminationReason::Unclean),
-        ))
-        .await
-        .unwrap();
-    wait_until(&state, |s| !s.adj_ribs_in.contains_key(&PEER_IP)).await;
-    drop(hold);
+impl Processor {
+    fn start(state: Arc<RwLock<DaemonState>>) -> Self {
+        let (session_tx, session_rx) = mpsc::channel(8);
+        let stop_senders = stop_map(session_tx);
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let (commands, command_rx) = mpsc::channel(4);
+        let task = tokio::spawn(run_command_processor::<Tracked, _, KernelTcpMd5>(
+            command_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_senders),
+            Arc::default(),
+            Arc::new(ListenerKeys::default()),
+            event_tx.clone(),
+            |_| panic!("a session was spawned for an address still in use"),
+            spawn_config(),
+            None,
+        ));
+        Self {
+            state,
+            stop_senders,
+            commands,
+            session_rx,
+            event_tx,
+            event_rx,
+            task,
+        }
+    }
 
-    for expected in ["Stop", "Retire"] {
-        let command = tokio::time::timeout(TIMEOUT, session_rx.recv())
-            .await
-            .expect("the session was never told to end")
-            .expect("the command channel closed first");
-        assert_eq!(format!("{command:?}"), expected);
+    async fn send(&self, command: DaemonCommand) {
+        self.commands.send(command).await.ok().unwrap();
+    }
+
+    async fn expect_commands(&mut self, expected: &[&str]) {
+        for expected in expected {
+            let command = tokio::time::timeout(TIMEOUT, self.session_rx.recv())
+                .await
+                .expect("the session was never told to end")
+                .expect("the command channel closed first");
+            assert_eq!(format!("{command:?}"), *expected);
+        }
     }
 }
 
-/// `Retired` from a session whose removal already completed can arrive after
-/// the peer has been added and marked for removal again. The new session has
-/// not ended, so its removal is still outstanding.
+fn establish(s: &mut DaemonState, capabilities: &[Capability]) {
+    s.on_established(
+        PEER_IP,
+        Ipv4Addr::new(10, 0, 0, 2),
+        PeerType::External,
+        65002,
+        90,
+        capabilities,
+        None,
+    );
+}
+
+/// A session's `Retired` follows its `Terminated`, and may still be queued when
+/// the latter is handled. The address must stay taken until then. A session
+/// added in between would receive the old one's `Retired`, and that cannot be
+/// told apart from its own: removing the new session would complete early, with
+/// its events still on the way.
 #[tokio::test]
-async fn late_retired_does_not_complete_a_later_removal() {
+async fn address_stays_taken_until_the_removed_session_is_retired() {
     let state = state_with_peer();
-    state.write().await.pending_removal.insert(PEER_IP);
-    let (replacement_tx, _replacement_rx) = mpsc::channel(8);
-    let stop_senders = stop_map(replacement_tx);
+    establish(&mut *state.write().await, &[]);
+    let mut p = Processor::start(Arc::clone(&state));
+    p.send(DaemonCommand::RemovePeer(PEER_IP)).await;
+    p.expect_commands(&["Stop", "Retire"]).await;
+
     let (event_tx, event_rx) = mpsc::channel(8);
+    tokio::spawn(run_event_loop(
+        event_rx,
+        Arc::clone(&state),
+        Arc::clone(&p.stop_senders),
+        None,
+    ));
+    event_tx
+        .send((
+            PEER_IP,
+            SessionEvent::Terminated(TerminationReason::OperatorStop),
+        ))
+        .await
+        .unwrap();
+    wait_until(&state, |s| !s.rib.peer_types.contains_key(&PEER_IP)).await;
+    {
+        let s = state.read().await;
+        assert!(s.adj_ribs_in.contains_key(&PEER_IP));
+        assert!(s.pending_removal.contains(&PEER_IP));
+    }
+
+    p.send(DaemonCommand::AddPeer(peer_config(179))).await;
+    drop(p.commands);
+    p.task.await.expect("AddPeer was not ignored");
+
     event_tx
         .send((PEER_IP, SessionEvent::Retired))
         .await
         .unwrap();
-    drop(event_tx);
+    wait_until(&state, |s| {
+        !s.adj_ribs_in.contains_key(&PEER_IP) && !s.pending_removal.contains(&PEER_IP)
+    })
+    .await;
+    assert!(p.stop_senders.lock().unwrap().is_empty());
+}
 
-    run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
+/// A retiring session closes its command channel before the daemon has taken
+/// its last events. A second `RemovePeer` then must not complete the removal
+/// ahead of them.
+#[tokio::test]
+async fn repeated_remove_peer_leaves_the_first_removal_to_finish() {
+    let mut p = Processor::start(state_with_peer());
+    p.send(DaemonCommand::RemovePeer(PEER_IP)).await;
+    p.expect_commands(&["Stop", "Retire"]).await;
+    p.session_rx.close();
+
+    p.send(DaemonCommand::RemovePeer(PEER_IP)).await;
+    drop(p.commands);
+    p.task.await.unwrap();
+
+    assert!(p.event_rx.try_recv().is_err(), "an event was made up");
+    assert!(p.state.read().await.pending_removal.contains(&PEER_IP));
+}
+
+/// A session task that has died will report nothing, so `RemovePeer` completes
+/// the removal itself rather than leave the address taken for good.
+#[tokio::test]
+async fn removing_a_peer_whose_session_task_died_completes() {
+    let state = state_with_peer();
+    let mut p = Processor::start(Arc::clone(&state));
+    p.session_rx.close();
+
+    p.send(DaemonCommand::RemovePeer(PEER_IP)).await;
+    drop(p.commands);
+    p.task.await.unwrap();
+    drop(p.event_tx);
+    run_event_loop(p.event_rx, Arc::clone(&state), p.stop_senders, None).await;
 
     let s = state.read().await;
-    assert!(s.adj_ribs_in.contains_key(&PEER_IP));
-    assert!(s.pending_removal.contains(&PEER_IP));
+    assert!(!s.adj_ribs_in.contains_key(&PEER_IP));
+    assert!(!s.pending_removal.contains(&PEER_IP));
 }
 
 /// A Graceful Restart peer's connection can fail just before `RemovePeer`. That
-/// termination completes the removal, and must not open a restart window: the
-/// peer is no longer configured, so nothing would ever withdraw the routes.
+/// termination must not open a restart window for a peer being removed: its
+/// routes are withdrawn at once.
 #[tokio::test]
-async fn removal_completed_by_an_unclean_termination_withdraws_routes() {
+async fn unclean_termination_of_a_peer_being_removed_withdraws_routes() {
     let state = state_with_peer();
     {
         let mut s = state.write().await;
-        s.on_established(
-            PEER_IP,
-            Ipv4Addr::new(10, 0, 0, 2),
-            PeerType::External,
-            65002,
-            90,
+        establish(
+            &mut s,
             &[Capability::GracefulRestart {
                 restart_flags: 0,
                 restart_time: 120,
@@ -465,7 +535,6 @@ async fn removal_completed_by_an_unclean_termination_withdraws_routes() {
                     forwarding_preserved: true,
                 }],
             }],
-            None,
         );
         s.on_route_update(
             PEER_IP,
@@ -497,6 +566,6 @@ async fn removal_completed_by_an_unclean_termination_withdraws_routes() {
     run_event_loop(event_rx, Arc::clone(&state), stop_map(session_tx), None).await;
 
     let s = state.read().await;
-    assert!(!s.adj_ribs_in.contains_key(&PEER_IP));
     assert_eq!(s.rib.loc_rib.len(), 0, "the removed peer's route remains");
+    assert!(s.gr.deadlines.is_empty(), "a restart window opened");
 }

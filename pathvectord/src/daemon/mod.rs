@@ -445,11 +445,11 @@ pub(crate) struct DaemonState {
     /// Per-peer coalescing buffers for outbound IPv6 prefix decisions.
     pub(crate) pending_decisions_v6: HashMap<IpAddr, Vec<PrefixDecisionV6>>,
     /// Peers that have been removed via [`DaemonCommand::RemovePeer`] but whose
-    /// session has not yet sent `Terminated`.
+    /// session has not yet sent `Retired`.
     ///
-    /// When `Terminated` arrives for a peer in this set, the event loop calls
-    /// [`DaemonState::remove_peer`] to erase all per-peer state instead of
-    /// resetting it for a reconnect.
+    /// While a peer is in this set, `Terminated` opens no restart window and
+    /// `AddPeer` for its address is ignored. When `Retired` arrives, the event
+    /// loop calls [`DaemonState::remove_peer`] to erase all per-peer state.
     pub(crate) pending_removal: HashSet<IpAddr>,
     /// RFC 4724 §4.2 GR state: active windows, stale-NLRI snapshots, peer families.
     ///
@@ -1360,14 +1360,22 @@ where
     )
 }
 
-/// Purges a peer that `RemovePeer` marked: its routes, then every piece of
-/// per-peer state, including the command sender.
-fn complete_removal(
+/// Handles one [`SessionEvent::Retired`]: purges a peer that `RemovePeer`
+/// marked — its routes, then every piece of per-peer state, including the
+/// command sender.
+///
+/// Only this event completes a removal, and it is the last one a session
+/// emits. Until it is handled the address stays taken (`AddPeer` is ignored),
+/// so no event of the removed session can be mistaken for one of a later
+/// session at the same address.
+fn handle_session_retired(
     s: &mut DaemonState,
     peer_ip: IpAddr,
-    termination_reason: TerminationReason,
     stop_senders: &Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>,
 ) {
+    if !s.pending_removal.contains(&peer_ip) {
+        return;
+    }
     // Capture identity fields while they are still in the RIB.  on_terminated
     // clears session-level state (peer_types, hold_times, etc.); remove_peer
     // clears everything including peer_remote_as.  Both run below.
@@ -1377,10 +1385,11 @@ fn complete_removal(
         .get(&peer_ip)
         .copied()
         .map(|remote_as| (remote_as, s.rib.local_as));
-    // While `pending_removal` still names the peer, so that no Graceful Restart
-    // window opens. Suppress the intermediate Changed(None) broadcast — the
-    // explicit Removed event below is the authoritative notification.
-    s.on_terminated(peer_ip, termination_reason, false);
+    // For a session that had no `Terminated` to report, such as one that was
+    // between sessions with routes retained.  Suppress the intermediate
+    // Changed(None) broadcast — the explicit Removed event below is the
+    // authoritative notification.
+    s.on_terminated(peer_ip, TerminationReason::OperatorStop, false);
     s.pending_removal.remove(&peer_ip);
     // Permanent removal: erase all per-peer state so the peer no longer
     // appears in gRPC responses and remove the stop sender so no further
@@ -1400,31 +1409,6 @@ fn complete_removal(
                 ..Default::default()
             }),
         });
-    }
-}
-
-/// Handles one [`SessionEvent::Retired`], the last event of a session that
-/// `RemovePeer` discarded.
-///
-/// An Established session reports `Terminated` first, which has already
-/// completed the removal. One that was not Established reports nothing else, so
-/// the removal completes here.
-fn handle_session_retired(
-    s: &mut DaemonState,
-    peer_ip: IpAddr,
-    stop_senders: &Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>,
-) {
-    // The peer may have been added again, and even be pending a second
-    // removal. That session's command channel is still open; the retired one's
-    // is closed.
-    let outstanding = s.pending_removal.contains(&peer_ip)
-        && stop_senders
-            .lock()
-            .unwrap()
-            .get(&peer_ip)
-            .is_none_or(mpsc::Sender::is_closed);
-    if outstanding {
-        complete_removal(s, peer_ip, TerminationReason::OperatorStop, stop_senders);
     }
 }
 
@@ -1464,11 +1448,14 @@ fn handle_session_terminated(
 ) -> Option<CapabilityRefresh> {
     // Recorded before `on_terminated` consumes the reason.
     crate::metrics::on_session_terminated(peer_ip, &termination_reason);
-    if s.pending_removal.contains(&peer_ip) {
-        complete_removal(s, peer_ip, termination_reason, stop_senders);
+    // A peer being removed stays marked until its session's `Retired`: no
+    // restart window opens, and the Removed event that follows is the only
+    // notification.
+    let removing = s.pending_removal.contains(&peer_ip);
+    s.on_terminated(peer_ip, termination_reason, !removing);
+    if removing {
         return None;
     }
-    s.on_terminated(peer_ip, termination_reason, true);
 
     // RFC 4724 §4.2: when re-establishing a session, the Restart State (R) bit
     // "MUST NOT be set unless the Receiving Speaker has restarted". The session
@@ -14379,7 +14366,7 @@ mod event_loop_tests {
     /// Termination of a peer in `pending_removal` must erase all per-peer state
     /// (not just reset it for reconnect).
     #[tokio::test]
-    async fn terminated_with_pending_removal_calls_remove_peer() {
+    async fn retired_removes_a_peer_pending_removal() {
         let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65099)], 8);
 
@@ -14387,7 +14374,7 @@ mod event_loop_tests {
         state.write().await.pending_removal.insert(peer_ip);
 
         let (event_tx, event_rx) = mpsc::channel(4);
-        // Establish then Terminate.
+        // Establish, terminate, retire.
         event_tx
             .send((peer_ip, SessionEvent::Established(established_info(65099))))
             .await
@@ -14399,6 +14386,10 @@ mod event_loop_tests {
             ))
             .await
             .unwrap();
+        event_tx
+            .send((peer_ip, SessionEvent::Retired))
+            .await
+            .unwrap();
         drop(event_tx);
 
         run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
@@ -14407,11 +14398,11 @@ mod event_loop_tests {
         // All per-peer maps must be cleared.
         assert!(
             !s.adj_ribs_in.contains_key(&peer_ip),
-            "adj_ribs_in must be removed after pending_removal Terminated"
+            "adj_ribs_in must be removed after Retired"
         );
         assert!(
             !s.rib.peer_remote_as.contains_key(&peer_ip),
-            "peer_remote_as must be removed after pending_removal Terminated"
+            "peer_remote_as must be removed after Retired"
         );
         assert!(
             !s.pending_removal.contains(&peer_ip),
@@ -14419,11 +14410,11 @@ mod event_loop_tests {
         );
     }
 
-    /// When RemovePeer is issued but the stop sender is absent (session already
-    /// exited between reconnects), the command processor must synthesize a
-    /// Terminated event so the pending_removal cleanup still runs.
+    /// When RemovePeer is issued but the stop sender is absent, the command
+    /// processor must synthesize a Retired event so the pending_removal cleanup
+    /// still runs.
     #[tokio::test]
-    async fn remove_peer_synthesizes_terminated_when_no_stop_sender() {
+    async fn remove_peer_synthesizes_retired_when_no_stop_sender() {
         // A SessionHandle stub that is never actually spawned — RemovePeer does
         // not call spawn_fn, so we just need any type that satisfies the bound.
         struct NeverSpawned;
@@ -14495,14 +14486,14 @@ mod event_loop_tests {
         // Drop our own event_tx so the event loop terminates after draining.
         drop(event_tx);
 
-        // The command processor should have synthesized Terminated; run the event
+        // The command processor should have synthesized Retired; run the event
         // loop to consume it and complete the cleanup.
         run_event_loop(event_rx, Arc::clone(&state), empty_stop_senders, None).await;
 
         let s = state.read().await;
         assert!(
             !s.adj_ribs_in.contains_key(&peer_ip),
-            "adj_ribs_in must be cleared after synthesized Terminated"
+            "adj_ribs_in must be cleared after synthesized Retired"
         );
         assert!(
             !s.pending_removal.contains(&peer_ip),
@@ -14544,58 +14535,28 @@ mod event_loop_tests {
         );
     }
 
-    /// A second `Terminated` event for a peer that has already been fully
-    /// removed (via `pending_removal`) must be a no-op — it must not panic
-    /// or corrupt any state.
-    ///
-    /// This covers the window where both a natural TCP-disconnect `Terminated`
-    /// and a synthesized `Terminated` from `RemovePeer` arrive for the same
-    /// peer: the first one runs cleanup, the second one finds empty maps and
-    /// returns silently.
+    /// `Retired` completes only a removal that `RemovePeer` asked for.
     #[tokio::test]
-    async fn double_terminated_second_is_no_op() {
+    async fn retired_without_pending_removal_keeps_peer_state() {
         let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let (state, _rxs, stop_senders) = make_state(&[(peer_ip, 65099)], 8);
 
-        state.write().await.pending_removal.insert(peer_ip);
-
-        let (event_tx, event_rx) = mpsc::channel(8);
-        // First Terminated — runs cleanup (routes cleared, remove_peer called).
+        let (event_tx, event_rx) = mpsc::channel(4);
         event_tx
-            .send((
-                peer_ip,
-                SessionEvent::Terminated(TerminationReason::Unclean),
-            ))
-            .await
-            .unwrap();
-        // Second Terminated — must be a no-op (maps already gone).
-        event_tx
-            .send((
-                peer_ip,
-                SessionEvent::Terminated(TerminationReason::Unclean),
-            ))
+            .send((peer_ip, SessionEvent::Retired))
             .await
             .unwrap();
         drop(event_tx);
 
-        // Must complete without panicking.
         run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
 
-        let s = state.read().await;
-        assert!(
-            !s.adj_ribs_in.contains_key(&peer_ip),
-            "peer must be absent after double-Terminated with pending_removal"
-        );
-        assert!(
-            !s.pending_removal.contains(&peer_ip),
-            "pending_removal must be cleared after first Terminated"
-        );
+        assert!(state.read().await.adj_ribs_in.contains_key(&peer_ip));
     }
 
     /// `AddPeer` while the peer is in `pending_removal` must be silently
     /// dropped — the spawn function must never be called.
     ///
-    /// The operator must wait until the Terminated event clears all per-peer
+    /// The operator must wait until the Retired event clears all per-peer
     /// state before re-adding the peer.
     #[tokio::test]
     async fn add_peer_while_pending_removal_is_dropped() {
@@ -15164,16 +15125,16 @@ mod event_loop_tests {
 
     // ── Removed broadcast correctness ─────────────────────────────────────────
 
-    /// When a peer in `pending_removal` receives `Terminated`, the event loop
-    /// must broadcast exactly **one** `Removed` event on `peer_tx` and it must
-    /// carry the correct `remote_as` and `local_as` captured before the state
-    /// was erased.
+    /// Over the `Terminated` and `Retired` of a peer in `pending_removal`, the
+    /// event loop must broadcast exactly **one** event on `peer_tx`, `Removed`,
+    /// and it must carry the correct `remote_as` and `local_as` captured before
+    /// the state was erased.
     ///
     /// This is the critical regression test for the fix that replaced the
     /// diff-based approach (which emitted `remote_as: 0`) with capturing
     /// identity fields before `on_terminated` / `remove_peer` run.
     #[tokio::test]
-    async fn terminated_with_pending_removal_broadcasts_removed_event_with_correct_fields() {
+    async fn removal_broadcasts_one_removed_event_with_correct_fields() {
         let peer_ip: IpAddr = "10.0.0.5".parse().unwrap();
         let remote_as = 65099_u32;
         let local_as = 65001_u32;
@@ -15192,6 +15153,10 @@ mod event_loop_tests {
             ))
             .await
             .unwrap();
+        event_tx
+            .send((peer_ip, SessionEvent::Retired))
+            .await
+            .unwrap();
         drop(event_tx);
 
         run_event_loop(event_rx, Arc::clone(&state), stop_senders, None).await;
@@ -15206,7 +15171,7 @@ mod event_loop_tests {
         assert_eq!(
             events.len(),
             1,
-            "exactly one peer_tx event must fire for a pending_removal Terminated; got {events:?}"
+            "exactly one peer_tx event must fire for a removal; got {events:?}"
         );
 
         let ev = &events[0];
