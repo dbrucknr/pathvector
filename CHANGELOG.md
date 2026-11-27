@@ -4,6 +4,25 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-25 (pathvector-policy: prefix matching with per-entry length windows — part of issue #84)
+
+`PrefixListCondition` answers an address-coverage question through an `IpSet`, which merges
+adjacent ranges and carries no prefix length, so it cannot express exact, or-longer or
+bounded-length matching.
+
+- **New: `PrefixMatchCondition`.** It matches when any of its entries does. Each entry is an
+  `ipnetx::prefix_match::PrefixMatch`: one prefix with its own length window (`exact`,
+  `or_longer`, or `new(prefix, min, max)`). Entries are never merged, so one entry's bounds
+  never apply to another's prefix.
+- **Entry rules come from `ipnetx`:** `prefix length <= min <= max <= address width`, with
+  host bits normalized. An empty list matches nothing.
+- **Dependency:** the workspace now requires `ipnetx` 0.3.1, which adds `prefix_match`. The
+  release is additive over 0.3.0.
+- **Unchanged:** `PrefixListCondition` keeps its whole-range union semantics.
+- **Not included:** And/Or combinators (the rest of issue #84) and any daemon configuration.
+
+---
+
 ## 2026-11-25 (outbound UPDATE ordering — issue #159)
 
 ### Fixes

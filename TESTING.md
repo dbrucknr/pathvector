@@ -181,6 +181,7 @@ failing cases to the smallest reproducing input automatically.
 | `ActionSequence` with Accept terminates with Accept | Compound actions must respect terminal decisions |
 | `prop_policy_evaluation_is_deterministic` | Same input always produces the same decision |
 | `prop_first_match_wins_accept_blocks_later_reject` | A matched Accept never passes to a later Reject term |
+| `prop_prefix_match_condition_v4_is_any_of_its_entries` / `_v6_` | The condition is the union of its entries, in any order |
 
 ### `pathvector-rib`
 
@@ -858,6 +859,8 @@ cargo llvm-cov -p pathvector-policy --show-missing-lines
 - `PrefixListCondition` specificity: a less-specific route does NOT match a list
   containing only a more-specific entry (`10.0.0.0/8` does not match a list with
   `10.1.0.0/24`).
+- `PrefixMatchCondition` does not merge adjacent entries: two `/25` entries never match
+  their `/24`, and one entry's length window never applies to another entry's prefix.
 - `CompareOp::Equal` and `CompareOp::NotEqual` inside `LocalPrefCondition` and
   `MedCondition` — not just `GreaterOrEqual` and `LessThan`.
 - `LocalPref(0)` and `Med(u32::MAX)` as boundary values.

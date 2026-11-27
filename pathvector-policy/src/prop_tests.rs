@@ -1,5 +1,6 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
+use ipnetx::{prefix::IpPrefix, prefix_match::PrefixMatch};
 use pathvector_types::{AsPath, Asn, Community, LocalPref, Med, Nlri, Origin};
 use proptest::prelude::*;
 
@@ -10,6 +11,7 @@ use crate::{
     },
     condition::{AnyCondition, CommunityCondition, Condition},
     outcome::{Decision, DefaultAction},
+    prefix_match::PrefixMatchCondition,
     route::BgpRoute,
     term::{Policy, PolicyBuilder, Term},
     testutil::TestRoute,
@@ -301,3 +303,57 @@ proptest! {
         prop_assert_eq!(seq.apply(&mut route), Decision::Reject);
     }
 }
+
+// ── PrefixMatchCondition ────────────────────────────────────────────────────
+//
+// What one entry accepts is tested in `ipnetx`. These check that the condition
+// is exactly the union of its entries, whatever their order.
+
+macro_rules! prefix_match_condition_props {
+    ($name:ident, $addr:ty, $int:ty, $width:expr) => {
+        proptest! {
+            #[test]
+            fn $name(
+                base in any::<$int>(),
+                // Sorted lengths give a valid entry; the flag moves some
+                // entries off the route's address so they cannot cover it.
+                specs in proptest::collection::vec(
+                    (proptest::array::uniform3(0u8..=$width), any::<bool>()),
+                    0..6,
+                ),
+                route_len in 0u8..=$width,
+            ) {
+                let prefix = |bits: $int, len| IpPrefix::new(<$addr>::from(bits), len).unwrap();
+                let entries: Vec<_> = specs
+                    .into_iter()
+                    .map(|(mut lens, elsewhere)| {
+                        lens.sort_unstable();
+                        let [len, min, max] = lens;
+                        let bits = if elsewhere { !base } else { base };
+                        PrefixMatch::new(prefix(bits, len), min, max).unwrap()
+                    })
+                    .collect();
+                let route = prefix(base, route_len);
+
+                let expected = entries.iter().any(|e| e.matches(route));
+                let reversed = PrefixMatchCondition::new(entries.iter().rev().copied());
+                let forward = PrefixMatchCondition::new(entries);
+                prop_assert_eq!(forward.matches_prefix(route), expected);
+                prop_assert_eq!(reversed.matches_prefix(route), expected);
+            }
+        }
+    };
+}
+
+prefix_match_condition_props!(
+    prop_prefix_match_condition_v4_is_any_of_its_entries,
+    Ipv4Addr,
+    u32,
+    32
+);
+prefix_match_condition_props!(
+    prop_prefix_match_condition_v6_is_any_of_its_entries,
+    Ipv6Addr,
+    u128,
+    128
+);
