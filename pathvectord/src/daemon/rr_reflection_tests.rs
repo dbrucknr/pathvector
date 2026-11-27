@@ -443,24 +443,29 @@ fn table_dump_from_a_reflector_carries_the_reflection_attributes() {
 /// When the best path moves to another client, even with otherwise identical
 /// attributes, the replacement carries the new originator and the local
 /// CLUSTER_ID exactly once. Covers the re-advertisement on session loss.
-///
-/// IPv4 only: IPv6 re-advertisement on session loss is issue #160.
 #[test]
 fn replacement_after_session_loss_carries_the_new_originator() {
-    let (mut state, mut rxs) = rr_setup();
-    state.on_route_update(IpAddr::V4(CLIENT), announce(Family::V4));
-    state.on_route_update(IpAddr::V4(CLIENT_2), announce(Family::V4));
-    // RFC 4271 §9.1.2.2 (f): CLIENT's identifier is lower.
-    let msg = advertised_to(&mut state, &mut rxs, NON_CLIENT, Family::V4);
-    assert_eq!(rr_attrs_of(&msg), (Some(CLIENT_ID), Some(vec![CLUSTER_ID])));
+    for family in FAMILIES {
+        let (mut state, mut rxs) = rr_setup();
+        state.on_route_update(IpAddr::V4(CLIENT), announce(family));
+        state.on_route_update(IpAddr::V4(CLIENT_2), announce(family));
+        // RFC 4271 §9.1.2.2 (f): CLIENT's identifier is lower.
+        let msg = advertised_to(&mut state, &mut rxs, NON_CLIENT, family);
+        assert_eq!(
+            rr_attrs_of(&msg),
+            (Some(CLIENT_ID), Some(vec![CLUSTER_ID])),
+            "{family:?}"
+        );
 
-    state.on_terminated(IpAddr::V4(CLIENT), TerminationReason::Unclean, true);
+        state.on_terminated(IpAddr::V4(CLIENT), TerminationReason::Unclean, true);
 
-    let msg = advertised_to(&mut state, &mut rxs, NON_CLIENT, Family::V4);
-    assert_eq!(
-        rr_attrs_of(&msg),
-        (Some(CLIENT_2_ID), Some(vec![CLUSTER_ID]))
-    );
+        let msg = advertised_to(&mut state, &mut rxs, NON_CLIENT, family);
+        assert_eq!(
+            rr_attrs_of(&msg),
+            (Some(CLIENT_2_ID), Some(vec![CLUSTER_ID])),
+            "{family:?}"
+        );
+    }
 }
 
 /// The Adj-RIB-Out holds the route as advertised, so selecting it again sends
