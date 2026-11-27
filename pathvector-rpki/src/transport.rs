@@ -24,7 +24,7 @@ const READ_CHUNK: usize = 16 * 1024;
 pub(crate) enum ReadError {
     /// The connection failed or closed; there is nobody to report to.
     Transport(RtrError),
-    /// The peer sent bytes that are not a legal PDU.
+    /// The peer sent bytes that cannot be decoded.
     Malformed(FrameError),
 }
 
@@ -76,6 +76,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             }
             self.decoder.push(&self.chunk[..n]);
         }
+    }
+
+    /// Steps over a PDU [`read_frame`](Self::read_frame) rejected that the
+    /// protocol says to ignore.
+    pub(crate) fn skip(&mut self, rejected: &FrameError) {
+        self.decoder.skip(rejected);
     }
 
     /// Sends one PDU.

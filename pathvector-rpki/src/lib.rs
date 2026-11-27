@@ -17,9 +17,12 @@
 //! the crate README for the details and the cost of staging.
 //!
 //! Input handling: PDUs are delimited by their Length field however the bytes arrive, and
-//! a partly received PDU survives the refresh timer. A Prefix PDU outside the bounds of
-//! RFC 8210 §§5.1, 5.6 and 5.7 is answered with Error Report 0 ("Corrupt Data") and ends
-//! the session without publishing any of that transfer.
+//! a partly received PDU survives the refresh timer. A PDU that cannot be accepted — an
+//! unknown type or protocol version, a wrong Length, or prefix lengths outside RFC 8210
+//! §§5.1, 5.6 and 5.7 — is answered with the matching §12 Error Report (never when it is
+//! itself an Error Report, §5.11) and ends the session without publishing any of that
+//! transfer. The one exception: a Serial Notify of an unknown version during version
+//! negotiation is ignored (§7).
 
 mod cache;
 mod client;

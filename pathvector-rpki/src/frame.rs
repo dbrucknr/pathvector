@@ -11,6 +11,15 @@
 //! branch losing to the refresh timer) cannot lose bytes. The socket side
 //! lives in `transport.rs`.
 //!
+//! # PDUs that cannot be decoded
+//!
+//! A header with an impossible Length is refused as soon as it arrives. One
+//! whose Protocol Version or PDU Type is unrecognised still has a Length to
+//! delimit it, so the refusal waits for the whole PDU: the Error Report must
+//! echo it, and RFC 8210 §5.11 allows truncating that echo only for an
+//! excessive or possibly corrupt length. What to do about a [`FrameError`] is
+//! `protocol.rs`'s decision.
+//!
 //! # Memory bound
 //!
 //! A header declaring more than [`MAX_PDU_LEN`] is rejected as soon as its 8
@@ -21,7 +30,7 @@
 
 use crate::{
     error::PduError,
-    pdu::{self, Pdu, RtrVersion},
+    pdu::{self, Pdu, PduType, RtrVersion},
 };
 
 /// Size of the fixed header every PDU starts with.
@@ -46,16 +55,38 @@ pub(crate) struct Frame {
     pub(crate) raw: Vec<u8>,
 }
 
-/// The stream does not contain a well-formed PDU at this point.
+/// The stream does not contain a decodable PDU at this point.
 ///
-/// There is no way to resynchronise a length-delimited stream after this, so
-/// the session has to end.
+/// The decoder does not move past it by itself. Unless the protocol says to
+/// ignore that PDU ([`FrameDecoder::skip`]), the session has to end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FrameError {
     pub(crate) error: PduError,
     /// The offending bytes: the whole PDU if its length was usable, otherwise
-    /// just the header.
+    /// just the header. Never shorter than [`HEADER_LEN`].
     pub(crate) raw: Vec<u8>,
+}
+
+impl FrameError {
+    /// The PDU's Protocol Version, if it is one this client speaks.
+    pub(crate) fn version(&self) -> Option<RtrVersion> {
+        RtrVersion::from_byte(*self.raw.first()?).ok()
+    }
+
+    /// Whether the PDU Type byte says Error Report, however broken the rest
+    /// is.
+    pub(crate) fn is_error_report(&self) -> bool {
+        self.raw.get(1) == Some(&(PduType::ErrorReport as u8))
+    }
+
+    /// Whether this is a complete, correctly sized Serial Notify in a Protocol
+    /// Version this client does not know. Only the version stopped it being
+    /// decoded.
+    pub(crate) fn is_serial_notify_of_unknown_version(&self) -> bool {
+        matches!(self.error, PduError::UnknownVersion(_))
+            && self.raw.get(1) == Some(&(PduType::SerialNotify as u8))
+            && self.raw.len() == pdu::LEN_SERIAL_NOTIFY as usize
+    }
 }
 
 /// Reassembles PDUs from arbitrarily segmented input.
@@ -100,19 +131,22 @@ impl FrameDecoder {
         let Some(header) = pending.get(..HEADER_LEN) else {
             return HEADER_LEN - pending.len();
         };
-        match check_header(header) {
-            Ok(header) => header.len.saturating_sub(pending.len()),
-            Err(_) => 0,
-        }
+        let len = match check_header(header) {
+            Ok(header) => header.len,
+            Err(error) => delimited_len(&error, header).unwrap_or(0),
+        };
+        len.saturating_sub(pending.len())
     }
 
     /// Takes the next complete PDU, or `Ok(None)` if more bytes are needed.
     ///
     /// # Errors
     ///
-    /// [`FrameError`] as soon as the bytes received so far cannot be a legal
-    /// PDU — for a bad header, without waiting for the body. Nothing is
-    /// consumed, so every later call reports the same error.
+    /// [`FrameError`] as soon as the bytes received so far cannot be a PDU
+    /// this client decodes — for an impossible Length, without waiting for the
+    /// body; for an unrecognised version or type, once the declared PDU is
+    /// complete (see the module docs). Nothing is consumed, so every later
+    /// call reports the same error until [`skip`](Self::skip).
     pub(crate) fn next_frame(&mut self) -> Result<Option<Frame>, FrameError> {
         let pending = self.pending();
         let Some(header) = pending.get(..HEADER_LEN) else {
@@ -123,10 +157,19 @@ impl FrameDecoder {
             pdu_type,
             field,
             len,
-        } = check_header(header).map_err(|error| FrameError {
-            error,
-            raw: header.to_vec(),
-        })?;
+        } = match check_header(header) {
+            Ok(header) => header,
+            Err(error) => {
+                let len = delimited_len(&error, header).unwrap_or(HEADER_LEN);
+                return match pending.get(..len) {
+                    Some(raw) => Err(FrameError {
+                        error,
+                        raw: raw.to_vec(),
+                    }),
+                    None => Ok(None),
+                };
+            }
+        };
         let Some(raw) = pending.get(..len) else {
             return Ok(None);
         };
@@ -140,6 +183,14 @@ impl FrameDecoder {
             Err(error) => Err(FrameError { error, raw }),
         }
     }
+
+    /// Steps over a PDU that [`next_frame`](Self::next_frame) has just refused
+    /// but that the protocol says to ignore. `rejected` must hold the whole
+    /// PDU, as it does whenever the Length was usable.
+    pub(crate) fn skip(&mut self, rejected: &FrameError) {
+        debug_assert!(self.pending().starts_with(&rejected.raw));
+        self.consumed += rejected.raw.len();
+    }
 }
 
 struct Header {
@@ -148,6 +199,22 @@ struct Header {
     field: u16,
     /// Within `HEADER_LEN..=MAX_PDU_LEN`.
     len: usize,
+}
+
+/// The size of a PDU whose header was refused only for its Protocol Version or
+/// PDU Type, if its Length field can delimit it.
+fn delimited_len(error: &PduError, header: &[u8]) -> Option<usize> {
+    if !matches!(
+        error,
+        PduError::UnknownVersion(_) | PduError::UnknownPduType(_)
+    ) {
+        return None;
+    }
+    let len = u32::from_be_bytes(header.get(4..HEADER_LEN)?.try_into().ok()?);
+    let len = usize::try_from(len).ok()?;
+    (HEADER_LEN..=MAX_PDU_LEN as usize)
+        .contains(&len)
+        .then_some(len)
 }
 
 /// Decodes a header and rejects a Length no PDU can have.
@@ -385,6 +452,101 @@ mod tests {
         assert_eq!(first.error, PduError::UnknownPduType(5));
         assert_eq!(frames.len(), 1);
         assert_eq!(decoder.next_frame(), Err(first));
+    }
+
+    /// An unrecognised version or type does not stop the Length field
+    /// delimiting the PDU: it is refused only once it is whole, so that all of
+    /// it can be echoed.
+    #[test]
+    fn an_unrecognised_pdu_is_delimited_by_its_length_before_it_is_refused() {
+        for (bytes, expected) in [
+            (
+                [2, 3, 0, 1, 0, 0, 0, 10, 0xaa, 0xbb],
+                PduError::UnknownVersion(2),
+            ),
+            (
+                [1, 11, 0, 1, 0, 0, 0, 10, 0xaa, 0xbb],
+                PduError::UnknownPduType(11),
+            ),
+        ] {
+            let mut decoder = FrameDecoder::new();
+            decoder.push(&bytes[..HEADER_LEN]);
+            assert_eq!(decoder.next_frame(), Ok(None), "waits for the body");
+            assert_eq!(decoder.needed(), bytes.len() - HEADER_LEN);
+            decoder.push(&bytes[HEADER_LEN..]);
+            assert_eq!(
+                decoder.next_frame(),
+                Err(FrameError {
+                    error: expected,
+                    raw: bytes.to_vec(),
+                })
+            );
+        }
+    }
+
+    /// A Length that cannot delimit anything is not waited for.
+    #[test]
+    fn an_unrecognised_pdu_with_an_impossible_length_is_refused_from_the_header() {
+        for len in [0, 7, MAX_PDU_LEN + 1, u32::MAX] {
+            let mut header = vec![2, 3, 0, 0];
+            header.extend_from_slice(&len.to_be_bytes());
+            let mut decoder = FrameDecoder::new();
+            decoder.push(&header);
+            assert_eq!(decoder.needed(), 0);
+            assert_eq!(
+                decoder.next_frame(),
+                Err(FrameError {
+                    error: PduError::UnknownVersion(2),
+                    raw: header,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_skipped_pdu_is_followed_by_the_next_one() {
+        let mut stream = vec![2, 0, 0, 7, 0, 0, 0, 12, 0, 0, 0, 1];
+        stream.extend(notify(2));
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&stream);
+        let rejected = decoder.next_frame().unwrap_err();
+        assert!(rejected.is_serial_notify_of_unknown_version());
+        decoder.skip(&rejected);
+        assert_eq!(decoder.next_frame().unwrap().unwrap().raw, notify(2));
+        assert_eq!(decoder.buffered(), 0);
+    }
+
+    /// What [`FrameError`] says about the refused header.
+    #[test]
+    fn a_frame_error_describes_the_refused_header() {
+        let refused = |bytes: &[u8]| {
+            let mut decoder = FrameDecoder::new();
+            decoder.push(bytes);
+            decoder.next_frame().unwrap_err()
+        };
+        // Error Reports stay Error Reports however they are broken.
+        for report in [
+            &[2, 10, 0, 0, 0, 0, 0, 8][..],
+            &[1, 10, 0, 0, 0, 0, 0, 7],
+            &[1, 10, 0, 0, 0, 0, 0, 8],
+        ] {
+            assert!(refused(report).is_error_report(), "{report:?}");
+        }
+        let unknown_type = refused(&[0, 5, 0, 0, 0, 0, 0, 8]);
+        assert!(!unknown_type.is_error_report());
+        assert_eq!(unknown_type.version(), Some(RtrVersion::V0));
+        assert_eq!(refused(&[9, 5, 0, 0, 0, 0, 0, 8]).version(), None);
+        // Only a 12-byte Serial Notify of an unknown version qualifies.
+        for other in [
+            &[2, 0, 0, 0, 0, 0, 0, 8][..],
+            &[2, 3, 0, 0, 0, 0, 0, 12, 0, 0, 0, 1],
+            &[1, 0, 0, 0, 0, 0, 0, 8],
+        ] {
+            assert!(
+                !refused(other).is_serial_notify_of_unknown_version(),
+                "{other:?}"
+            );
+        }
     }
 
     /// Chunk boundaries as sizes to cut off the front of the stream.
