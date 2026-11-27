@@ -16,9 +16,11 @@ use tokio::sync::{RwLock, mpsc, watch};
 use super::{DaemonState, MRAI};
 
 mod batch;
+mod forward;
 mod session_control;
 mod timers;
 
+pub(super) use forward::forward_events;
 #[cfg(test)]
 pub(super) use session_control::handle_session_terminated;
 

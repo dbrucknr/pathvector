@@ -23,7 +23,7 @@ use super::{
         warn_if_md5_best_effort,
     },
     deferral::SelectionDeferral,
-    event_loop::run_event_loop,
+    event_loop::{forward_events, run_event_loop},
     fib::withdraw_stale_bgp_routes,
     peer::{run_bgp_listener, run_command_processor},
     peering::{
@@ -408,7 +408,7 @@ where
             set_listener_key(&md5_passwords, peer.address, auth);
         }
 
-        let mut handle = spawn_fn(session_cfg);
+        let handle = spawn_fn(session_cfg);
         handle.start().await;
 
         update_senders.insert(peer.address, handle.update_sender());
@@ -420,15 +420,7 @@ where
             .write()
             .await
             .insert(peer.address, handle.incoming_sender());
-        let peer_addr = peer.address;
-        let tx = event_tx.clone();
-        tokio::spawn(async move {
-            while let Some(event) = handle.next_event().await {
-                if tx.send((peer_addr, event)).await.is_err() {
-                    break;
-                }
-            }
-        });
+        tokio::spawn(forward_events(handle, peer.address, event_tx.clone()));
     }
     // Keep a clone of event_tx alive; the caller returns it so the command
     // processor can forward events from dynamically added sessions.  The

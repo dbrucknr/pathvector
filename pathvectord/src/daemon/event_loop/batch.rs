@@ -12,8 +12,8 @@ use tokio::sync::{RwLock, mpsc};
 use super::{
     StopSenders,
     session_control::{
-        CapabilityRefresh, automatic_stop, handle_session_terminated, hold_down, route_reset,
-        send_to_session,
+        CapabilityRefresh, automatic_stop, handle_session_retired, handle_session_terminated,
+        hold_down, route_reset, send_to_session,
     },
 };
 use crate::daemon::DaemonState;
@@ -88,6 +88,15 @@ pub(super) async fn on_session_events(
             if let Some(refresh) = refresh {
                 refresh.send().await;
             }
+            return;
+        }
+        SessionEvent::Retired => {
+            handle_session_retired(&mut s, peer_ip, stop_senders);
+            crate::metrics::update_rib_sizes(
+                s.rib.loc_rib.len(),
+                s.rib.loc_rib_v6.len(),
+                &s.rib.prefixes_advertised,
+            );
             return;
         }
         SessionEvent::RouteUpdate(msg) => {
@@ -197,6 +206,9 @@ async fn drain_and_flush(
                     termination_reason,
                     stop_senders,
                 ));
+            }
+            SessionEvent::Retired => {
+                handle_session_retired(&mut s, extra_ip, stop_senders);
             }
             SessionEvent::RouteUpdate(msg) => {
                 // See the primary RouteUpdate arm above: this only

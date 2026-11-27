@@ -16,6 +16,61 @@ use crate::daemon::{
 };
 use crate::proto;
 
+/// Handles one [`SessionEvent::Retired`](pathvector_session::transport::SessionEvent::Retired):
+/// purges a peer that `RemovePeer` marked — its routes, then every piece of
+/// per-peer state, including the command sender.
+///
+/// Only this event completes a removal, and it is the last one a session
+/// emits. Until it is handled the address stays taken (`AddPeer` is ignored),
+/// so no event of the removed session can be mistaken for one of a later
+/// session at the same address.
+pub(super) fn handle_session_retired(
+    s: &mut DaemonState,
+    peer_ip: IpAddr,
+    stop_senders: &StopSenders,
+) {
+    if !s.pending_removal.contains(&peer_ip) {
+        // The session task died by itself, and this was the last event from it.
+        // Without a sender, `RemovePeer` knows to complete the removal itself.
+        stop_senders.lock().unwrap().remove(&peer_ip);
+        return;
+    }
+    // Capture identity fields while they are still in the RIB.  on_terminated
+    // clears session-level state (peer_types, hold_times, etc.); remove_peer
+    // clears everything including peer_remote_as.  Both run below.
+    let removal_identity = s
+        .rib
+        .peer_remote_as
+        .get(&peer_ip)
+        .copied()
+        .map(|remote_as| (remote_as, s.rib.local_as));
+    // For a session that had no `Terminated` to report, such as one that was
+    // between sessions with routes retained.  Suppress the intermediate
+    // Changed(None) broadcast — the explicit Removed event below is the
+    // authoritative notification.
+    s.on_terminated(peer_ip, TerminationReason::OperatorStop, false);
+    s.pending_removal.remove(&peer_ip);
+    // Permanent removal: erase all per-peer state so the peer no longer
+    // appears in gRPC responses and remove the stop sender so no further
+    // commands can be sent to this session.
+    s.remove_peer(peer_ip);
+    stop_senders.lock().unwrap().remove(&peer_ip);
+    // Broadcast a Removed event carrying the last-known remote_as and
+    // local_as so watch_peers subscribers can identify the removed peer
+    // without re-reading a snapshot that no longer contains it.
+    if let Some((remote_as, local_as)) = removal_identity {
+        let _ = s.peer_tx.send(proto::PeerEvent {
+            r#type: proto::PeerEventType::Removed as i32,
+            peer: Some(proto::PeerState {
+                address: peer_ip.to_string(),
+                remote_as,
+                local_as,
+                ..Default::default()
+            }),
+        });
+    }
+}
+
 /// A [`SessionCommand::SetCapabilities`] owed to a session whose teardown has
 /// just been processed.
 ///
@@ -50,45 +105,14 @@ pub(in crate::daemon) fn handle_session_terminated(
     termination_reason: TerminationReason,
     stop_senders: &StopSenders,
 ) -> Option<CapabilityRefresh> {
-    let is_removed = s.pending_removal.remove(&peer_ip);
-    // Capture identity fields while they are still in the RIB.  on_terminated
-    // clears session-level state (peer_types, hold_times, etc.); remove_peer
-    // clears everything including peer_remote_as.  Both run below.
-    let removal_identity = if is_removed {
-        s.rib
-            .peer_remote_as
-            .get(&peer_ip)
-            .copied()
-            .map(|remote_as| (remote_as, s.rib.local_as))
-    } else {
-        None
-    };
     // Recorded before `on_terminated` consumes the reason.
     crate::metrics::on_session_terminated(peer_ip, &termination_reason);
-    // For removal, suppress the intermediate Changed(None) broadcast — the
-    // explicit Removed event below is the authoritative notification.
-    s.on_terminated(peer_ip, termination_reason, !is_removed);
-
-    if is_removed {
-        // Permanent removal: erase all per-peer state so the peer no longer
-        // appears in gRPC responses and remove the stop sender so no further
-        // commands can be sent to this session.
-        s.remove_peer(peer_ip);
-        stop_senders.lock().unwrap().remove(&peer_ip);
-        // Broadcast a Removed event carrying the last-known remote_as and
-        // local_as so watch_peers subscribers can identify the removed peer
-        // without re-reading a snapshot that no longer contains it.
-        if let Some((remote_as, local_as)) = removal_identity {
-            let _ = s.peer_tx.send(proto::PeerEvent {
-                r#type: proto::PeerEventType::Removed as i32,
-                peer: Some(proto::PeerState {
-                    address: peer_ip.to_string(),
-                    remote_as,
-                    local_as,
-                    ..Default::default()
-                }),
-            });
-        }
+    // A peer being removed stays marked until its session's `Retired`: no
+    // restart window opens, and the Removed event that follows is the only
+    // notification.
+    let removing = s.pending_removal.contains(&peer_ip);
+    s.on_terminated(peer_ip, termination_reason, !removing);
+    if removing {
         return None;
     }
 

@@ -107,11 +107,11 @@ pub(crate) struct DaemonState {
     /// Per-peer coalescing buffers for outbound IPv6 prefix decisions.
     pub(crate) pending_decisions_v6: HashMap<IpAddr, Vec<PrefixDecisionV6>>,
     /// Peers that have been removed via [`DaemonCommand::RemovePeer`](super::DaemonCommand::RemovePeer) but whose
-    /// session has not yet sent `Terminated`.
+    /// session has not yet sent `Retired`.
     ///
-    /// When `Terminated` arrives for a peer in this set, the event loop calls
-    /// [`DaemonState::remove_peer`] to erase all per-peer state instead of
-    /// resetting it for a reconnect.
+    /// While a peer is in this set, `Terminated` opens no restart window and
+    /// `AddPeer` for its address is ignored. When `Retired` arrives, the event
+    /// loop calls [`DaemonState::remove_peer`] to erase all per-peer state.
     pub(crate) pending_removal: HashSet<IpAddr>,
     /// RFC 4724 §4.2 GR state: active windows, stale-NLRI snapshots, peer families.
     ///

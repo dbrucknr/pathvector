@@ -128,6 +128,9 @@ mod outbound_order_tests;
 // Sessions the daemon resets on its own authority must reconnect.
 #[cfg(test)]
 mod session_restart_tests;
+// RemovePeer must end the peer's session and forwarding tasks.
+#[cfg(test)]
+mod session_retire_tests;
 
 pub(crate) use bootstrap::run;
 pub(crate) use command::DaemonCommand;
@@ -138,6 +141,7 @@ pub(crate) use state::DaemonState;
 // items defined in other sibling submodules.
 use blackhole::{BlackholeBook, BlackholeBooks, BlackholeChange, PeerBlackhole};
 use capabilities::{Md5Keys, SpawnConfig, remove_listener_key, session_tcp_md5, set_listener_key};
+use event_loop::forward_events;
 use fib::changed_nlris;
 use import::{
     ImportPipeline, ImportTally, RibEffects, import_announcement, import_ineligible,

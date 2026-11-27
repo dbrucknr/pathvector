@@ -318,6 +318,17 @@ pub enum SessionCommand {
     ///
     /// Has no effect if the session is already in `Established` state.
     SetCapabilities(Vec<crate::message::Capability>),
+    /// Stop as [`Self::Stop`] does, then end the session task for good, however
+    /// many command senders are still alive. For a caller that is discarding
+    /// the session, such as on removing the peer.
+    ///
+    /// The task first delivers what it still owes: a queued NOTIFICATION, and
+    /// any events not yet taken, including the
+    /// [`SessionEvent::Terminated`] of an Established session. It then emits
+    /// [`SessionEvent::Retired`] and closes the event stream, so the consumer
+    /// must keep calling [`SessionHandle::next_event`] until it returns
+    /// `None`. Commands sent after this one are not acted on.
+    Retire,
 }
 
 /// Why a BGP session was torn down.
@@ -359,6 +370,11 @@ pub enum SessionEvent {
     Terminated(TerminationReason),
     /// An UPDATE message was received; forward to the RIB layer.
     RouteUpdate(UpdateMessage),
+    /// The session acted on [`SessionCommand::Retire`]. Always the last event,
+    /// and emitted from any state: a session that never reached Established
+    /// emits it without a [`Self::Terminated`]. Its command senders already
+    /// report [`closed`](mpsc::Sender::is_closed).
+    Retired,
 }
 
 /// Caller-facing handle returned by [`spawn`].
@@ -434,8 +450,8 @@ impl SessionHandle for SpawnedSessionHandle {
 /// Spawn a BGP session task and return a handle to control it.
 ///
 /// The session starts in `Idle`. Call [`SessionHandle::start`] to initiate the
-/// TCP connection. The task ends when the handle and every sender cloned from
-/// it have been dropped.
+/// TCP connection. The task ends on [`SessionCommand::Retire`], or when the
+/// handle and every sender cloned from it have been dropped.
 #[must_use]
 pub fn spawn(config: SessionConfig) -> SpawnedSessionHandle {
     let (mut session, handle) = Session::<FramedBgpTransport>::new(config);
@@ -559,8 +575,17 @@ struct Session<T: BgpTransport> {
     // Reason for the most recent (or current) session termination.  Set just
     // before calling fsm.process() so execute() can carry it in the event.
     termination_reason: TerminationReason,
-    // Every command sender is gone: stop and end the task.
-    shutting_down: bool,
+    // Set once the task is to end, after the stop that goes with it.
+    exit: Option<Exit>,
+}
+
+/// Why a session task is ending.
+#[derive(Debug, Clone, Copy)]
+enum Exit {
+    /// Every command sender is gone, and with them the handle and its events.
+    Abandoned,
+    /// [`SessionCommand::Retire`].
+    Retired,
 }
 
 impl<T: BgpTransport> Session<T> {
@@ -608,7 +633,7 @@ impl<T: BgpTransport> Session<T> {
             collision_candidate_open_timeout: COLLISION_CANDIDATE_OPEN_TIMEOUT,
             update_rx,
             termination_reason: TerminationReason::Unclean,
-            shutting_down: false,
+            exit: None,
         };
         let handle = SpawnedSessionHandle {
             cmd_tx,
@@ -688,23 +713,37 @@ impl<T: BgpTransport> Session<T> {
             // BGP Identifier for the first time) or dying entirely — may be
             // exactly what a deferred candidate decision was waiting on.
             self.try_resolve_pending_candidate();
-            if self.shutting_down {
-                self.finish().await;
+            if let Some(exit) = self.exit {
+                self.finish(exit).await;
                 return;
             }
         }
     }
 
-    /// Give a closing connection its chance to deliver the Cease before the
-    /// task ends. Bounded by [`CLOSE_FLUSH_TIMEOUT`].
-    async fn finish(mut self) {
-        if let Some(mut link) = self.closing.take()
-            && tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, link.out.drain())
-                .await
-                .is_err()
-        {
-            link.out.abort();
+    /// Deliver what the session still owes before the task ends.
+    ///
+    /// A closing connection gets its chance to deliver the Cease, bounded by
+    /// [`CLOSE_FLUSH_TIMEOUT`]. A retired session also hands over every event,
+    /// which takes as long as the consumer does; dropping the handle ends the
+    /// wait.
+    async fn finish(mut self, exit: Exit) {
+        // Before `Retired` can be seen, so that its receiver can tell this
+        // session's senders from those of a replacement.
+        self.cmd_rx.close();
+        if matches!(exit, Exit::Retired) {
+            self.events.push(SessionEvent::Retired);
         }
+        let closing = self.closing.take();
+        let flush = async {
+            if let Some(mut link) = closing
+                && tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, link.out.drain())
+                    .await
+                    .is_err()
+            {
+                link.out.abort();
+            }
+        };
+        tokio::join!(flush, self.events.drain());
     }
 
     /// Block until the next [`FsmInput`] arrives from any source.
@@ -832,7 +871,11 @@ impl<T: BgpTransport> Session<T> {
             Some(SessionCommand::Stop) => Some(FsmInput::ManualStop),
             // Handle dropped → treat as operator stop, then end the task.
             None => {
-                self.shutting_down = true;
+                self.exit = Some(Exit::Abandoned);
+                Some(FsmInput::ManualStop)
+            }
+            Some(SessionCommand::Retire) => {
+                self.exit = Some(Exit::Retired);
                 Some(FsmInput::ManualStop)
             }
             Some(SessionCommand::Notification(msg)) => Some(FsmInput::NotificationToSend(msg)),

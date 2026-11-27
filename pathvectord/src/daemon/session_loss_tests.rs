@@ -229,8 +229,8 @@ fn session_loss_sends_no_v6_update_to_a_v4_only_peer() {
     assert!(withdraws_v6(&sent_to(&mut state, &mut rx, PEER_C)));
 }
 
-/// `RemovePeer` ends in the same `Terminated` handling, followed by the purge
-/// of all per-peer state.
+/// The `Terminated` of a peer being removed withdraws its routes at once; the
+/// purge of all per-peer state follows on `Retired`.
 #[test]
 fn remove_peer_withdraws_v6() {
     let (mut state, mut rx) = seeded(false);
