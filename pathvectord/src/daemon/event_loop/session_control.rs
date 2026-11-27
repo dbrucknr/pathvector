@@ -44,11 +44,17 @@ pub(super) fn handle_session_retired(
         .get(&peer_ip)
         .copied()
         .map(|remote_as| (remote_as, s.rib.local_as));
-    // For a session that had no `Terminated` to report, such as one that was
-    // between sessions with routes retained.  Suppress the intermediate
-    // Changed(None) broadcast — the explicit Removed event below is the
-    // authoritative notification.
-    s.on_terminated(peer_ip, TerminationReason::OperatorStop, false);
+    // Each teardown walks the whole Loc-RIB, so skip it if `Terminated` has
+    // done it and no later session has been Established since.
+    let torn_down =
+        s.removal_torn_down.remove(&peer_ip) && !s.rib.peer_types.contains_key(&peer_ip);
+    if !torn_down {
+        // For a session that had no `Terminated` to report, such as one that
+        // was between sessions with routes retained.  Suppress the
+        // intermediate Changed(None) broadcast — the explicit Removed event
+        // below is the authoritative notification.
+        s.on_terminated(peer_ip, TerminationReason::OperatorStop, false);
+    }
     s.pending_removal.remove(&peer_ip);
     // Permanent removal: erase all per-peer state so the peer no longer
     // appears in gRPC responses and remove the stop sender so no further
@@ -113,6 +119,7 @@ pub(in crate::daemon) fn handle_session_terminated(
     let removing = s.pending_removal.contains(&peer_ip);
     s.on_terminated(peer_ip, termination_reason, !removing);
     if removing {
+        s.removal_torn_down.insert(peer_ip);
         return None;
     }
 
