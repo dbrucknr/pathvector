@@ -1307,7 +1307,7 @@ where
             set_listener_key(&md5_passwords, peer.address, auth);
         }
 
-        let mut handle = spawn_fn(session_cfg);
+        let handle = spawn_fn(session_cfg);
         handle.start().await;
 
         update_senders.insert(peer.address, handle.update_sender());
@@ -1319,15 +1319,7 @@ where
             .write()
             .await
             .insert(peer.address, handle.incoming_sender());
-        let peer_addr = peer.address;
-        let tx = event_tx.clone();
-        tokio::spawn(async move {
-            while let Some(event) = handle.next_event().await {
-                if tx.send((peer_addr, event)).await.is_err() {
-                    break;
-                }
-            }
-        });
+        tokio::spawn(forward_events(handle, peer.address, event_tx.clone()));
     }
     // Keep a clone of event_tx alive; the caller returns it so the command
     // processor can forward events from dynamically added sessions.  The
@@ -1360,6 +1352,28 @@ where
     )
 }
 
+/// Owns a session's handle and forwards its events to the event loop, ending
+/// with exactly one [`SessionEvent::Retired`].
+///
+/// A session task that dies emits none, so it is added here, behind everything
+/// the task did emit. Sent from anywhere else it could overtake those events.
+async fn forward_events<H: SessionHandle>(
+    mut handle: H,
+    peer_ip: IpAddr,
+    event_tx: mpsc::Sender<(IpAddr, SessionEvent)>,
+) {
+    let mut retired = false;
+    while let Some(event) = handle.next_event().await {
+        retired |= matches!(event, SessionEvent::Retired);
+        if event_tx.send((peer_ip, event)).await.is_err() {
+            return;
+        }
+    }
+    if !retired {
+        let _ = event_tx.send((peer_ip, SessionEvent::Retired)).await;
+    }
+}
+
 /// Handles one [`SessionEvent::Retired`]: purges a peer that `RemovePeer`
 /// marked — its routes, then every piece of per-peer state, including the
 /// command sender.
@@ -1374,6 +1388,9 @@ fn handle_session_retired(
     stop_senders: &Mutex<HashMap<IpAddr, mpsc::Sender<SessionCommand>>>,
 ) {
     if !s.pending_removal.contains(&peer_ip) {
+        // The session task died by itself, and this was the last event from it.
+        // Without a sender, `RemovePeer` knows to complete the removal itself.
+        stop_senders.lock().unwrap().remove(&peer_ip);
         return;
     }
     // Capture identity fields while they are still in the RIB.  on_terminated

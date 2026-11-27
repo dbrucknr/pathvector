@@ -963,7 +963,7 @@ pub(super) async fn run_command_processor<H, F, P>(
                     set_listener_key(&listener_keys, peer.address, auth.clone());
                 }
 
-                let mut handle = spawn_fn(session_cfg);
+                let handle = spawn_fn(session_cfg);
                 handle.start().await;
 
                 let update_sender = handle.update_sender();
@@ -984,15 +984,7 @@ pub(super) async fn run_command_processor<H, F, P>(
                 crate::metrics::register_peer(peer.address);
 
                 // Forward session events to the main event channel.
-                let peer_addr = peer.address;
-                let tx = event_tx.clone();
-                tokio::spawn(async move {
-                    while let Some(event) = handle.next_event().await {
-                        if tx.send((peer_addr, event)).await.is_err() {
-                            break;
-                        }
-                    }
-                });
+                tokio::spawn(forward_events(handle, peer.address, event_tx.clone()));
 
                 if let Some(store) = &peer_store {
                     store.upsert(peer.clone()).await;
@@ -1001,22 +993,31 @@ pub(super) async fn run_command_processor<H, F, P>(
             }
 
             DaemonCommand::RemovePeer(peer_ip) => {
-                // Mark for removal until the session reports `Retired`.
-                // `insert` is false while an earlier removal is outstanding:
-                // that one has told the session already, and its `Retired` is
-                // the one to wait for.
-                let newly_marked = {
+                // Mark for removal until the session's `Retired`. `insert` is
+                // false while an earlier removal is outstanding: that one has
+                // seen to the session already.
+                //
+                // The sender is read under the same lock. It is missing only if
+                // a dead session's `Retired` has been handled already; handled
+                // after this, that event completes the removal.
+                let marked = {
                     let mut s = state.write().await;
-                    s.adj_ribs_in.contains_key(&peer_ip) && s.pending_removal.insert(peer_ip)
+                    (s.adj_ribs_in.contains_key(&peer_ip) && s.pending_removal.insert(peer_ip))
+                        .then(|| {
+                            (
+                                stop_senders.lock().unwrap().get(&peer_ip).cloned(),
+                                s.shutdown_messages.get(&peer_ip).cloned(),
+                            )
+                        })
                 };
 
-                if !newly_marked {
+                let Some((stop_tx, shutdown_reason)) = marked else {
                     tracing::debug!(
                         peer = %peer_ip,
                         "RemovePeer: not configured or already being removed, skipping"
                     );
                     continue;
-                }
+                };
 
                 // Stop accepting new inbound connections from this peer, then
                 // take its TCP MD5 key off the listener. In this order the
@@ -1034,9 +1035,7 @@ pub(super) async fn run_command_processor<H, F, P>(
                 // forwarding task. It first delivers the NOTIFICATION and any
                 // Terminated, and finishes with Retired, which completes the
                 // removal whatever state the session was in.
-                let shutdown_reason = state.read().await.shutdown_messages.get(&peer_ip).cloned();
-                let stop_tx = stop_senders.lock().unwrap().get(&peer_ip).cloned();
-                let retiring = if let Some(tx) = stop_tx {
+                if let Some(tx) = stop_tx {
                     if let Some(reason) = shutdown_reason {
                         let cmd = SessionCommand::Notification(NotificationMessage {
                             error: NotificationError::Cease(CeaseError::AdministrativeShutdown),
@@ -1046,13 +1045,12 @@ pub(super) async fn run_command_processor<H, F, P>(
                     } else {
                         let _ = tx.send(SessionCommand::Stop).await;
                     }
-                    tx.send(SessionCommand::Retire).await.is_ok()
+                    // A closed channel means the session task has died; its
+                    // forwarding task still ends with Retired.
+                    let _ = tx.send(SessionCommand::Retire).await;
                 } else {
-                    false
-                };
-                if !retiring {
-                    // No session task is there to report: complete the removal
-                    // from here, or the address would stay taken for good.
+                    // Nothing more is coming from the session: complete the
+                    // removal from here, or the address would stay taken.
                     let _ = event_tx.send((peer_ip, SessionEvent::Retired)).await;
                 }
                 // stop_senders entry is cleaned up when the event loop completes

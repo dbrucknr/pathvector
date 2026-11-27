@@ -154,7 +154,7 @@ Four `SessionEvent` variants drive all daemon state changes:
 | `Established(SessionInfo)` | FSM reaches Established after KEEPALIVE exchange | `on_established` — records peer type, resets `AdjRibOut`, performs full-table dump to new peer |
 | `Terminated` | TCP close, NOTIFICATION received, hold timer expired | `on_terminated` — clears `AdjRibIn`, withdraws peer's routes from `LocRib`, propagates best-path changes to other established peers |
 | `RouteUpdate(UpdateMessage)` | UPDATE received in Established state | `on_route_update` — calls `handle_update`, propagates affected NLRIs to all peers |
-| `Retired` | The session acted on `SessionCommand::Retire`; its last event | `handle_session_retired` — completes a `RemovePeer`; the address stays taken until then |
+| `Retired` | The session acted on `SessionCommand::Retire`; its last event. The forwarding task adds it for a session task that died | `handle_session_retired` — completes a `RemovePeer`; the address stays taken until then |
 
 `RemovePeer` stops the session and then retires it. Retiring ends the session task, which closes
 the event stream and so ends the daemon's forwarding task.

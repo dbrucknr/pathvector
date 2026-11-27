@@ -23,7 +23,8 @@ being removed. Its routes stayed in the Loc-RIB with nothing left to withdraw th
   session can be mistaken for one of a later session. A repeated `RemovePeer` does nothing more.
 - `Terminated` for a peer being removed still withdraws its routes at once, and opens no restart
   window.
-- If the session task has died, `RemovePeer` completes the removal itself.
+- A session task that dies emits no `Retired`, so its forwarding task adds one, behind every event
+  the session did emit.
 
 **API change:** `SessionCommand` has a new `Retire` variant and `SessionEvent` a new `Retired`
 variant.
