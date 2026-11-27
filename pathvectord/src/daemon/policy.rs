@@ -238,26 +238,31 @@ impl DaemonState {
         // Collect all Loc-RIB NLRIs; the borrow is dropped after the collect.
         let nlris: Vec<Nlri<Ipv4Addr>> = self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
 
-        let max_len = self
-            .negotiated_max_len
-            .get(&peer_ip)
-            .copied()
-            .unwrap_or(MAX_LEN);
         let local_as = self.rib.local_as;
         // RFC 5065: the AS number prepended for genuinely external peers —
         // the confederation identifier when confederations are configured,
         // or `local_as` again when they are not.
         let public_as = self.rib.confederation_id.unwrap_or(local_as);
-        let local_bgp_id = self.rib.local_bgp_id;
-        let peer_four_byte = self.four_byte_peers.contains(&peer_ip);
+        // RFC 4271 §5.1.3: our NEXT_HOP is the address of this session's
+        // interface, as in incremental propagation and the table dump. The
+        // router ID stands in only when the session has no local IPv4 address.
+        let local_next_hop = self
+            .rib
+            .local_addrs
+            .get(&peer_ip)
+            .and_then(|a| match a {
+                IpAddr::V4(v4) => Some(*v4),
+                IpAddr::V6(_) => None,
+            })
+            .unwrap_or(self.rib.local_bgp_id);
         let next_hop_self = self.rib.next_hop_self_peers.contains(&peer_ip);
         let v4_deferred = self.selection_deferral.v4_deferred();
         let v6_deferred = self.selection_deferral.v6_deferred();
 
-        if let (Some(export_policy), Some(adj_rib_out), Some(update_tx)) = (
+        if let (Some(export_policy), Some(adj_rib_out), true) = (
             self.export_policies.get(&peer_ip),
             self.adj_ribs_out.get_mut(&peer_ip),
-            self.update_senders.get(&peer_ip),
+            self.update_senders.contains_key(&peer_ip),
         ) {
             let decisions: Vec<PrefixDecision> = nlris
                 .into_iter()
@@ -266,36 +271,28 @@ impl DaemonState {
                         nlri,
                         &self.rib.loc_rib,
                         adj_rib_out,
+                        &self.rib.rr_clients,
                         export_policy,
                         peer_type,
                         local_as,
                         public_as,
-                        local_bgp_id,
+                        local_next_hop,
                         next_hop_self,
                         v4_deferred,
                     )
                 })
                 .collect();
-            if !flush_updates(
-                peer_ip,
-                decisions,
-                max_len,
-                update_tx,
-                peer_type,
-                peer_four_byte,
-            ) {
-                self.stalled_peers.push(peer_ip);
-            }
+            self.send_decisions(peer_ip, decisions);
         }
 
         if self.ipv6_capable_peers.contains(&peer_ip) {
             let nlris_v6: Vec<Nlri<Ipv6Addr>> =
                 self.rib.loc_rib_v6.best_routes().map(|(n, _)| n).collect();
             let local_ipv6 = self.rib.local_ipv6;
-            if let (Some(export_policy_v6), Some(adj_rib_out_v6), Some(update_tx)) = (
+            if let (Some(export_policy_v6), Some(adj_rib_out_v6), true) = (
                 self.export_policies_v6.get(&peer_ip),
                 self.adj_ribs_out_v6.get_mut(&peer_ip),
-                self.update_senders.get(&peer_ip),
+                self.update_senders.contains_key(&peer_ip),
             ) {
                 let decisions_v6: Vec<PrefixDecisionV6> = nlris_v6
                     .into_iter()
@@ -304,6 +301,7 @@ impl DaemonState {
                             nlri,
                             &self.rib.loc_rib_v6,
                             adj_rib_out_v6,
+                            &self.rib.rr_clients,
                             export_policy_v6,
                             peer_type,
                             local_as,
@@ -314,16 +312,7 @@ impl DaemonState {
                         )
                     })
                     .collect();
-                if !flush_updates_v6(
-                    peer_ip,
-                    decisions_v6,
-                    max_len,
-                    update_tx,
-                    peer_type,
-                    peer_four_byte,
-                ) {
-                    self.stalled_peers.push(peer_ip);
-                }
+                self.send_decisions_v6(peer_ip, decisions_v6);
             }
         }
 
@@ -333,13 +322,16 @@ impl DaemonState {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use pathvector_policy::DefaultAction;
     use pathvector_rib::BestPathChange;
     use pathvector_session::message::{Capability, PathAttribute, UpdateMessage};
     use pathvector_types::{AsPath, Asn, Nlri, Origin, PeerType};
+    use tokio::sync::mpsc;
 
+    use crate::daemon::DaemonState;
     use crate::daemon::tests::{make_state, with_recording_fib};
 
     const LOCAL_AS: u32 = 65001;
@@ -431,6 +423,129 @@ mod tests {
                 .try_recv()
                 .is_err()
         );
+    }
+
+    // ── NEXT_HOP on an export-policy change (issue #179) ─────────────────
+
+    /// The peer whose export default changes.
+    const DEST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 3);
+    /// Local address of the session to `DEST_IP`. Deliberately different from
+    /// the router ID `make_state` configures (10.0.0.1).
+    const SESSION_LOCAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 254);
+
+    /// Every announced prefix in `msgs`, paired with the `NEXT_HOP` it was
+    /// announced with, in prefix order.
+    fn announced_next_hops(msgs: &[UpdateMessage]) -> Vec<(Nlri<Ipv4Addr>, Ipv4Addr)> {
+        let mut announced: Vec<_> = msgs
+            .iter()
+            .flat_map(|m| {
+                let next_hop = m.attributes.iter().find_map(|a| match a {
+                    PathAttribute::NextHop(nh) => Some(*nh),
+                    _ => None,
+                });
+                m.announced
+                    .iter()
+                    .map(move |&n| (n, next_hop.expect("announcement without NEXT_HOP")))
+            })
+            .collect();
+        announced.sort_by_key(|(n, _)| n.to_string());
+        announced
+    }
+
+    /// Sends `DEST_IP` one route in its table dump and one by incremental
+    /// propagation, then changes its export default. Every send path must use
+    /// the same `NEXT_HOP`, the session's local address.
+    fn assert_export_change_keeps_session_next_hop(
+        dest_type: PeerType,
+        dest_as: u32,
+        next_hop_self: bool,
+    ) {
+        let (mut state, mut rxs) = make_state(
+            LOCAL_AS,
+            &[
+                (IpAddr::V4(PEER_IP), PEER_AS),
+                (IpAddr::V4(DEST_IP), dest_as),
+            ],
+        );
+        if next_hop_self {
+            std::sync::Arc::make_mut(&mut state.rib)
+                .next_hop_self_peers
+                .insert(IpAddr::V4(DEST_IP));
+        }
+        let sent = |state: &mut DaemonState, rxs: &mut HashMap<IpAddr, _>| {
+            state.flush_pending();
+            let rx: &mut mpsc::Receiver<UpdateMessage> = rxs.get_mut(&IpAddr::V4(DEST_IP)).unwrap();
+            std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>()
+        };
+        let expected = vec![
+            (nlri("198.51.100.0/24"), SESSION_LOCAL),
+            (nlri("203.0.113.0/24"), SESSION_LOCAL),
+        ];
+
+        state.on_established(
+            IpAddr::V4(PEER_IP),
+            PEER_IP,
+            PeerType::External,
+            PEER_AS,
+            90,
+            &[],
+            None,
+        );
+        state.on_route_update(IpAddr::V4(PEER_IP), announce("198.51.100.0/24"));
+        state.on_established(
+            IpAddr::V4(DEST_IP),
+            DEST_IP,
+            dest_type,
+            dest_as,
+            90,
+            &[],
+            Some(IpAddr::V4(SESSION_LOCAL)),
+        );
+        let mut before = sent(&mut state, &mut rxs);
+        state.on_route_update(IpAddr::V4(PEER_IP), announce("203.0.113.0/24"));
+        before.extend(sent(&mut state, &mut rxs));
+        assert_eq!(
+            announced_next_hops(&before),
+            expected,
+            "control: table dump and incremental propagation"
+        );
+
+        // RFC 4271 §9.2: "A BGP speaker SHOULD NOT advertise a given feasible
+        // BGP route from its Adj-RIB-Out if it would produce an UPDATE message
+        // containing the same BGP route as was previously advertised."
+        state.set_export_default(IpAddr::V4(DEST_IP), DefaultAction::Accept);
+        assert_eq!(
+            announced_next_hops(&sent(&mut state, &mut rxs)),
+            vec![],
+            "re-setting the current default must not re-advertise anything"
+        );
+
+        state.set_export_default(IpAddr::V4(DEST_IP), DefaultAction::Reject);
+        sent(&mut state, &mut rxs);
+        state.set_export_default(IpAddr::V4(DEST_IP), DefaultAction::Accept);
+        assert_eq!(
+            announced_next_hops(&sent(&mut state, &mut rxs)),
+            expected,
+            "re-advertisement after a policy change"
+        );
+    }
+
+    /// RFC 4271 §5.1.3, external peer: "By default (if none of the above
+    /// conditions apply), the BGP speaker SHOULD use the IP address of the
+    /// interface that the speaker uses to establish the BGP connection to peer
+    /// X in the NEXT_HOP attribute."
+    #[test]
+    fn set_export_default_ebgp_next_hop_is_session_local_address() {
+        assert_export_change_keeps_session_next_hop(PeerType::External, 65003, false);
+    }
+
+    /// RFC 4271 §5.1.3, internal peer: NEXT_HOP is left alone unless the
+    /// speaker "has been explicitly configured to announce its own IP address
+    /// as the NEXT_HOP", and its own address is that of "the interface that is
+    /// used to reach the peer".
+    #[test]
+    fn set_export_default_ibgp_next_hop_self_is_session_local_address() {
+        assert_export_change_keeps_session_next_hop(PeerType::Internal, LOCAL_AS, true);
     }
 
     fn announce_v6(prefix: &str) -> UpdateMessage {

@@ -70,6 +70,10 @@ pub enum NotificationError {
     /// Error code 6 — operator-initiated or policy-driven session teardown
     /// (RFC 4486).
     Cease(CeaseError),
+    /// Error code 8 — the local system could not send any BGP message for the
+    /// `SendHoldTime` (RFC 9687). The subcode "is set to 0 and is not used",
+    /// and no data is appended (§6).
+    SendHoldTimerExpired,
     /// Any (code, subcode) pair not recognised above.
     Unknown { code: u8, subcode: u8 },
 }
@@ -88,6 +92,7 @@ impl NotificationError {
                 _ => Self::FsmError,
             },
             6 => Self::Cease(CeaseError::from_u8(subcode)),
+            8 => Self::SendHoldTimerExpired,
             _ => Self::Unknown { code, subcode },
         }
     }
@@ -103,6 +108,7 @@ impl NotificationError {
             Self::FsmErrorOpenConfirm => (5, 2),
             Self::FsmErrorEstablished => (5, 3),
             Self::Cease(s) => (6, s.as_u8()),
+            Self::SendHoldTimerExpired => (8, 0),
             Self::Unknown { code, subcode } => (*code, *subcode),
         }
     }
@@ -358,6 +364,27 @@ mod tests {
         // 19-byte header, then 1 byte code, 1 byte subcode.
         assert_eq!(encoded[19], 2, "error code must be 2 (OPEN Message Error)");
         assert_eq!(encoded[20], 11, "subcode must be 11 (Role Mismatch)");
+    }
+
+    /// RFC 9687 §9: error code 8, "Send Hold Timer Expired". §6: "The
+    /// subcode ... is set to 0 and is not used; no additional data is to be
+    /// appended".
+    #[test]
+    fn test_send_hold_timer_expired_is_code_8_subcode_0_without_data() {
+        let msg = NotificationMessage {
+            error: NotificationError::SendHoldTimerExpired,
+            data: vec![],
+        };
+        let encoded = msg.encode();
+        assert_eq!(encoded.len(), 21);
+        assert_eq!(&encoded[19..], &[8, 0]);
+        assert_eq!(roundtrip(&msg), msg);
+        // "not used": a peer's non-zero subcode does not change the meaning.
+        let mut cur = Cursor::new(&[8, 3]);
+        assert_eq!(
+            NotificationMessage::decode(&mut cur).unwrap().error,
+            NotificationError::SendHoldTimerExpired
+        );
     }
 
     #[test]

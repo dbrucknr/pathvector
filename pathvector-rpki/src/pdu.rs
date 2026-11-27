@@ -148,7 +148,7 @@ impl RtrVersion {
         }
     }
 
-    fn from_byte(b: u8) -> Result<Self, PduError> {
+    pub(crate) fn from_byte(b: u8) -> Result<Self, PduError> {
         match b {
             0 => Ok(Self::V0),
             1 => Ok(Self::V1),
@@ -311,7 +311,7 @@ pub struct EndOfDataIntervals {
 // ── Fixed header/payload sizes (bytes, including the 8-byte header) ─────────
 
 const HEADER_LEN: u32 = 8;
-const LEN_SERIAL_NOTIFY: u32 = 12;
+pub(crate) const LEN_SERIAL_NOTIFY: u32 = 12;
 const LEN_SERIAL_QUERY: u32 = 12;
 const LEN_RESET_QUERY: u32 = 8;
 const LEN_CACHE_RESPONSE: u32 = 8;

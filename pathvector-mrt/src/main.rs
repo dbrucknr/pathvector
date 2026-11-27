@@ -17,9 +17,9 @@
 //!
 //! ## What it measures
 //!
-//! - BGP announcement throughput (prefixes/second into pathvectord)
-//! - RIB convergence time: from first UPDATE sent to when the route count
-//!   has been stable for `--idle-ms` (default 200 ms) with no further change
+//! - Announcement throughput (prefixes/second to build and send the UPDATEs)
+//! - RIB convergence time: from the end of the announcement until the route count
+//!   has been stable for `--idle-ms` (default 200 ms)
 //! - Accepted vs rejected route count
 
 use std::{

@@ -145,6 +145,7 @@ proptest! {
     fn prop_notification_roundtrip(
         error in prop_oneof![
             Just(NotificationError::HoldTimerExpired),
+            Just(NotificationError::SendHoldTimerExpired),
             Just(NotificationError::FsmError),
             prop_oneof![
                 Just(MsgHeaderError::ConnectionNotSynchronized),
@@ -195,7 +196,7 @@ proptest! {
                 prop_oneof![Just(0u8), 11u8..=u8::MAX].prop_map(CeaseError::Unknown),
             ].prop_map(NotificationError::Cease),
             // Top-level Unknown is only reachable for codes not in 1–6.
-            (prop_oneof![Just(0u8), 7u8..=u8::MAX], any::<u8>())
+            (prop_oneof![Just(0u8), Just(7u8), 9u8..=u8::MAX], any::<u8>())
                 .prop_map(|(code, subcode)| NotificationError::Unknown { code, subcode }),
         ],
         data in prop::collection::vec(any::<u8>(), 0..16),

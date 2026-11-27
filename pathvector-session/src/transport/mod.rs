@@ -4,30 +4,56 @@
 //! over a real TCP connection. Call [`spawn`] to start a session task and
 //! interact with it via the returned [`SpawnedSessionHandle`], which
 //! implements the [`SessionHandle`] trait.
+//!
+//! # Timer supervision and backpressure
+//!
+//! The session task waits in exactly one place; writing, emitting events and
+//! arming timers never block. So the RFC 4271 and RFC 9687 timers keep running
+//! however much input is ready, whether or not the peer is reading and whether
+//! or not events are being consumed:
+//!
+//! * overdue timers and ready input alternate (`schedule`);
+//! * writes are buffered and flushed alongside everything else (`link`);
+//! * events that do not fit the channel are held in order, and the peer is not
+//!   read while any are held (`outbox`).
 
+mod link;
 pub mod listener;
+mod outbox;
 #[cfg(test)]
 mod prop_tests;
+mod schedule;
+mod sink;
 pub mod tcp_md5;
 
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
+use std::time::Duration;
 
-use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
-use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio::time::{Instant, Sleep};
 
-use crate::framing::{BgpCodec, FramingError};
+use crate::framing::FramingError;
 use crate::fsm::{Fsm, FsmConfig, FsmInput, FsmOutput, SessionInfo, UpdateRecovery};
+pub use crate::fsm::{InvalidSendHoldTime, SendHoldTime};
 use crate::message::{
-    AsnWidth, BgpMessage, Capability, CodecError, MsgHeaderError, NotificationError,
+    AsnWidth, BgpMessage, Capability, CeaseError, CodecError, MsgHeaderError, NotificationError,
     NotificationMessage, OpenMessage, OpenMsgError, UpdateMessage,
 };
+
+pub use link::{BgpReader, BgpTransport, BgpWriter, MessagesWritten};
+use link::{FramedBgpTransport, Link, Outbound, ready_now};
+use outbox::Outbox;
+use schedule::{
+    CLOSE_FLUSH_TIMEOUT, Deadlines, EventBacklogLimit, HoldGrace, Timer, Turns, WriteBatch,
+};
+
+/// Capacity of the channel carrying outbound UPDATEs from the daemon.
+const UPDATE_CHANNEL: usize = 256;
 
 /// How long to wait for a staged, not-yet-validated second (collision
 /// candidate) connection to send its OPEN before giving up on it and
@@ -142,79 +168,11 @@ enum CollisionPurpose {
 /// of the peer by means outside of the protocol" — which this
 /// implementation doesn't have, so it must wait for the primary's own OPEN
 /// (or for the primary to fail) rather than guess.
-struct CollisionCandidate<T> {
-    transport: T,
+struct CollisionCandidate<T: BgpTransport> {
+    link: Link<T>,
     identity: ConnectionIdentity,
     open: Option<OpenMessage>,
     purpose: CollisionPurpose,
-}
-
-// ── Transport trait ───────────────────────────────────────────────────────────
-
-/// Abstraction over the BGP message I/O layer.
-///
-/// The only two operations the session event loop needs once a connection
-/// exists are sending and receiving complete BGP messages. Implementations
-/// supply the framing and underlying I/O; the session loop owns all FSM
-/// state and timer management.
-///
-/// Both associated futures must be [`Send`] so the session task can be
-/// spawned on a multi-threaded Tokio runtime.
-pub trait BgpTransport: Send + 'static {
-    /// Write one BGP message to the peer. Returns an error if the underlying
-    /// connection is broken.
-    fn send(&mut self, msg: BgpMessage) -> impl Future<Output = io::Result<()>> + Send + '_;
-    /// Read the next decoded BGP message from the peer. Returns `None` when
-    /// the connection has closed cleanly.
-    fn recv(
-        &mut self,
-    ) -> impl Future<Output = Option<Result<BgpMessage, FramingError>>> + Send + '_;
-    /// Raise (or lower) the message size limit after Extended Message capability
-    /// (RFC 8654) is negotiated. Default implementation is a no-op.
-    fn set_extended_message(&mut self, _enabled: bool) {}
-    /// Set the width of AS numbers on this session (RFC 6793 §4), for both
-    /// decoding received and encoding sent UPDATEs. Default implementation
-    /// is a no-op.
-    fn set_asn_width(&mut self, _width: AsnWidth) {}
-}
-
-// ── Production transport impl ─────────────────────────────────────────────────
-
-struct FramedBgpTransport {
-    reader: FramedRead<OwnedReadHalf, BgpCodec>,
-    writer: FramedWrite<OwnedWriteHalf, BgpCodec>,
-}
-
-impl FramedBgpTransport {
-    fn from_stream(stream: TcpStream) -> Self {
-        let (r, w) = stream.into_split();
-        Self {
-            reader: FramedRead::new(r, BgpCodec::new()),
-            writer: FramedWrite::new(w, BgpCodec::new()),
-        }
-    }
-}
-
-impl BgpTransport for FramedBgpTransport {
-    async fn send(&mut self, msg: BgpMessage) -> io::Result<()> {
-        self.writer.send(msg).await?;
-        Ok(())
-    }
-
-    async fn recv(&mut self) -> Option<Result<BgpMessage, FramingError>> {
-        self.reader.next().await
-    }
-
-    fn set_extended_message(&mut self, enabled: bool) {
-        self.reader.decoder_mut().set_extended_message(enabled);
-    }
-
-    fn set_asn_width(&mut self, width: AsnWidth) {
-        self.reader.decoder_mut().set_asn_width(width);
-        // The writer's codec is a separate instance: without this the
-        // outbound side would keep encoding four-octet ASNs to an OLD peer.
-        self.writer.encoder_mut().set_asn_width(width);
-    }
 }
 
 // ── SessionHandle trait ───────────────────────────────────────────────────────
@@ -285,6 +243,11 @@ pub struct SessionConfig {
     /// [`DEFAULT_CONNECT_RETRY_TIME`] for the RFC-recommended 120 s default.
     /// Set lower in tests or latency-sensitive deployments.
     pub connect_retry_time: std::time::Duration,
+    /// RFC 9687 `SendHoldTime`: how long the session stays up when no BGP
+    /// message can be sent to the peer. [`SendHoldTime::default`] is the
+    /// RFC-recommended greater of 8 minutes and twice the negotiated hold
+    /// time.
+    pub send_hold_time: SendHoldTime,
     /// Capabilities advertised in the OPEN message.
     pub capabilities: Vec<Capability>,
     /// Capabilities the peer MUST advertise. If absent, the session is rejected
@@ -355,6 +318,17 @@ pub enum SessionCommand {
     ///
     /// Has no effect if the session is already in `Established` state.
     SetCapabilities(Vec<crate::message::Capability>),
+    /// Stop as [`Self::Stop`] does, then end the session task for good, however
+    /// many command senders are still alive. For a caller that is discarding
+    /// the session, such as on removing the peer.
+    ///
+    /// The task first delivers what it still owes: a queued NOTIFICATION, and
+    /// any events not yet taken, including the
+    /// [`SessionEvent::Terminated`] of an Established session. It then emits
+    /// [`SessionEvent::Retired`] and closes the event stream, so the consumer
+    /// must keep calling [`SessionHandle::next_event`] until it returns
+    /// `None`. Commands sent after this one are not acted on.
+    Retire,
 }
 
 /// Why a BGP session was torn down.
@@ -377,6 +351,14 @@ pub enum TerminationReason {
     /// The session was torn down by this side, whether by the operator or by
     /// the local system's own logic.  Always flushes routes immediately.
     OperatorStop,
+    /// The RFC 9687 `SendHoldTimer` expired: nothing could be sent to the peer.
+    ///
+    /// This side generated a "Send Hold Timer Expired" NOTIFICATION (which the
+    /// peer may well not have received), so Graceful Restart retention applies
+    /// only under RFC 8538: "The BGP speaker generating the BGP NOTIFICATION
+    /// message MUST also follow the rules for the Receiving Speaker" when the
+    /// N bit was exchanged.
+    SendHoldTimerExpired,
 }
 
 /// Events emitted by a session to its caller.
@@ -388,6 +370,11 @@ pub enum SessionEvent {
     Terminated(TerminationReason),
     /// An UPDATE message was received; forward to the RIB layer.
     RouteUpdate(UpdateMessage),
+    /// The session acted on [`SessionCommand::Retire`]. Always the last event,
+    /// and emitted from any state: a session that never reached Established
+    /// emits it without a [`Self::Terminated`]. Its command senders already
+    /// report [`closed`](mpsc::Sender::is_closed).
+    Retired,
 }
 
 /// Caller-facing handle returned by [`spawn`].
@@ -463,52 +450,14 @@ impl SessionHandle for SpawnedSessionHandle {
 /// Spawn a BGP session task and return a handle to control it.
 ///
 /// The session starts in `Idle`. Call [`SessionHandle::start`] to initiate the
-/// TCP connection.
+/// TCP connection. The task ends on [`SessionCommand::Retire`], or when the
+/// handle and every sender cloned from it have been dropped.
 #[must_use]
 pub fn spawn(config: SessionConfig) -> SpawnedSessionHandle {
-    let (cmd_tx, cmd_rx) = mpsc::channel(8);
-    let (event_tx, event_rx) = mpsc::channel(64);
-    let (update_tx, update_rx) = mpsc::channel(256);
-
-    let fsm_config = FsmConfig {
-        local_as: config.local_as,
-        local_bgp_id: config.local_bgp_id,
-        hold_time: config.hold_time,
-        capabilities: config.capabilities.clone(),
-        required_capabilities: config.required_capabilities.clone(),
-        peer_as: config.peer_as,
-        confederation_member: config.confederation_member,
-        public_as: config.public_as,
-    };
-
-    let session: Session<FramedBgpTransport> = Session {
-        config,
-        fsm: Fsm::new(fsm_config),
-        cmd_rx,
-        event_tx,
-        hold_deadline: None,
-        keepalive_deadline: None,
-        retry_deadline: None,
-        transport: None,
-        pending_transport: None,
-        pending_input: None,
-        connect_task: None,
-        connect_factory: Some(Box::new(FramedBgpTransport::from_stream)),
-        local_addr: None,
-        transport_identity: None,
-        pending_collision_candidate: None,
-        pending_collision_deadline: None,
-        collision_candidate_open_timeout: COLLISION_CANDIDATE_OPEN_TIMEOUT,
-        update_rx,
-        termination_reason: TerminationReason::Unclean,
-    };
-
+    let (mut session, handle) = Session::<FramedBgpTransport>::new(config);
+    session.connect_factory = Some(Box::new(FramedBgpTransport::from_stream));
     tokio::spawn(session.run());
-    SpawnedSessionHandle {
-        cmd_tx,
-        event_rx,
-        update_tx,
-    }
+    handle
 }
 
 /// Test-only variant of [`spawn`] that overrides
@@ -521,51 +470,13 @@ pub fn spawn(config: SessionConfig) -> SpawnedSessionHandle {
 #[cfg(test)]
 fn spawn_with_collision_timeout(
     config: SessionConfig,
-    collision_candidate_open_timeout: std::time::Duration,
+    collision_candidate_open_timeout: Duration,
 ) -> SpawnedSessionHandle {
-    let (cmd_tx, cmd_rx) = mpsc::channel(8);
-    let (event_tx, event_rx) = mpsc::channel(64);
-    let (update_tx, update_rx) = mpsc::channel(256);
-
-    let fsm_config = FsmConfig {
-        local_as: config.local_as,
-        local_bgp_id: config.local_bgp_id,
-        hold_time: config.hold_time,
-        capabilities: config.capabilities.clone(),
-        required_capabilities: config.required_capabilities.clone(),
-        peer_as: config.peer_as,
-        confederation_member: config.confederation_member,
-        public_as: config.public_as,
-    };
-
-    let session: Session<FramedBgpTransport> = Session {
-        config,
-        fsm: Fsm::new(fsm_config),
-        cmd_rx,
-        event_tx,
-        hold_deadline: None,
-        keepalive_deadline: None,
-        retry_deadline: None,
-        transport: None,
-        pending_transport: None,
-        pending_input: None,
-        connect_task: None,
-        connect_factory: Some(Box::new(FramedBgpTransport::from_stream)),
-        local_addr: None,
-        transport_identity: None,
-        pending_collision_candidate: None,
-        pending_collision_deadline: None,
-        collision_candidate_open_timeout,
-        update_rx,
-        termination_reason: TerminationReason::Unclean,
-    };
-
+    let (mut session, handle) = Session::<FramedBgpTransport>::new(config);
+    session.connect_factory = Some(Box::new(FramedBgpTransport::from_stream));
+    session.collision_candidate_open_timeout = collision_candidate_open_timeout;
     tokio::spawn(session.run());
-    SpawnedSessionHandle {
-        cmd_tx,
-        event_rx,
-        update_tx,
-    }
+    handle
 }
 
 /// Spawn a BGP session with a pre-built transport, bypassing TCP connection
@@ -580,66 +491,49 @@ fn spawn_with_collision_timeout(
 /// Use this in tests that need a controllable transport without binding real
 /// TCP sockets, or in production integrations that supply their own I/O layer.
 pub fn spawn_with<T: BgpTransport>(config: SessionConfig, transport: T) -> SpawnedSessionHandle {
-    let (cmd_tx, cmd_rx) = mpsc::channel(8);
-    let (event_tx, event_rx) = mpsc::channel(64);
-    let (update_tx, update_rx) = mpsc::channel(256);
-
-    let fsm_config = FsmConfig {
-        local_as: config.local_as,
-        local_bgp_id: config.local_bgp_id,
-        hold_time: config.hold_time,
-        capabilities: config.capabilities.clone(),
-        required_capabilities: config.required_capabilities.clone(),
-        peer_as: config.peer_as,
-        confederation_member: config.confederation_member,
-        public_as: config.public_as,
-    };
-
-    let session: Session<T> = Session {
-        config,
-        fsm: Fsm::new(fsm_config),
-        cmd_rx,
-        event_tx,
-        hold_deadline: None,
-        keepalive_deadline: None,
-        retry_deadline: None,
-        transport: None,
-        pending_transport: Some(transport),
-        pending_input: None,
-        connect_task: None,
-        connect_factory: None,
-        local_addr: None,
-        transport_identity: None,
-        pending_collision_candidate: None,
-        pending_collision_deadline: None,
-        collision_candidate_open_timeout: COLLISION_CANDIDATE_OPEN_TIMEOUT,
-        update_rx,
-        termination_reason: TerminationReason::Unclean,
-    };
-
+    let (mut session, handle) = Session::<T>::new(config);
+    session.pending_transport = Some(transport);
     tokio::spawn(session.run());
-    SpawnedSessionHandle {
-        cmd_tx,
-        event_rx,
-        update_tx,
-    }
+    handle
 }
 
 // ── Internal session worker ───────────────────────────────────────────────────
 
+/// One session's task.
+///
+/// The only place this task waits is the `select!` in `wait_for_input`.
+/// Everything a transition does (writing, emitting events, arming timers) is
+/// synchronous, so neither a peer that stops reading nor a consumer that stops
+/// taking events can suspend timer supervision.
 struct Session<T: BgpTransport> {
     config: SessionConfig,
     fsm: Fsm,
     cmd_rx: mpsc::Receiver<SessionCommand>,
-    event_tx: mpsc::Sender<SessionEvent>,
+    events: Outbox,
 
-    // Timer deadlines — None means the timer is not running.
-    hold_deadline: Option<Instant>,
-    keepalive_deadline: Option<Instant>,
-    retry_deadline: Option<Instant>,
+    // Timer policy (`schedule`).
+    deadlines: Deadlines,
+    turns: Turns,
+    hold_grace: HoldGrace,
+    write_batch: WriteBatch,
+    event_backlog_limit: EventBacklogLimit,
+    // The interval the FSM last armed the KeepaliveTimer with, so that sending
+    // an UPDATE can restart it.
+    keepalive_interval: Option<Duration>,
+    // The value the FSM started the SendHoldTimer with, so that sending a
+    // message can restart it. `None` while it is stopped.
+    send_hold_interval: Option<Duration>,
+    // Set for a teardown that must not wait for the connection to drain.
+    abort_on_close: bool,
+    // Wakes the loop at the earliest deadline. Kept across iterations so it is
+    // only re-registered when that deadline changes.
+    wake: Pin<Box<Sleep>>,
 
-    // Active transport — present when connected, None otherwise.
-    transport: Option<T>,
+    // Active connection — present when connected, None otherwise.
+    link: Option<Link<T>>,
+    // A connection that has been closed but is still taking its last bytes
+    // (normally a NOTIFICATION). Bounded by `Timer::CloseFlush`.
+    closing: Option<Link<T>>,
     // Transport waiting to be activated on the first InitiateTcpConnect output.
     // Used by spawn_with to inject a pre-built transport without real TCP.
     pending_transport: Option<T>,
@@ -658,9 +552,8 @@ struct Session<T: BgpTransport> {
     // local address isn't silently discarded -- the daemon decides how to use
     // it per address family.
     local_addr: Option<IpAddr>,
-    // The local/peer IP addresses and initiator of `self.transport`'s TCP
-    // connection. `None` when `self.transport` is `None`. See
-    // `ConnectionIdentity`.
+    // The local/peer IP addresses and initiator of `self.link`'s TCP
+    // connection. `None` when `self.link` is `None`. See `ConnectionIdentity`.
     transport_identity: Option<ConnectionIdentity>,
     // A second incoming connection staged while resolving a potential RFC
     // 4271 §6.8 collision or RFC 4724 §4.2 GR override. `None` unless a
@@ -669,10 +562,6 @@ struct Session<T: BgpTransport> {
     // `handle_collision_candidate_message`, and
     // `try_resolve_pending_candidate`.
     pending_collision_candidate: Option<CollisionCandidate<T>>,
-    // Deadline for `pending_collision_candidate` to send its OPEN. `None`
-    // once its OPEN has been read and validated (`CollisionCandidate::open`
-    // is `Some`) or whenever `pending_collision_candidate` is `None`.
-    pending_collision_deadline: Option<Instant>,
     // How long to wait for a staged candidate's OPEN. Always
     // `COLLISION_CANDIDATE_OPEN_TIMEOUT` in production; overridable in tests
     // (`spawn_with_collision_timeout`) so the deadline can be exercised with
@@ -680,15 +569,80 @@ struct Session<T: BgpTransport> {
     // pausing time races its own auto-advance-when-idle behavior against
     // this module's real-TCP collision tests, which can deadlock outright
     // (confirmed while writing this fix's tests) rather than just flake.
-    collision_candidate_open_timeout: std::time::Duration,
+    collision_candidate_open_timeout: Duration,
     // Outbound UPDATE messages queued by the daemon.
     update_rx: mpsc::Receiver<UpdateMessage>,
     // Reason for the most recent (or current) session termination.  Set just
     // before calling fsm.process() so execute() can carry it in the event.
     termination_reason: TerminationReason,
+    // Set once the task is to end, after the stop that goes with it.
+    exit: Option<Exit>,
+}
+
+/// Why a session task is ending.
+#[derive(Debug, Clone, Copy)]
+enum Exit {
+    /// Every command sender is gone, and with them the handle and its events.
+    Abandoned,
+    /// [`SessionCommand::Retire`].
+    Retired,
 }
 
 impl<T: BgpTransport> Session<T> {
+    fn new(config: SessionConfig) -> (Self, SpawnedSessionHandle) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (update_tx, update_rx) = mpsc::channel(UPDATE_CHANNEL);
+
+        let fsm = Fsm::new(FsmConfig {
+            local_as: config.local_as,
+            local_bgp_id: config.local_bgp_id,
+            hold_time: config.hold_time,
+            capabilities: config.capabilities.clone(),
+            required_capabilities: config.required_capabilities.clone(),
+            peer_as: config.peer_as,
+            confederation_member: config.confederation_member,
+            public_as: config.public_as,
+            send_hold_time: config.send_hold_time,
+        });
+        let events = Outbox::new(event_tx, config.peer_addr.ip());
+
+        let session = Self {
+            config,
+            fsm,
+            cmd_rx,
+            events,
+            deadlines: Deadlines::default(),
+            turns: Turns::default(),
+            hold_grace: HoldGrace::new(HoldGrace::DEFAULT_LIMIT),
+            write_batch: WriteBatch::DEFAULT,
+            event_backlog_limit: EventBacklogLimit::DEFAULT,
+            keepalive_interval: None,
+            send_hold_interval: None,
+            abort_on_close: false,
+            wake: Box::pin(tokio::time::sleep_until(Instant::now())),
+            link: None,
+            closing: None,
+            pending_transport: None,
+            pending_input: None,
+            connect_task: None,
+            connect_factory: None,
+            local_addr: None,
+            transport_identity: None,
+            pending_collision_candidate: None,
+            collision_candidate_open_timeout: COLLISION_CANDIDATE_OPEN_TIMEOUT,
+            update_rx,
+            termination_reason: TerminationReason::Unclean,
+            exit: None,
+        };
+        let handle = SpawnedSessionHandle {
+            cmd_tx,
+            event_rx,
+            update_tx,
+        };
+        (session, handle)
+    }
+
     async fn run(mut self) {
         loop {
             let input = self.wait_for_input().await;
@@ -714,6 +668,7 @@ impl<T: BgpTransport> Session<T> {
                     FsmInput::MalformedUpdate(r) if r.is_session_reset() => {
                         TerminationReason::OperatorStop
                     }
+                    FsmInput::SendHoldTimerExpired => TerminationReason::SendHoldTimerExpired,
                     _ => TerminationReason::Unclean,
                 };
             }
@@ -739,14 +694,17 @@ impl<T: BgpTransport> Session<T> {
             if deliberate_teardown && let Some(candidate) = self.pending_collision_candidate.take()
             {
                 drop(candidate);
-                self.pending_collision_deadline = None;
+                self.deadlines.cancel(Timer::CandidateOpen);
             }
+            // RFC 9687 §4.3: send the NOTIFICATION only if that does not
+            // delay dropping the connection.
+            self.abort_on_close = matches!(input, FsmInput::SendHoldTimerExpired);
             let outputs = self.fsm.process(input);
-            if !self.execute(outputs).await {
+            if !self.execute(outputs) {
                 // A TCP send failed; feed TcpFailed back into the FSM.
                 // Reason stays Unclean — we never received a Notification.
                 let recovery = self.fsm.process(FsmInput::TcpFailed);
-                self.execute(recovery).await;
+                let _ = self.execute(recovery);
             }
             // Cheap no-op unless a collision candidate is both staged and
             // already holding a validated OPEN (see `CollisionCandidate`).
@@ -754,16 +712,50 @@ impl<T: BgpTransport> Session<T> {
             // OpenConfirm from OpenSent (learning the primary's own peer
             // BGP Identifier for the first time) or dying entirely — may be
             // exactly what a deferred candidate decision was waiting on.
-            self.try_resolve_pending_candidate().await;
+            self.try_resolve_pending_candidate();
+            if let Some(exit) = self.exit {
+                self.finish(exit).await;
+                return;
+            }
         }
+    }
+
+    /// Deliver what the session still owes before the task ends.
+    ///
+    /// A closing connection gets its chance to deliver the Cease, bounded by
+    /// [`CLOSE_FLUSH_TIMEOUT`]. A retired session also hands over every event,
+    /// which takes as long as the consumer does; dropping the handle ends the
+    /// wait.
+    async fn finish(mut self, exit: Exit) {
+        // Before `Retired` can be seen, so that its receiver can tell this
+        // session's senders from those of a replacement.
+        self.cmd_rx.close();
+        if matches!(exit, Exit::Retired) {
+            self.events.push(SessionEvent::Retired);
+        }
+        let closing = self.closing.take();
+        let flush = async {
+            if let Some(mut link) = closing
+                && tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, link.out.drain())
+                    .await
+                    .is_err()
+            {
+                link.out.abort();
+            }
+        };
+        tokio::join!(flush, self.events.drain());
     }
 
     /// Block until the next [`FsmInput`] arrives from any source.
     ///
-    /// Outbound UPDATEs queued via [`SessionHandle::update_sender`] are
-    /// forwarded to the transport inline; they do not produce an `FsmInput`
-    /// and the loop continues until a real FSM event arrives. If the write
-    /// fails, `TcpFailed` is returned so the FSM can recover.
+    /// Each turn of the loop does at most one bounded piece of work: a batch of
+    /// outbound UPDATEs, an overdue timer, or one ready input. Timers and input
+    /// alternate (see [`Turns`]), so an overdue timer is serviced however much
+    /// input is ready.
+    ///
+    /// Outbound UPDATEs queued via [`SessionHandle::update_sender`], writes and
+    /// event delivery produce no `FsmInput`; the loop continues until a real
+    /// FSM event arrives. A failed write returns `TcpFailed`.
     async fn wait_for_input(&mut self) -> FsmInput {
         // Return any immediate follow-up input before awaiting new events.
         // This fires TcpConnected right after pending_transport is activated
@@ -773,49 +765,58 @@ impl<T: BgpTransport> Session<T> {
         }
 
         loop {
-            let hold = deadline_fut(self.hold_deadline);
-            let keepalive = deadline_fut(self.keepalive_deadline);
-            let retry = deadline_fut(self.retry_deadline);
-            let collision_deadline = deadline_fut(self.pending_collision_deadline);
+            if let Some(input) = self.pump_updates(None) {
+                return input;
+            }
+            self.restart_send_hold_timer();
+            if let Some(timer) = self.turns.next(&self.deadlines, Instant::now()) {
+                if let Some(input) = self.on_timer(timer) {
+                    return input;
+                }
+                continue;
+            }
+
+            let wake_at = self.deadlines.earliest();
+            if let Some(at) = wake_at
+                && self.wake.deadline() != at
+            {
+                self.wake.as_mut().reset(at);
+            }
+            // While events are held for the consumer, leave the peer's data in
+            // the socket: TCP flow control pushes the wait back to the sender.
+            let reading = !self.events.is_blocked();
+            let blocked_events = self.events.is_blocked().then(|| self.events.sender());
+            let writer_idle = !self.link.as_ref().is_some_and(|l| l.out.is_flushing());
+            let (reader, out) = match &mut self.link {
+                Some(link) => (Some(&mut link.reader), Some(&mut link.out)),
+                None => (None, None),
+            };
+            let closing = self.closing.as_mut().map(|l| &mut l.out);
 
             tokio::select! {
                 biased;
 
-                cmd = self.cmd_rx.recv() => match cmd {
-                    Some(SessionCommand::Start) => return FsmInput::ManualStart,
-                    // None = handle dropped → treat as operator stop.
-                    Some(SessionCommand::Stop) | None => return FsmInput::ManualStop,
-                    Some(SessionCommand::Notification(msg)) => {
-                        return FsmInput::NotificationToSend(msg);
+                cmd = self.cmd_rx.recv() => {
+                    if let Some(input) = self.handle_command(cmd) {
+                        return input;
                     }
-                    Some(SessionCommand::AutomaticStop(msg)) => {
-                        return FsmInput::AutomaticStop(msg);
+                }
+
+                result = flush_pending(out) => {
+                    if result.is_err() {
+                        self.drop_connection();
+                        return FsmInput::TcpFailed;
                     }
-                    Some(SessionCommand::IncomingConnection(stream)) => {
-                        if let Some(input) = self.handle_incoming_connection(stream) {
-                            return input;
-                        }
-                        // Won the collision: incoming rejected, outbound continues.
-                    }
-                    Some(SessionCommand::RouteRefresh(rr)) => {
-                        if let Some(t) = &mut self.transport
-                            && t.send(BgpMessage::RouteRefresh(rr)).await.is_err()
-                        {
-                            self.drop_connection();
-                            return FsmInput::TcpFailed;
-                        }
-                        // No FSM transition; loop continues.
-                    }
-                    Some(SessionCommand::SetCapabilities(caps)) => {
-                        // Update the capability set used in the next OPEN message.
-                        // Has no effect if we are already Established — the OPEN
-                        // for the current session has already been sent.
-                        if !self.fsm.is_established() {
-                            self.fsm.set_capabilities(caps);
-                        }
-                        // No FSM transition; loop continues.
-                    }
-                },
+                }
+
+                _ = drain_pending(closing) => {
+                    self.closing = None;
+                    self.deadlines.cancel(Timer::CloseFlush);
+                }
+
+                permit = reserve(blocked_events), if !reading => {
+                    self.events.deliver(permit);
+                }
 
                 result = recv_connect(&mut self.connect_task) => {
                     self.connect_task = None;
@@ -825,17 +826,16 @@ impl<T: BgpTransport> Session<T> {
                             self.transport_identity =
                                 connection_identity(&stream, ConnectionOrigin::Outbound);
                             // connect_task is only spawned when connect_factory is Some.
-                            self.transport = Some(self.connect_factory.as_ref().unwrap()(stream));
+                            self.link =
+                                Some(Link::new(self.connect_factory.as_ref().unwrap()(stream)));
                             FsmInput::TcpConnected
                         }
                         Err(_) => FsmInput::TcpFailed,
                     };
                 }
 
-                msg = recv_message(&mut self.transport) => {
-                    if let Some(input) = self.handle_primary_message(msg).await {
-                        return input;
-                    }
+                msg = recv_message(reader), if reading => {
+                    return self.handle_primary_message(msg);
                 }
 
                 // A staged collision candidate (see `handle_incoming_connection`)
@@ -847,49 +847,252 @@ impl<T: BgpTransport> Session<T> {
                 // (TcpConnected, then the candidate's own OPEN), which the
                 // single-slot `pending_input` bypass can't queue.
                 msg = recv_candidate_message(&mut self.pending_collision_candidate) => {
-                    self.handle_collision_candidate_message(msg).await;
+                    self.handle_collision_candidate_message(msg);
                 }
 
-                () = collision_deadline => {
-                    tracing::debug!(
-                        peer = %self.config.peer_addr,
-                        "collision candidate timed out waiting for its OPEN; dropping it"
-                    );
-                    self.pending_collision_candidate = None;
-                    self.pending_collision_deadline = None;
-                }
-
-                () = hold => {
-                    self.hold_deadline = None;
-                    return FsmInput::HoldTimerExpired;
-                }
-
-                () = keepalive => {
-                    if let Some(deadline) = self.keepalive_deadline {
-                        record_keepalive_lateness(self.config.peer_addr.ip(), deadline);
+                // Only polled while the writer is idle, so a peer that is not
+                // reading fills this channel instead of the session's memory.
+                Some(update) = self.update_rx.recv(), if writer_idle => {
+                    if let Some(input) = self.pump_updates(Some(update)) {
+                        return input;
                     }
-                    self.keepalive_deadline = None;
-                    return FsmInput::KeepaliveTimerExpired;
                 }
 
-                () = retry => {
-                    self.retry_deadline = None;
-                    return FsmInput::ConnectRetryTimerExpired;
-                }
-
-                // Lowest-priority arm: outbound UPDATEs from the daemon.
-                // Written directly to the transport; no FSM transition needed.
-                Some(update) = self.update_rx.recv() => {
-                    if let Some(t) = &mut self.transport
-                        && t.send(BgpMessage::Update(update)).await.is_err()
-                    {
-                        self.drop_connection();
-                        return FsmInput::TcpFailed;
-                    }
-                    // Not yet Established, or send succeeded — loop.
-                }
+                // Nothing else ready: the next turn services the timer.
+                () = &mut self.wake, if wake_at.is_some() => {}
             }
         }
+    }
+
+    /// Apply one command. `None` means the command channel is closed.
+    fn handle_command(&mut self, cmd: Option<SessionCommand>) -> Option<FsmInput> {
+        match cmd {
+            Some(SessionCommand::Start) => Some(FsmInput::ManualStart),
+            Some(SessionCommand::Stop) => Some(FsmInput::ManualStop),
+            // Handle dropped → treat as operator stop, then end the task.
+            None => {
+                self.exit = Some(Exit::Abandoned);
+                Some(FsmInput::ManualStop)
+            }
+            Some(SessionCommand::Retire) => {
+                self.exit = Some(Exit::Retired);
+                Some(FsmInput::ManualStop)
+            }
+            Some(SessionCommand::Notification(msg)) => Some(FsmInput::NotificationToSend(msg)),
+            Some(SessionCommand::AutomaticStop(msg)) => Some(FsmInput::AutomaticStop(msg)),
+            // `None` when the incoming connection is rejected or staged.
+            Some(SessionCommand::IncomingConnection(stream)) => {
+                self.handle_incoming_connection(stream)
+            }
+            Some(SessionCommand::RouteRefresh(rr)) => {
+                if self.fsm.is_established() && !self.send_message(BgpMessage::RouteRefresh(rr)) {
+                    return Some(FsmInput::TcpFailed);
+                }
+                None
+            }
+            Some(SessionCommand::SetCapabilities(caps)) => {
+                // Update the capability set used in the next OPEN message.
+                // Has no effect if we are already Established — the OPEN
+                // for the current session has already been sent.
+                if !self.fsm.is_established() {
+                    self.fsm.set_capabilities(caps);
+                }
+                None
+            }
+        }
+    }
+
+    /// Queue `msg` and write what can be written now. `false` if the connection
+    /// failed (and has been dropped).
+    fn send_message(&mut self, msg: BgpMessage) -> bool {
+        let Some(link) = &mut self.link else {
+            return true;
+        };
+        if link.out.queue(msg).is_err() || matches!(link.out.try_flush(), Some(Err(_))) {
+            self.drop_connection();
+            return false;
+        }
+        true
+    }
+
+    /// Move one batch of the daemon's UPDATEs into the write buffer, if the
+    /// writer is idle. `first` is an UPDATE already taken from the channel.
+    ///
+    /// UPDATEs are only sent in Established; any queued at other times are
+    /// discarded, as [`SessionHandle::update_sender`] documents.
+    fn pump_updates(&mut self, first: Option<UpdateMessage>) -> Option<FsmInput> {
+        let established = self.fsm.is_established();
+        let Some(link) = self.link.as_mut().filter(|_| established) else {
+            self.discard_updates();
+            return None;
+        };
+        // `first` was received while the writer was idle, so it is never
+        // dropped here.
+        if first.is_none() && link.out.is_flushing() {
+            return None;
+        }
+        let mut queued = 0;
+        let mut next = first.or_else(|| self.update_rx.try_recv().ok());
+        while let Some(update) = next {
+            let Ok(bytes) = link.out.queue(BgpMessage::Update(update)) else {
+                self.drop_connection();
+                return Some(FsmInput::TcpFailed);
+            };
+            queued += bytes;
+            next = if self.write_batch.has_room(queued) {
+                self.update_rx.try_recv().ok()
+            } else {
+                None
+            };
+        }
+        if queued == 0 {
+            return None;
+        }
+        let failed = matches!(link.out.try_flush(), Some(Err(_)));
+        if failed {
+            self.drop_connection();
+            return Some(FsmInput::TcpFailed);
+        }
+        // RFC 4271 §8.2.2 Established: "Each time the local system sends a
+        // KEEPALIVE or UPDATE message, it restarts its KeepaliveTimer, unless
+        // the negotiated HoldTime value is zero."
+        if let Some(interval) = self.keepalive_interval
+            && self.deadlines.get(Timer::Keepalive).is_some()
+        {
+            self.deadlines
+                .arm(Timer::Keepalive, Instant::now() + interval);
+        }
+        None
+    }
+
+    /// Throw away queued UPDATEs that belong to no established session.
+    fn discard_updates(&mut self) {
+        // Bounded: a producer that keeps sending cannot hold the loop here.
+        for _ in 0..UPDATE_CHANNEL {
+            if self.update_rx.try_recv().is_err() {
+                break;
+            }
+        }
+    }
+
+    /// RFC 9687 §4.3: "Each time the local system sends a BGP message, it
+    /// restarts the `SendHoldTimer`". "Sent" means accepted by the transport:
+    /// for TCP, written to the socket.
+    ///
+    /// Returns whether a message was sent since the last call. A write resolves
+    /// as each message finishes (see [`BgpWriter::flush`]), and every path from
+    /// one to here is synchronous, so "now" is when it was sent.
+    fn restart_send_hold_timer(&mut self) -> bool {
+        let sent = self.link.as_mut().is_some_and(|l| l.out.take_sent());
+        if sent && let Some(interval) = self.send_hold_interval {
+            self.deadlines
+                .arm(Timer::SendHold, Instant::now() + interval);
+        }
+        sent
+    }
+
+    /// Service one overdue timer.
+    fn on_timer(&mut self, timer: Timer) -> Option<FsmInput> {
+        match timer {
+            Timer::SendHold => {
+                // The connection may have become writable since the last turn.
+                // A message that goes out now restarts the timer, whether or
+                // not others are still waiting behind it. A write error is met
+                // again by the flush in `wait_for_input`.
+                if let Some(link) = &mut self.link {
+                    let _ = link.out.try_flush();
+                }
+                if self.restart_send_hold_timer() {
+                    return None;
+                }
+                self.deadlines.cancel(Timer::SendHold);
+                // RFC 9687 §5: "an error MUST be logged in the local system,
+                // indicating the \"Send Hold Timer Expired\" Error Code."
+                tracing::error!(
+                    peer = %self.config.peer_addr,
+                    error_code = 8,
+                    send_hold_time = ?self.send_hold_interval,
+                    "Send Hold Timer Expired: no BGP message could be sent to the peer; \
+                     closing the session"
+                );
+                metrics::counter!(
+                    "pathvector_session_send_hold_expired_total",
+                    "peer" => self.config.peer_addr.ip().to_string()
+                )
+                .increment(1);
+                Some(FsmInput::SendHoldTimerExpired)
+            }
+            Timer::Keepalive => {
+                if let Some(deadline) = self.deadlines.get(Timer::Keepalive) {
+                    record_keepalive_lateness(self.config.peer_addr.ip(), deadline);
+                }
+                self.deadlines.cancel(Timer::Keepalive);
+                Some(FsmInput::KeepaliveTimerExpired)
+            }
+            Timer::Hold => Some(self.on_hold_timer()),
+            Timer::ConnectRetry => {
+                self.deadlines.cancel(Timer::ConnectRetry);
+                Some(FsmInput::ConnectRetryTimerExpired)
+            }
+            Timer::CandidateOpen => {
+                tracing::debug!(
+                    peer = %self.config.peer_addr,
+                    "collision candidate timed out waiting for its OPEN; dropping it"
+                );
+                self.pending_collision_candidate = None;
+                self.deadlines.cancel(Timer::CandidateOpen);
+                None
+            }
+            Timer::CloseFlush => {
+                if let Some(mut link) = self.closing.take() {
+                    link.out.abort();
+                }
+                self.deadlines.cancel(Timer::CloseFlush);
+                None
+            }
+        }
+    }
+
+    /// The `HoldTimer` is overdue.
+    ///
+    /// The peer's KEEPALIVE or UPDATE may already have arrived and be waiting
+    /// unread, because the task was behind or had stopped reading for the
+    /// consumer. Such a message restarts the timer, so read what is ready
+    /// first, within [`HoldGrace`]. The timer stays due until it is restarted
+    /// or expires.
+    fn on_hold_timer(&mut self) -> FsmInput {
+        if self.hold_grace.take()
+            && let Some(link) = &mut self.link
+            && let Some(msg) = ready_now(link.reader.recv())
+        {
+            // A closed or broken connection adds no UPDATE to the backlog.
+            if !matches!(msg, Some(Ok(_)))
+                || !self.event_backlog_limit.is_reached_by(self.events.held())
+            {
+                return self.handle_primary_message(msg);
+            }
+            // The peer is alive but the consumer has taken nothing for as long
+            // as it takes to fill the backlog. Reading more would grow it
+            // without bound.
+            if self.fsm.is_established() {
+                tracing::error!(
+                    peer = %self.config.peer_addr,
+                    held = self.events.held(),
+                    "session events are not being consumed; resetting the session"
+                );
+                metrics::counter!(
+                    "pathvector_session_event_backlog_resets_total",
+                    "peer" => self.config.peer_addr.ip().to_string()
+                )
+                .increment(1);
+                return FsmInput::AutomaticStop(NotificationMessage {
+                    error: NotificationError::Cease(CeaseError::OutOfResources),
+                    data: vec![],
+                });
+            }
+        }
+        self.deadlines.cancel(Timer::Hold);
+        FsmInput::HoldTimerExpired
     }
 
     /// RFC 4271 §6.8 connection collision detection / RFC 4724 §4.2 GR
@@ -943,7 +1146,7 @@ impl<T: BgpTransport> Session<T> {
                 self.local_addr = stream.local_addr().ok().map(|a| a.ip());
                 self.transport_identity = connection_identity(&stream, ConnectionOrigin::Inbound);
                 if let Some(factory) = &self.connect_factory {
-                    self.transport = Some(factory(stream));
+                    self.link = Some(Link::new(factory(stream)));
                 }
                 Some(FsmInput::TcpConnected)
             }
@@ -952,7 +1155,7 @@ impl<T: BgpTransport> Session<T> {
             // with (OpenSent/OpenConfirm) or might be a GR reconnect for
             // (Established). Stage it — wrap it via the same connect_factory
             // used for a direct accept, but hold it separately from
-            // `self.transport` until its OPEN is read and validated.
+            // `self.link` until its OPEN is read and validated.
             State::OpenSent | State::OpenConfirm => {
                 self.stage_collision_candidate(stream, CollisionPurpose::Collision);
                 None
@@ -999,13 +1202,15 @@ impl<T: BgpTransport> Session<T> {
             return;
         };
         self.pending_collision_candidate = Some(CollisionCandidate {
-            transport: factory(stream),
+            link: Link::new(factory(stream)),
             identity,
             open: None,
             purpose,
         });
-        self.pending_collision_deadline =
-            Some(Instant::now() + self.collision_candidate_open_timeout);
+        self.deadlines.arm(
+            Timer::CandidateOpen,
+            Instant::now() + self.collision_candidate_open_timeout,
+        );
     }
 
     /// Handles the first message read from a staged collision candidate
@@ -1025,14 +1230,14 @@ impl<T: BgpTransport> Session<T> {
     ///
     /// A candidate that clears both checks isn't necessarily *decided* yet
     /// — seeing `try_resolve_pending_candidate`.
-    async fn handle_collision_candidate_message(
+    fn handle_collision_candidate_message(
         &mut self,
         msg: Option<Result<BgpMessage, FramingError>>,
     ) {
         let Some(mut candidate) = self.pending_collision_candidate.take() else {
             return;
         };
-        self.pending_collision_deadline = None;
+        self.deadlines.cancel(Timer::CandidateOpen);
 
         let open = match msg {
             Some(Ok(BgpMessage::Open(open))) => open,
@@ -1072,13 +1277,19 @@ impl<T: BgpTransport> Session<T> {
                 "rejecting collision candidate: OPEN failed validation; \
                  existing connection (if any) left undisturbed"
             );
-            let _ = candidate
-                .transport
-                .send(BgpMessage::Notification(NotificationMessage {
+            // A fresh connection has an empty send buffer; if it still cannot
+            // take the NOTIFICATION at once, drop it without waiting.
+            if candidate
+                .link
+                .out
+                .queue(BgpMessage::Notification(NotificationMessage {
                     error,
                     data,
                 }))
-                .await;
+                .is_ok()
+            {
+                let _ = candidate.link.out.try_flush();
+            }
             drop(candidate);
             return;
         }
@@ -1119,7 +1330,7 @@ impl<T: BgpTransport> Session<T> {
 
         candidate.open = Some(open);
         self.pending_collision_candidate = Some(candidate);
-        self.try_resolve_pending_candidate().await;
+        self.try_resolve_pending_candidate();
     }
 
     /// Attempts to resolve a staged, already-validated collision candidate
@@ -1158,7 +1369,7 @@ impl<T: BgpTransport> Session<T> {
     /// reach `Established` while the candidate was still pending — that
     /// would displace a healthy, just-established primary based on stale
     /// context from before it ever finished its own handshake.
-    async fn try_resolve_pending_candidate(&mut self) {
+    fn try_resolve_pending_candidate(&mut self) {
         use crate::fsm::State;
 
         let Some(candidate) = &self.pending_collision_candidate else {
@@ -1272,7 +1483,7 @@ impl<T: BgpTransport> Session<T> {
                     "BGP collision: adopting validated incoming connection, closing existing"
                 );
                 let outputs = self.fsm.process(FsmInput::CollisionDetected);
-                self.execute(outputs).await;
+                let _ = self.execute(outputs);
             }
             State::Established => {
                 tracing::info!(
@@ -1289,14 +1500,14 @@ impl<T: BgpTransport> Session<T> {
                 // keys on (TerminationReason::Unclean).
                 self.termination_reason = TerminationReason::Unclean;
                 let outputs = self.fsm.process(FsmInput::CollisionDetected);
-                self.execute(outputs).await;
+                let _ = self.execute(outputs);
             }
             State::Idle | State::Connect | State::Active => {
                 // Nothing to tear down.
             }
         }
 
-        self.transport = Some(candidate.transport);
+        self.link = Some(candidate.link);
         self.transport_identity = Some(candidate.identity);
         self.local_addr = Some(candidate.identity.local);
         // Drive both follow-up transitions synchronously here rather than
@@ -1306,23 +1517,23 @@ impl<T: BgpTransport> Session<T> {
         // (OpenSent -> OpenConfirm, sends our KEEPALIVE) — it was already
         // consumed reading it off the wire, so it can't be read again.
         let outputs = self.fsm.process(FsmInput::TcpConnected);
-        self.execute(outputs).await;
+        let _ = self.execute(outputs);
         let outputs = self
             .fsm
             .process(FsmInput::MessageReceived(BgpMessage::Open(open)));
-        self.execute(outputs).await;
+        let _ = self.execute(outputs);
     }
 
-    /// Execute a batch of FSM outputs. Returns `false` if a TCP send failed;
-    /// the caller is responsible for feeding [`FsmInput::TcpFailed`] back to
-    /// the FSM.
+    /// Execute a batch of FSM outputs. Never blocks. Returns `false` if a TCP
+    /// send failed; the caller is responsible for feeding
+    /// [`FsmInput::TcpFailed`] back to the FSM.
     ///
     /// A failed send drops the connection but does not abandon the batch. The
     /// FSM has already changed state, so the outputs that follow (timers,
     /// `SessionTerminated`) will not be produced again: from `Idle` the
     /// `TcpFailed` fed back is ignored. Later sends find no transport and are
     /// skipped.
-    async fn execute(&mut self, outputs: Vec<FsmOutput>) -> bool {
+    fn execute(&mut self, outputs: Vec<FsmOutput>) -> bool {
         let mut all_sent = true;
         for output in outputs {
             match output {
@@ -1333,7 +1544,7 @@ impl<T: BgpTransport> Session<T> {
                         // No real TcpStream here, so no endpoints to capture —
                         // harmless, since this test/mock-only path never stages
                         // a real collision candidate to compare against.
-                        self.transport = Some(t);
+                        self.link = Some(Link::new(t));
                         self.pending_input = Some(FsmInput::TcpConnected);
                     } else if self.connect_factory.is_some() {
                         let addr = self.config.peer_addr;
@@ -1348,33 +1559,41 @@ impl<T: BgpTransport> Session<T> {
                     }
                 }
                 FsmOutput::CloseTcpConnection => {
-                    self.drop_connection();
+                    self.close_connection();
                 }
                 FsmOutput::SendMessage(msg) => {
-                    if let Some(t) = &mut self.transport
-                        && t.send(msg).await.is_err()
-                    {
-                        self.drop_connection();
-                        all_sent = false;
-                    }
+                    all_sent &= self.send_message(msg);
                 }
                 FsmOutput::StartHoldTimer(d) => {
-                    self.hold_deadline = Some(Instant::now() + d);
+                    self.deadlines.arm(Timer::Hold, Instant::now() + d);
+                    self.hold_grace.reset();
                 }
                 FsmOutput::StopHoldTimer => {
-                    self.hold_deadline = None;
+                    self.deadlines.cancel(Timer::Hold);
                 }
                 FsmOutput::StartKeepaliveTimer(d) => {
-                    self.keepalive_deadline = Some(Instant::now() + d);
+                    self.keepalive_interval = Some(d);
+                    self.deadlines.arm(Timer::Keepalive, Instant::now() + d);
                 }
                 FsmOutput::StopKeepaliveTimer => {
-                    self.keepalive_deadline = None;
+                    self.deadlines.cancel(Timer::Keepalive);
+                }
+                FsmOutput::StartSendHoldTimer(d) => {
+                    self.send_hold_interval = Some(d);
+                    self.deadlines.arm(Timer::SendHold, Instant::now() + d);
+                }
+                FsmOutput::StopSendHoldTimer => {
+                    self.send_hold_interval = None;
+                    self.deadlines.cancel(Timer::SendHold);
                 }
                 FsmOutput::StartConnectRetryTimer(_) => {
-                    self.retry_deadline = Some(Instant::now() + self.config.connect_retry_time);
+                    self.deadlines.arm(
+                        Timer::ConnectRetry,
+                        Instant::now() + self.config.connect_retry_time,
+                    );
                 }
                 FsmOutput::StopConnectRetryTimer => {
-                    self.retry_deadline = None;
+                    self.deadlines.cancel(Timer::ConnectRetry);
                 }
                 FsmOutput::SessionEstablished(mut info) => {
                     // RFC 8654: raise the codec limit if both sides negotiated
@@ -1392,51 +1611,42 @@ impl<T: BgpTransport> Session<T> {
                     // ever receives the result.
                     let asn_width =
                         AsnWidth::negotiate(&self.config.capabilities, &info.peer_capabilities);
-                    if let Some(t) = &mut self.transport {
-                        t.set_extended_message(extended);
-                        t.set_asn_width(asn_width);
+                    if let Some(link) = &mut self.link {
+                        link.reader.set_extended_message(extended);
+                        link.reader.set_asn_width(asn_width);
+                        link.out.set_asn_width(asn_width);
                     }
                     info.local_addr = self.local_addr;
-                    send_event_timed(
-                        &self.event_tx,
-                        SessionEvent::Established(info),
-                        self.config.peer_addr.ip(),
-                    )
-                    .await;
+                    // Anything still queued was built for an earlier session.
+                    // The consumer queues nothing for this one until it has
+                    // seen the event below.
+                    self.discard_updates();
+                    self.events.push(SessionEvent::Established(info));
                 }
                 FsmOutput::SessionTerminated => {
-                    send_event_timed(
-                        &self.event_tx,
-                        SessionEvent::Terminated(self.termination_reason.clone()),
-                        self.config.peer_addr.ip(),
-                    )
-                    .await;
+                    self.events
+                        .push(SessionEvent::Terminated(self.termination_reason.clone()));
                 }
                 FsmOutput::RouteUpdate(update) => {
-                    send_event_timed(
-                        &self.event_tx,
-                        SessionEvent::RouteUpdate(update),
-                        self.config.peer_addr.ip(),
-                    )
-                    .await;
+                    self.events.push(SessionEvent::RouteUpdate(update));
                 }
             }
         }
         all_sent
     }
 
-    /// Handles one decoded (or failed-to-decode) message from the primary
-    /// transport, called from `wait_for_input`'s select loop.
-    async fn handle_primary_message(
+    /// Turns one decoded (or failed-to-decode) message from the primary
+    /// connection into an FSM input.
+    fn handle_primary_message(
         &mut self,
         msg: Option<Result<BgpMessage, FramingError>>,
-    ) -> Option<FsmInput> {
+    ) -> FsmInput {
         match msg {
             // A malformed UPDATE is *not* acted on here. The transport only
             // classifies it (pure, no I/O) and hands the result to the FSM,
             // which applies RFC 4271 §8.2.2's per-state rules first and only
             // then — in Established — lets the RFC 7606 recovery take effect.
-            // There is deliberately no path from here to `event_tx`.
+            // There is deliberately no path from here to the event channel.
             Some(Ok(BgpMessage::MalformedUpdate(m))) => {
                 for e in &m.errors {
                     tracing::warn!(
@@ -1447,28 +1657,52 @@ impl<T: BgpTransport> Session<T> {
                         "RFC 7606: malformed path attribute"
                     );
                 }
-                Some(FsmInput::MalformedUpdate(UpdateRecovery::classify(m)))
+                FsmInput::MalformedUpdate(UpdateRecovery::classify(m))
             }
-            Some(Ok(m)) => Some(FsmInput::MessageReceived(m)),
+            Some(Ok(m)) => FsmInput::MessageReceived(m),
             Some(Err(e)) => {
                 tracing::warn!(peer = %self.config.peer_addr, error = %e, "codec error on received message");
                 if let Some(notif) = header_error_notification(&e)
-                    && let Some(t) = &mut self.transport
+                    && self.send_message(BgpMessage::Notification(notif))
                 {
-                    let _ = t.send(BgpMessage::Notification(notif)).await;
+                    self.close_connection();
+                } else {
+                    self.drop_connection();
                 }
-                self.drop_connection();
-                Some(FsmInput::TcpFailed)
+                FsmInput::TcpFailed
             }
             None => {
                 self.drop_connection();
-                Some(FsmInput::TcpFailed)
+                FsmInput::TcpFailed
             }
         }
     }
 
+    /// Close the connection after letting it take what is already queued,
+    /// normally a NOTIFICATION. If it cannot at once, it carries on in the
+    /// background for at most [`CLOSE_FLUSH_TIMEOUT`], unless this teardown
+    /// must not wait (`abort_on_close`).
+    fn close_connection(&mut self) {
+        if let Some(mut link) = self.link.take()
+            && link.out.is_flushing()
+            && link.out.try_flush().is_none()
+        {
+            if self.abort_on_close {
+                link.out.abort();
+            } else {
+                if let Some(mut older) = self.closing.replace(link) {
+                    older.out.abort();
+                }
+                self.deadlines
+                    .arm(Timer::CloseFlush, Instant::now() + CLOSE_FLUSH_TIMEOUT);
+            }
+        }
+        self.drop_connection();
+    }
+
+    /// Drop the connection (if still held) and any dial in progress.
     fn drop_connection(&mut self) {
-        self.transport = None;
+        self.link = None;
         self.transport_identity = None;
         if let Some(t) = self.connect_task.take() {
             t.abort();
@@ -1548,37 +1782,6 @@ async fn tcp_connect<P: tcp_md5::TcpMd5Port + ?Sized>(
 
 // ── Free async helpers ────────────────────────────────────────────────────────
 
-/// Delivers `event` to the daemon, recording how long the session task was
-/// parked waiting for channel capacity.
-///
-/// The session task owns the hold and keepalive timers, the socket read and
-/// the socket write in one `select!` loop. While it is parked in
-/// `event_tx.send().await` it can do none of those, so a slow consumer on the
-/// other end of this channel (the daemon event loop under its write lock,
-/// see `PRODUCTION_READINESS.md` PR-1) turns directly into KEEPALIVEs not being
-/// sent. The fast path is a non-blocking `try_send` with no clock read, so the
-/// uncontended cost is nil; only a genuinely blocked send is timed and
-/// recorded as `pathvector_session_event_send_blocked_seconds{peer}` (the
-/// histogram's count is the number of times the session blocked, its sum the
-/// total time).
-///
-/// Behaviour is otherwise identical to `let _ = tx.send(event).await`: a
-/// closed channel is ignored.
-async fn send_event_timed(tx: &mpsc::Sender<SessionEvent>, event: SessionEvent, peer: IpAddr) {
-    match tx.try_send(event) {
-        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-        Err(mpsc::error::TrySendError::Full(event)) => {
-            let start = std::time::Instant::now();
-            let _ = tx.send(event).await;
-            metrics::histogram!(
-                "pathvector_session_event_send_blocked_seconds",
-                "peer" => peer.to_string()
-            )
-            .record(start.elapsed().as_secs_f64());
-        }
-    }
-}
-
 /// How far past its deadline a timer is being serviced. Zero if serviced
 /// early or exactly on time (`saturating_duration_since`).
 fn timer_lateness(now: Instant, deadline: Instant) -> std::time::Duration {
@@ -1587,24 +1790,14 @@ fn timer_lateness(now: Instant, deadline: Instant) -> std::time::Duration {
 
 /// Records `pathvector_session_keepalive_lateness_seconds{peer}`: the gap
 /// between when the keepalive timer was due and when the session loop
-/// actually got to service it. Near zero on a healthy session; grows when the
-/// task is parked in a blocked `send_event_timed`, or when the `biased;`
-/// `select!` keeps picking an always-ready earlier arm (e.g. `recv_message`
-/// during a full-table receive) ahead of the timer arms.
+/// actually got to service it. Near zero while the task is being scheduled
+/// normally: the loop waits on nothing that can delay a due timer.
 fn record_keepalive_lateness(peer: IpAddr, deadline: Instant) {
     metrics::histogram!(
         "pathvector_session_keepalive_lateness_seconds",
         "peer" => peer.to_string()
     )
     .record(timer_lateness(Instant::now(), deadline).as_secs_f64());
-}
-
-/// Resolves at `deadline`, or never if `None`.
-async fn deadline_fut(deadline: Option<Instant>) {
-    match deadline {
-        Some(d) => tokio::time::sleep_until(d).await,
-        None => std::future::pending().await,
-    }
 }
 
 /// Resolves when the pending connect task completes, or never if `None`.
@@ -1617,14 +1810,42 @@ async fn recv_connect(
     }
 }
 
-/// Resolves with the next decoded message from the transport, or never if
-/// not connected.
-async fn recv_message<T: BgpTransport>(
-    transport: &mut Option<T>,
+/// Resolves when the event channel `tx` has room, or never if `None`.
+async fn reserve(
+    tx: Option<mpsc::Sender<SessionEvent>>,
+) -> Result<mpsc::OwnedPermit<SessionEvent>, mpsc::error::SendError<()>> {
+    match tx {
+        Some(tx) => tx.reserve_owned().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves with the next decoded message from `reader`, or never if there is
+/// none.
+async fn recv_message<R: BgpReader>(
+    reader: Option<&mut R>,
 ) -> Option<Result<BgpMessage, FramingError>> {
-    match transport {
-        Some(t) => t.recv().await,
-        None => std::future::pending::<Option<Result<BgpMessage, FramingError>>>().await,
+    match reader {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves when `out` has written at least one more message, or never if
+/// there is nothing to write.
+async fn flush_pending<W: BgpWriter>(out: Option<&mut Outbound<W>>) -> io::Result<()> {
+    match out {
+        Some(o) if o.is_flushing() => o.flush_some().await,
+        _ => std::future::pending().await,
+    }
+}
+
+/// Resolves when `out` has written everything queued, or never if there is
+/// nothing to write.
+async fn drain_pending<W: BgpWriter>(out: Option<&mut Outbound<W>>) -> io::Result<()> {
+    match out {
+        Some(o) if o.is_flushing() => o.drain().await,
+        _ => std::future::pending().await,
     }
 }
 
@@ -1637,8 +1858,8 @@ async fn recv_candidate_message<T: BgpTransport>(
         // Only poll a candidate that hasn't validated an OPEN yet — one
         // that has is held pending a decision (see
         // `try_resolve_pending_candidate`), not read from further.
-        Some(c) if c.open.is_none() => c.transport.recv().await,
-        _ => std::future::pending::<Option<Result<BgpMessage, FramingError>>>().await,
+        Some(c) if c.open.is_none() => c.link.reader.recv().await,
+        _ => std::future::pending().await,
     }
 }
 
@@ -1658,15 +1879,16 @@ mod tests {
     use std::net::Ipv4Addr as StdIpv4Addr;
 
     use super::{
-        BgpTransport, COLLISION_CANDIDATE_OPEN_TIMEOUT, ConnectionIdentity, ConnectionOrigin,
-        DEFAULT_CONNECT_RETRY_TIME, FramedBgpTransport, Session, SessionCommand, SessionConfig,
-        SessionEvent, SessionHandle, SpawnedSessionHandle, TerminationReason, spawn, spawn_with,
-        spawn_with_collision_timeout,
+        BgpReader, BgpTransport, BgpWriter, COLLISION_CANDIDATE_OPEN_TIMEOUT, ConnectionIdentity,
+        ConnectionOrigin, DEFAULT_CONNECT_RETRY_TIME, FramedBgpTransport, Link, MessagesWritten,
+        Session, SessionCommand, SessionConfig, SessionEvent, SessionHandle, SpawnedSessionHandle,
+        TerminationReason, spawn, spawn_with, spawn_with_collision_timeout,
     };
     use crate::framing::FramingError;
-    use crate::fsm::{Fsm, FsmConfig};
     use pathvector_types::Nlri;
 
+    use super::schedule::Timer;
+    use crate::fsm::FsmInput;
     use crate::message::{
         AttributeDecodeError, AttributeErrorPolicy, BgpMessage, Capability, CeaseError, CodecError,
         MalformedUpdate, MsgHeaderError, NotificationError, NotificationMessage, OpenMessage,
@@ -1707,8 +1929,38 @@ mod tests {
         }
     }
 
+    struct MockReader(mpsc::UnboundedReceiver<Result<BgpMessage, FramingError>>);
+
+    struct MockWriter {
+        send_tx: mpsc::UnboundedSender<BgpMessage>,
+        fail_send: Arc<AtomicBool>,
+        unreported: usize,
+    }
+
     impl BgpTransport for MockTransport {
-        async fn send(&mut self, msg: BgpMessage) -> io::Result<()> {
+        type Reader = MockReader;
+        type Writer = MockWriter;
+
+        fn into_split(self) -> (MockReader, MockWriter) {
+            (
+                MockReader(self.recv_rx),
+                MockWriter {
+                    send_tx: self.send_tx,
+                    fail_send: self.fail_send,
+                    unreported: 0,
+                },
+            )
+        }
+    }
+
+    impl BgpReader for MockReader {
+        async fn recv(&mut self) -> Option<Result<BgpMessage, FramingError>> {
+            self.0.recv().await
+        }
+    }
+
+    impl BgpWriter for MockWriter {
+        fn queue(&mut self, msg: BgpMessage) -> io::Result<usize> {
             if self.fail_send.load(Ordering::SeqCst) {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -1716,11 +1968,84 @@ mod tests {
                 ));
             }
             let _ = self.send_tx.send(msg);
-            Ok(())
+            self.unreported += 1;
+            Ok(1)
         }
 
-        async fn recv(&mut self) -> Option<Result<BgpMessage, FramingError>> {
-            self.recv_rx.recv().await
+        async fn flush(&mut self) -> io::Result<MessagesWritten> {
+            Ok(MessagesWritten(std::mem::take(&mut self.unreported)))
+        }
+    }
+
+    // ── A peer that takes one message at a time ──────────────────────────────
+
+    /// Takes `room` more messages, one per `flush`, then blocks.
+    #[derive(Default)]
+    struct Trickle {
+        queued: usize,
+        room: usize,
+    }
+
+    impl BgpWriter for Trickle {
+        fn queue(&mut self, _: BgpMessage) -> io::Result<usize> {
+            self.queued += 1;
+            Ok(1)
+        }
+
+        async fn flush(&mut self) -> io::Result<MessagesWritten> {
+            if self.queued == 0 {
+                return Ok(MessagesWritten(0));
+            }
+            if self.room == 0 {
+                std::future::pending::<()>().await;
+            }
+            self.queued -= 1;
+            self.room -= 1;
+            Ok(MessagesWritten(1))
+        }
+    }
+
+    struct TrickleTransport(Trickle);
+
+    impl BgpTransport for TrickleTransport {
+        type Reader = MockReader;
+        type Writer = Trickle;
+
+        fn into_split(self) -> (MockReader, Trickle) {
+            (MockReader(mpsc::unbounded_channel().1), self.0)
+        }
+    }
+
+    /// RFC 9687 §4.3 on the timer's own path: the deadline is due, and the
+    /// connection turns out to take one of the two waiting messages. That one
+    /// is sent, so it restarts the timer. When nothing can be sent, it expires.
+    #[tokio::test(start_paused = true)]
+    async fn due_send_hold_timer_is_restarted_by_one_message_of_several() {
+        let period = Duration::from_secs(480);
+        let (mut session, _handle) = Session::<TrickleTransport>::new(test_config());
+        let mut link = Link::new(TrickleTransport(Trickle { queued: 0, room: 1 }));
+        for _ in 0..2 {
+            link.out.queue(BgpMessage::Update(announcement())).unwrap();
+        }
+        session.link = Some(link);
+        session.send_hold_interval = Some(period);
+        let now = tokio::time::Instant::now();
+        session.deadlines.arm(Timer::SendHold, now);
+
+        assert!(session.on_timer(Timer::SendHold).is_none());
+        assert_eq!(session.deadlines.get(Timer::SendHold), Some(now + period));
+
+        assert!(matches!(
+            session.on_timer(Timer::SendHold),
+            Some(FsmInput::SendHoldTimerExpired)
+        ));
+    }
+
+    fn announcement() -> UpdateMessage {
+        UpdateMessage {
+            withdrawn: vec![],
+            attributes: vec![],
+            announced: vec![Nlri::new(Ipv4Addr::new(192, 0, 2, 0), 24).expect("valid /24")],
         }
     }
 
@@ -1740,6 +2065,7 @@ mod tests {
             peer_addr: "127.0.0.1:0".parse().unwrap(),
             tcp_md5: None,
             connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
+            send_hold_time: crate::fsm::SendHoldTime::default(),
         }
     }
 
@@ -2013,19 +2339,31 @@ mod tests {
     /// else, so a keepalive cannot be what ends the session.
     struct NotificationWriteFails(MockTransport);
 
+    struct NotificationWriterFails(MockWriter);
+
     impl BgpTransport for NotificationWriteFails {
-        async fn send(&mut self, msg: BgpMessage) -> io::Result<()> {
+        type Reader = MockReader;
+        type Writer = NotificationWriterFails;
+
+        fn into_split(self) -> (MockReader, NotificationWriterFails) {
+            let (reader, writer) = self.0.into_split();
+            (reader, NotificationWriterFails(writer))
+        }
+    }
+
+    impl BgpWriter for NotificationWriterFails {
+        fn queue(&mut self, msg: BgpMessage) -> io::Result<usize> {
             if matches!(msg, BgpMessage::Notification(_)) {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "mock: send failed",
                 ));
             }
-            self.0.send(msg).await
+            self.0.queue(msg)
         }
 
-        async fn recv(&mut self) -> Option<Result<BgpMessage, FramingError>> {
-            self.0.recv().await
+        async fn flush(&mut self) -> io::Result<MessagesWritten> {
+            self.0.flush().await
         }
     }
 
@@ -2048,50 +2386,13 @@ mod tests {
         config.connect_retry_time = SHORT_RETRY;
 
         let (peers_tx, peers_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, cmd_rx) = mpsc::channel(8);
-        let (event_tx, event_rx) = mpsc::channel(64);
-        let (update_tx, update_rx) = mpsc::channel(256);
-        let session: Session<NotificationWriteFails> = Session {
-            fsm: Fsm::new(FsmConfig {
-                local_as: config.local_as,
-                local_bgp_id: config.local_bgp_id,
-                hold_time: config.hold_time,
-                capabilities: config.capabilities.clone(),
-                required_capabilities: config.required_capabilities.clone(),
-                peer_as: config.peer_as,
-                confederation_member: config.confederation_member,
-                public_as: config.public_as,
-            }),
-            config,
-            cmd_rx,
-            event_tx,
-            hold_deadline: None,
-            keepalive_deadline: None,
-            retry_deadline: None,
-            transport: None,
-            pending_transport: None,
-            pending_input: None,
-            connect_task: None,
-            connect_factory: Some(Box::new(move |_stream| {
-                let (mock, peer) = MockTransport::pair();
-                let _ = peers_tx.send(peer);
-                NotificationWriteFails(mock)
-            })),
-            local_addr: None,
-            transport_identity: None,
-            pending_collision_candidate: None,
-            pending_collision_deadline: None,
-            collision_candidate_open_timeout: COLLISION_CANDIDATE_OPEN_TIMEOUT,
-            update_rx,
-            termination_reason: TerminationReason::Unclean,
-        };
+        let (mut session, handle) = Session::<NotificationWriteFails>::new(config);
+        session.connect_factory = Some(Box::new(move |_stream| {
+            let (mock, peer) = MockTransport::pair();
+            let _ = peers_tx.send(peer);
+            NotificationWriteFails(mock)
+        }));
         tokio::spawn(session.run());
-
-        let handle = SpawnedSessionHandle {
-            cmd_tx,
-            event_rx,
-            update_tx,
-        };
         (handle, peers_rx, listener)
     }
 
@@ -2923,7 +3224,6 @@ mod tests {
     /// `yield_now` calls guarantees that it has.
     #[tokio::test]
     async fn test_framed_transport_send_io_error_is_forwarded() {
-        use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2935,7 +3235,7 @@ mod tests {
         let (_server_stream, _addr) = server_accept.unwrap();
 
         let mut transport = FramedBgpTransport::from_stream(client_stream);
-        transport.writer.get_mut().shutdown().await.unwrap();
+        transport.shutdown_write().await.unwrap();
 
         let err = transport
             .send(BgpMessage::Keepalive)
@@ -3524,9 +3824,8 @@ mod tests {
         }
         candidate_peer.send(candidate_open).await.unwrap();
 
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
+        // Real socket I/O: give the session time to read and validate it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // The operator stops the session while the candidate is still
         // deferred (validated, but held pending the primary's own identity).
@@ -3553,8 +3852,9 @@ mod tests {
         let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
             .await
             .expect("timed out waiting for the deferred candidate to close");
+        // A reset rather than a clean close if the OPEN was still unread.
         assert!(
-            closed.is_none(),
+            matches!(closed, None | Some(Err(FramingError::Io(_)))),
             "a deferred collision candidate must be closed, not adopted, \
              when the operator stops the session, got {closed:?}"
         );
@@ -3582,6 +3882,11 @@ mod tests {
     /// the daemon just removed. Pre-fix, this candidate would have survived
     /// (only `ManualStop` was covered) and been adopted once its OPEN
     /// arrived, since `Idle` alone said "nothing left to protect."
+    ///
+    /// The candidate never sends anything here. Writing to it after the
+    /// teardown would draw a TCP reset (RFC 9293 §3.6.1, SHLD-3) that races
+    /// the read of the session's FIN, making the result `None` or
+    /// `ConnectionReset` by chance.
     #[tokio::test]
     async fn test_collision_candidate_pending_closed_on_notification_to_send() {
         let peer_bgp_id = Ipv4Addr::new(10, 0, 0, 2);
@@ -3596,17 +3901,14 @@ mod tests {
         establish_with_gr(peer_bgp_id, &mut existing_peer, &mut handle).await;
 
         // A GR-purpose candidate is staged, but held back before it ever
-        // sends its OPEN.
+        // sends its OPEN. It shares a channel with the teardown below, so
+        // the session is certain to stage it first.
         let (incoming, mut candidate_peer) = candidate_pair().await;
         handle
             .incoming_sender()
             .send(SessionCommand::IncomingConnection(incoming))
             .await
             .unwrap();
-
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
 
         // The daemon issues a locally initiated administrative teardown
         // (e.g. RFC 9003 peer removal) while the candidate is still
@@ -3653,22 +3955,9 @@ mod tests {
              got {terminated_event:?}"
         );
 
-        // Only now does the candidate send its OPEN — same BGP Identifier
-        // and GR, exactly what a genuine GR reconnect would look like. If
-        // the bug were still present, this would be adopted and recreate
-        // the session the daemon just deliberately tore down.
-        let mut candidate_open = peer_open();
-        if let BgpMessage::Open(ref mut o) = candidate_open {
-            o.bgp_id = peer_bgp_id;
-            o.capabilities.push(Capability::GracefulRestart {
-                restart_flags: 0,
-                restart_time: 120,
-                families: vec![],
-            });
-        }
-        candidate_peer.send(candidate_open).await.unwrap();
-
-        // The candidate must be closed outright — not adopted.
+        // The teardown alone must close the candidate: left staged, it would
+        // stay open for `COLLISION_CANDIDATE_OPEN_TIMEOUT` waiting to send
+        // its OPEN, and be adopted when it did.
         let closed = tokio::time::timeout(Duration::from_secs(1), candidate_peer.recv())
             .await
             .expect("timed out waiting for the pending candidate to close");
@@ -4219,6 +4508,7 @@ mod tests {
             peer_as: Some(65002),
             confederation_member: false,
             public_as: 65001,
+            send_hold_time: crate::fsm::SendHoldTime::default(),
         });
 
         assert!(!fsm.is_established(), "FSM must start non-Established");
@@ -4343,40 +4633,15 @@ mod tests {
 
 #[cfg(test)]
 mod instrumentation_tests {
-    use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
-    use tokio::sync::mpsc;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use tokio::time::Instant;
 
-    use super::{
-        SessionEvent, TerminationReason, record_keepalive_lateness, send_event_timed,
-        timer_lateness,
-    };
+    use super::{record_keepalive_lateness, timer_lateness};
 
     const PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-
-    fn terminated() -> SessionEvent {
-        SessionEvent::Terminated(TerminationReason::OperatorStop)
-    }
-
-    /// Every histogram recorded so far, keyed by metric name, as raw samples.
-    fn histograms(snapshotter: &Snapshotter) -> HashMap<String, Vec<f64>> {
-        snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .filter_map(|(key, _unit, _desc, value)| match value {
-                DebugValue::Histogram(samples) => Some((
-                    key.key().name().to_string(),
-                    samples.iter().map(|s| s.into_inner()).collect(),
-                )),
-                _ => None,
-            })
-            .collect()
-    }
 
     #[test]
     fn timer_lateness_is_the_overshoot_and_never_negative() {
@@ -4391,77 +4656,6 @@ mod instrumentation_tests {
         assert_eq!(timer_lateness(base, base), Duration::ZERO);
     }
 
-    /// With capacity available the event is delivered and *no* blocked-send
-    /// sample is emitted — the metric's count must mean "number of times the
-    /// session actually blocked", not "number of sends".
-    #[tokio::test(flavor = "current_thread")]
-    async fn unblocked_send_delivers_without_recording() {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let _guard = metrics::set_default_local_recorder(&recorder);
-
-        let (tx, mut rx) = mpsc::channel(4);
-        send_event_timed(&tx, terminated(), PEER).await;
-
-        assert!(matches!(rx.recv().await, Some(SessionEvent::Terminated(_))));
-        assert!(
-            !histograms(&snapshotter).contains_key("pathvector_session_event_send_blocked_seconds")
-        );
-    }
-
-    /// When the channel is full the send parks until the consumer makes room;
-    /// the parked time is recorded once, the event is still delivered, and
-    /// delivery order is preserved.
-    #[tokio::test(flavor = "current_thread")]
-    async fn blocked_send_records_parked_time_and_still_delivers() {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let _guard = metrics::set_default_local_recorder(&recorder);
-
-        let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(terminated()).expect("prefill to capacity");
-
-        let drainer = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(40)).await;
-            let mut n = 0;
-            while let Some(_ev) = rx.recv().await {
-                n += 1;
-                if n == 2 {
-                    break;
-                }
-            }
-            n
-        });
-
-        send_event_timed(&tx, terminated(), PEER).await;
-        assert_eq!(drainer.await.expect("drainer"), 2, "both events delivered");
-
-        let samples = histograms(&snapshotter)
-            .remove("pathvector_session_event_send_blocked_seconds")
-            .expect("blocked send must be recorded");
-        assert_eq!(samples.len(), 1);
-        assert!(
-            samples[0] >= 0.035,
-            "parked ~40ms but recorded {}",
-            samples[0]
-        );
-    }
-
-    /// A closed channel is swallowed exactly as the old `let _ = tx.send(..)`
-    /// did: no panic, and nothing recorded (it never blocked).
-    #[tokio::test(flavor = "current_thread")]
-    async fn closed_channel_is_ignored() {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let _guard = metrics::set_default_local_recorder(&recorder);
-
-        let (tx, rx) = mpsc::channel(1);
-        drop(rx);
-        send_event_timed(&tx, terminated(), PEER).await;
-
-        assert!(histograms(&snapshotter).is_empty());
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn keepalive_lateness_is_recorded_per_peer() {
         let recorder = DebuggingRecorder::new();
@@ -4470,10 +4664,72 @@ mod instrumentation_tests {
 
         record_keepalive_lateness(PEER, Instant::now() - Duration::from_millis(250));
 
-        let samples = histograms(&snapshotter)
-            .remove("pathvector_session_keepalive_lateness_seconds")
-            .expect("lateness recorded");
+        let samples: Vec<f64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _unit, _desc, value)| match value {
+                DebugValue::Histogram(samples)
+                    if key.key().name() == "pathvector_session_keepalive_lateness_seconds" =>
+                {
+                    Some(samples)
+                }
+                _ => None,
+            })
+            .flatten()
+            .map(f64::from)
+            .collect();
         assert_eq!(samples.len(), 1);
         assert!(samples[0] >= 0.25, "recorded {}", samples[0]);
+    }
+}
+
+#[cfg(test)]
+mod command_flood_tests {
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+    use tokio::time::Instant;
+
+    use super::*;
+
+    /// RFC 4271 §8.2.2: `ConnectRetryTimer_Expires` (Event 9) restarts the
+    /// connection attempt. Commands that are continuously ready must not
+    /// postpone it.
+    #[tokio::test(start_paused = true)]
+    async fn overdue_connect_retry_is_serviced_while_commands_stay_ready() {
+        let config = SessionConfig {
+            local_as: 65001,
+            local_bgp_id: Ipv4Addr::new(10, 0, 0, 1),
+            hold_time: 90,
+            capabilities: vec![],
+            required_capabilities: vec![],
+            peer_as: None,
+            confederation_member: false,
+            public_as: 65001,
+            peer_addr: "127.0.0.1:0".parse().unwrap(),
+            tcp_md5: None,
+            connect_retry_time: Duration::from_secs(1),
+            send_hold_time: crate::fsm::SendHoldTime::default(),
+        };
+        let (mut session, _handle) = Session::<FramedBgpTransport>::new(config);
+        let (cmd_tx, cmd_rx) = mpsc::channel(10_000);
+        session.cmd_rx = cmd_rx;
+        session.deadlines.arm(Timer::ConnectRetry, Instant::now());
+        for _ in 0..10_000 {
+            cmd_tx
+                .try_send(SessionCommand::SetCapabilities(vec![]))
+                .unwrap();
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        let input = session.wait_for_input().await;
+        assert!(
+            matches!(input, FsmInput::ConnectRetryTimerExpired),
+            "{input:?}"
+        );
+        let handled = 10_000 - session.cmd_rx.len();
+        assert!(handled <= 8, "retry waited behind {handled} ready commands");
     }
 }

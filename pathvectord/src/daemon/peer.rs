@@ -1,4 +1,5 @@
 // daemon/peer.rs — Peer lifecycle: add, remove, establish, terminate; session listener and command processor.
+use super::peering::import_policy_pair;
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
@@ -74,8 +75,8 @@ impl DaemonState {
         let pt = config_peer_type(local_as, peer.remote_as, confed_member);
         let peer_id = PeerId::from(peer.address);
 
-        let is_rr = !self.rib.rr_clients.is_empty();
-        let (adj_out, adj_out_v6) = make_adj_ribs_out_pair(peer_id, pt, is_rr);
+        let (adj_out, adj_out_v6) =
+            make_adj_ribs_out_pair(peer_id, pt, self.rib.reflector_cluster_id());
 
         self.adj_ribs_in
             .insert(peer.address, AdjRibIn::new(peer_id));
@@ -85,23 +86,19 @@ impl DaemonState {
         self.adj_ribs_out_v6.insert(peer.address, adj_out_v6);
         self.peer_config_types.insert(peer.address, pt);
 
-        let mut import_policy = Policy::new(resolve_import_default(peer.import_default, is_ebgp));
-        let default_v6 = peer.import_default_v6.or(peer.import_default);
-        let mut import_policy_v6 = Policy::new(resolve_import_default(default_v6, is_ebgp));
         let mut export_policy = Policy::new(resolve_export_default(peer.export_default, is_ebgp));
         // No separate `export_default_v6` knob — see the matching comment in
         // `DaemonState::new`.
         let mut export_policy_v6 =
             Policy::new(resolve_export_default(peer.export_default, is_ebgp));
         let resolved_role: Option<Role> = effective_role(peer, local_as).inspect(|&role| {
-            let peer_asn = Asn::new(peer.remote_as);
-            install_otc_import_term(&mut import_policy, role, peer_asn);
-            install_otc_import_term(&mut import_policy_v6, role, peer_asn);
             install_otc_export_term(&mut export_policy, role, Asn::new(local_as));
             install_otc_export_term(&mut export_policy_v6, role, Asn::new(local_as));
         });
         self.blackhole_sessions
             .insert(peer.address, peer_blackhole(peer, resolved_role));
+        let (import_policy, import_policy_v6) =
+            import_policy_pair(peer, local_as, resolved_role, self.rov_reject.as_ref());
         self.import_policies.insert(peer.address, import_policy);
         self.import_policies_v6
             .insert(peer.address, import_policy_v6);
@@ -338,8 +335,8 @@ impl DaemonState {
         };
         self.negotiated_max_len.insert(peer_ip, max_len);
 
-        let is_rr = !self.rib.rr_clients.is_empty();
-        let (new_aro, new_aro_v6) = make_adj_ribs_out_pair(peer_id, peer_type, is_rr);
+        let (new_aro, new_aro_v6) =
+            make_adj_ribs_out_pair(peer_id, peer_type, self.rib.reflector_cluster_id());
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
             *aro = new_aro;
         }
@@ -572,6 +569,7 @@ impl DaemonState {
         );
         self.program_fib_v6(effects);
         self.repropagate_peer_prefixes_v6(peer_ip, &nlris);
+        self.emit_route_events_v6(&nlris);
     }
 
     ///
@@ -597,6 +595,10 @@ impl DaemonState {
         // - Peer sent a NOTIFICATION (RFC 8538): eligible if BOTH sides negotiated
         //   the N-bit AND the notification is NOT CEASE/HardReset (subcode 9).
         //   Hard Reset always triggers an immediate flush regardless of N-bit.
+        // - Send Hold Timer Expired (RFC 9687): this side generated the
+        //   NOTIFICATION, so eligible only if BOTH sides negotiated the N-bit
+        //   (RFC 8538 §4: "The BGP speaker generating the BGP NOTIFICATION
+        //   message MUST also follow the rules for the Receiving Speaker").
         // - OperatorStop: never eligible — we initiated the teardown.
         //
         // Additional guards: peer must have advertised a non-zero restart_time,
@@ -617,15 +619,16 @@ impl DaemonState {
                 Capability::GracefulRestart { restart_flags, restart_time, .. }
                 if *restart_time > 0 && restart_flags & 0x04 != 0)
         });
+        let n_bit_exchanged =
+            we_have_n_bit && self.gr.notification_capable_peers.contains(&peer_ip);
         let notification_gr_eligible = match &reason {
             TerminationReason::Notification(n) => {
                 use pathvector_session::message::{CeaseError, NotificationError};
                 let is_hard_reset =
                     matches!(&n.error, NotificationError::Cease(CeaseError::HardReset));
-                !is_hard_reset
-                    && we_have_n_bit
-                    && self.gr.notification_capable_peers.contains(&peer_ip)
+                !is_hard_reset && n_bit_exchanged
             }
+            TerminationReason::SendHoldTimerExpired => n_bit_exchanged,
             _ => false,
         };
         let enter_gr = !pending
@@ -719,8 +722,8 @@ impl DaemonState {
             ari.clear();
         }
 
-        // Snapshot affected prefixes before withdrawal so we can propagate the
-        // changes to other established peers below.
+        // Snapshot affected IPv4 prefixes before withdrawal so we can propagate
+        // the changes to other established peers below.
         let prev_prefixes: Vec<Nlri<Ipv4Addr>> =
             self.rib.loc_rib.best_routes().map(|(n, _)| n).collect();
 
@@ -735,6 +738,9 @@ impl DaemonState {
             best: self.rib_withdraw_peer_v6(&peer_id),
             blackhole: self.blackholes.v6.release_peer(peer_id),
         };
+        // IPv6 prefixes whose best path this teardown removed or replaced.
+        let mut changed_v6 = changed_nlris(&fx_v6.best);
+        changed_v6.sort_unstable();
         self.program_fib_v4(fx_v4);
         self.program_fib_v6(fx_v6);
 
@@ -744,8 +750,8 @@ impl DaemonState {
             .get(&peer_ip)
             .copied()
             .unwrap_or(PeerType::External);
-        let is_rr = !self.rib.rr_clients.is_empty();
-        let (new_aro, new_aro_v6) = make_adj_ribs_out_pair(peer_id, cfg_pt, is_rr);
+        let (new_aro, new_aro_v6) =
+            make_adj_ribs_out_pair(peer_id, cfg_pt, self.rib.reflector_cluster_id());
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
             *aro = new_aro;
         }
@@ -755,6 +761,10 @@ impl DaemonState {
 
         // Tell all other established peers about the best-path changes caused
         // by this teardown.
+        //
+        // RFC 4271 §3.1 / §8.2.2 delete the lost peer's routes; §9.2 requires
+        // the newly unfeasible and newly installed ones to be advertised. That
+        // holds per address family: IPv4 below, IPv6 after it.
         //
         // WARNING: this loop runs synchronously while holding the DaemonState
         // write lock.  For a peer with a large route table the loop can stall
@@ -774,7 +784,7 @@ impl DaemonState {
         let local_bgp_id = self.rib.local_bgp_id;
         let v4_deferred = self.selection_deferral.v4_deferred();
         let propagation_start = std::time::Instant::now();
-        let prefix_count = prev_prefixes.len();
+        let prefix_count = prev_prefixes.len() + changed_v6.len();
         for other_ip in other_peers {
             let other_type = self
                 .rib
@@ -782,11 +792,6 @@ impl DaemonState {
                 .get(&other_ip)
                 .copied()
                 .unwrap_or(PeerType::External);
-            let max_len = self
-                .negotiated_max_len
-                .get(&other_ip)
-                .copied()
-                .unwrap_or(MAX_LEN);
             let Some(export_policy) = self.export_policies.get(&other_ip) else {
                 tracing::error!(peer = %other_ip, "export_policies missing peer — skipping propagation on Terminated");
                 continue;
@@ -795,10 +800,10 @@ impl DaemonState {
                 tracing::error!(peer = %other_ip, "adj_ribs_out missing peer — skipping propagation on Terminated");
                 continue;
             };
-            let Some(update_tx) = self.update_senders.get(&other_ip) else {
+            if !self.update_senders.contains_key(&other_ip) {
                 tracing::error!(peer = %other_ip, "update_senders missing peer — skipping propagation on Terminated");
                 continue;
-            };
+            }
 
             let decisions: Vec<PrefixDecision> = prev_prefixes
                 .iter()
@@ -817,6 +822,7 @@ impl DaemonState {
                         nlri,
                         &self.rib.loc_rib,
                         adj_rib_out,
+                        &self.rib.rr_clients,
                         export_policy,
                         other_type,
                         local_as,
@@ -827,19 +833,10 @@ impl DaemonState {
                     )
                 })
                 .collect();
-            let other_four_byte = self.four_byte_peers.contains(&other_ip);
-            if !flush_updates(
-                other_ip,
-                decisions,
-                max_len,
-                update_tx,
-                other_type,
-                other_four_byte,
-            ) {
-                self.stalled_peers.push(other_ip);
-            }
+            self.send_decisions(other_ip, decisions);
             self.sync_advertised(other_ip);
         }
+        self.repropagate_peer_prefixes_v6(peer_ip, &changed_v6);
 
         let elapsed = propagation_start.elapsed();
         if elapsed.as_millis() > 100 {
@@ -857,6 +854,7 @@ impl DaemonState {
         // (or Announced if another peer's route was promoted). Without this,
         // the dashboard shows stale routes after a peer disconnects.
         self.emit_route_events(&prev_prefixes);
+        self.emit_route_events_v6(&changed_v6);
 
         if notify {
             let _ = self.peer_tx.send(proto::PeerEvent {
@@ -912,7 +910,7 @@ pub(super) async fn run_command_processor<H, F, P>(
                 //
                 // Special case: if the peer is present but marked for removal
                 // (`pending_removal`), the teardown hasn't completed yet.  We
-                // still skip the add — the operator must wait for the Terminated
+                // still skip the add — the operator must wait for the Retired
                 // event to clear all per-peer state before re-adding.  A warning
                 // is logged so operators can diagnose a "silent drop" scenario.
                 {
@@ -953,6 +951,8 @@ pub(super) async fn run_command_processor<H, F, P>(
                         .map_or(DEFAULT_CONNECT_RETRY_TIME, |s| {
                             std::time::Duration::from_secs(u64::from(s))
                         }),
+                    // RFC 9687 §6 RECOMMENDS enabling it without configuration.
+                    send_hold_time: SendHoldTime::RECOMMENDED,
                 };
 
                 // Before the peer can appear in incoming_senders (below).
@@ -960,7 +960,7 @@ pub(super) async fn run_command_processor<H, F, P>(
                     set_listener_key(&listener_keys, peer.address, auth.clone());
                 }
 
-                let mut handle = spawn_fn(session_cfg);
+                let handle = spawn_fn(session_cfg);
                 handle.start().await;
 
                 let update_sender = handle.update_sender();
@@ -981,15 +981,7 @@ pub(super) async fn run_command_processor<H, F, P>(
                 crate::metrics::register_peer(peer.address);
 
                 // Forward session events to the main event channel.
-                let peer_addr = peer.address;
-                let tx = event_tx.clone();
-                tokio::spawn(async move {
-                    while let Some(event) = handle.next_event().await {
-                        if tx.send((peer_addr, event)).await.is_err() {
-                            break;
-                        }
-                    }
-                });
+                tokio::spawn(forward_events(handle, peer.address, event_tx.clone()));
 
                 if let Some(store) = &peer_store {
                     store.upsert(peer.clone()).await;
@@ -998,27 +990,31 @@ pub(super) async fn run_command_processor<H, F, P>(
             }
 
             DaemonCommand::RemovePeer(peer_ip) => {
-                // Mark for removal so the Terminated handler in the event loop
-                // performs a full state purge instead of a reconnect reset.
-                // `held_down`: max-prefix stopped the session and its
-                // teardown has been processed, so no further `Terminated` is
-                // coming from it.
-                let (existed, held_down) = {
+                // Mark for removal until the session's `Retired`. `insert` is
+                // false while an earlier removal is outstanding: that one has
+                // seen to the session already.
+                //
+                // The sender is read under the same lock. It is missing only if
+                // a dead session's `Retired` has been handled already; handled
+                // after this, that event completes the removal.
+                let marked = {
                     let mut s = state.write().await;
-                    if s.adj_ribs_in.contains_key(&peer_ip) {
-                        s.pending_removal.insert(peer_ip);
-                        let held_down = s.is_max_prefix_held(peer_ip)
-                            && !s.rib.peer_types.contains_key(&peer_ip);
-                        (true, held_down)
-                    } else {
-                        (false, false)
-                    }
+                    (s.adj_ribs_in.contains_key(&peer_ip) && s.pending_removal.insert(peer_ip))
+                        .then(|| {
+                            (
+                                stop_senders.lock().unwrap().get(&peer_ip).cloned(),
+                                s.shutdown_messages.get(&peer_ip).cloned(),
+                            )
+                        })
                 };
 
-                if !existed {
-                    tracing::debug!(peer = %peer_ip, "RemovePeer: not a configured peer, skipping");
+                let Some((stop_tx, shutdown_reason)) = marked else {
+                    tracing::debug!(
+                        peer = %peer_ip,
+                        "RemovePeer: not configured or already being removed, skipping"
+                    );
                     continue;
-                }
+                };
 
                 // Stop accepting new inbound connections from this peer, then
                 // take its TCP MD5 key off the listener. In this order the
@@ -1027,13 +1023,15 @@ pub(super) async fn run_command_processor<H, F, P>(
                 incoming_senders.write().await.remove(&peer_ip);
                 remove_listener_key(&listener_keys, peer_ip);
 
-                // Send Cease NOTIFICATION; the session will emit Terminated which
-                // triggers full state cleanup in the event loop.
+                // Send Cease NOTIFICATION.
                 //
                 // If the peer has a configured shutdown_message (RFC 9003), encode it
                 // into the CEASE/AdministrativeShutdown payload instead of bare Stop.
-                let shutdown_reason = state.read().await.shutdown_messages.get(&peer_ip).cloned();
-                let stop_tx = stop_senders.lock().unwrap().get(&peer_ip).cloned();
+                //
+                // Then retire the session, which ends its task and with it the
+                // forwarding task. It first delivers the NOTIFICATION and any
+                // Terminated, and finishes with Retired, which completes the
+                // removal whatever state the session was in.
                 if let Some(tx) = stop_tx {
                     if let Some(reason) = shutdown_reason {
                         let cmd = SessionCommand::Notification(NotificationMessage {
@@ -1044,32 +1042,16 @@ pub(super) async fn run_command_processor<H, F, P>(
                     } else {
                         let _ = tx.send(SessionCommand::Stop).await;
                     }
-                    if held_down {
-                        // The session is already stopped, so it will not report
-                        // another teardown: complete the removal here.
-                        let _ = event_tx
-                            .send((
-                                peer_ip,
-                                SessionEvent::Terminated(TerminationReason::OperatorStop),
-                            ))
-                            .await;
-                    }
+                    // A closed channel means the session task has died; its
+                    // forwarding task still ends with Retired.
+                    let _ = tx.send(SessionCommand::Retire).await;
                 } else {
-                    // No live session actor (peer is idle / between reconnects and the
-                    // stop sender was dropped).  Synthesize Terminated directly so the
-                    // event loop still performs the pending_removal cleanup path —
-                    // otherwise the peer would be stuck in pending_removal forever.
-                    // Operator-initiated removal with no live session — use
-                    // Clean so on_terminated does not open a GR window.
-                    let _ = event_tx
-                        .send((
-                            peer_ip,
-                            SessionEvent::Terminated(TerminationReason::OperatorStop),
-                        ))
-                        .await;
+                    // Nothing more is coming from the session: complete the
+                    // removal from here, or the address would stay taken.
+                    let _ = event_tx.send((peer_ip, SessionEvent::Retired)).await;
                 }
-                // stop_senders entry is cleaned up when Terminated arrives and
-                // remove_peer() is called by the event loop.
+                // stop_senders entry is cleaned up when the event loop completes
+                // the removal.
                 if let Some(store) = &peer_store {
                     store.remove(peer_ip).await;
                 }

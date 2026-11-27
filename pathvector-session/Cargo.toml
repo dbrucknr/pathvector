@@ -18,7 +18,7 @@ metrics          = { workspace = true }
 pathvector-sys   = { workspace = true }
 pathvector-types = { workspace = true }
 socket2          = { workspace = true }
-tokio            = { workspace = true }
+tokio            = { workspace = true, features = ["io-util"] }
 tokio-util       = { workspace = true }
 tracing          = "0.1"
 

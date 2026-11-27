@@ -1797,11 +1797,23 @@ the crate).
 **#89 and #91 fixed 2026-11-25** (see CHANGELOG): framing is now `frame.rs` +
 `transport.rs`, and prefix records are `Vrp<A>` values. Left open from that work:
 
-- Error Reports for other malformed input. `Violation::malformed` reports only a
-  forbidden prefix tuple; an unknown PDU type (RFC 8210 §12 code 5), unsupported
-  protocol version (code 4) or wrong Length (code 0) still drops the session silently.
-  The decoder already hands over the offending bytes; the care needed is in never
-  reporting a malformed Error Report (§5.11) and not disturbing the v1→v0 fallback.
+- ~~Error Reports for other malformed input~~ — **done 2026-11-25** (see `changelog.d/2026-11-25-rpki-rtr-error-reports.md`):
+  unknown PDU type (code 5), unrecognized version (4 while negotiating, 8 after) and
+  wrong Length (0) are reported; Error Reports never are.
+- Found while doing that, not fixed:
+  - A PDU that decodes but is not allowed where it arrives (a Serial or Reset Query
+    from the cache, a Prefix before Cache Response, a Cache Reset after a Reset Query
+    or mid-transfer) drops the session with no Error Report (§12 code 0 or 3 would
+    need choosing).
+  - Wrong Lengths still accepted: a Router Key shorter than its §5.10 layout (anything
+    from 8 bytes), and bytes after an Error Report's text — with code 2 the session
+    even continues.
+  - A version 0 Router Key is ignored; RFC 6810 defines no type 9, so it should be
+    code 5.
+  - A fixed-size PDU declaring too long a Length is refused only once that many bytes
+    arrive (at most 64 KiB; nothing bounds the wait until #93).
+  - Not tested: closing with unread input (a refused record early in a large load) can
+    make TCP send a reset that destroys the Error Report before the cache reads it.
 - `RtrHandle::validate_v4`/`validate_v6` take a bare `(address, prefix_len)`, so a
   caller can still ask about a `/33`. A typed prefix argument would need a
   `pathvector-policy` change.
@@ -2378,6 +2390,13 @@ What remains as optional future work:
 
 ### Remaining
 
+- Timer jitter (RFC 4271 §10 SHOULD): multiply the KeepaliveTimer and ConnectRetryTimer by a fresh random factor in 0.75–1.0 each time they are set (issue #102 audit)
+- `pathvectord` has no `send_hold_time` setting; sessions use the RFC 9687 default. RFC 9687 §6 allows a per-peer value, and `SendHoldTime::from_secs` already validates one
+- RFC 9687 has not been exercised against GoBGP, FRR or BIRD
+- The `SendHoldTimer` counts from the last message the socket accepted in full, so an idle session behind a closed window is only detected once the kernel send buffer fills. `TCP_NOTSENT_LOWAT` or `TCP_USER_TIMEOUT` would tighten this
+- `RemovePeer` without a shutdown message sends Cease "Administrative Shutdown". RFC 4486 §4 says a speaker de-configuring a peer SHOULD send "Peer De-configured"; RFC 9003 allows a shutdown message only with "Administrative Shutdown" or "Administrative Reset", so a configured message needs its own decision
+- A session task that dies (a panic) while its peer is not being removed leaves the peer registered, with its routes, until `RemovePeer`. Nothing runs the termination handling or starts a new session
+- Needs investigation: Hold Timer expiry is reported as `TerminationReason::Unclean`, so GR retention applies without the RFC 8538 N bit even though a NOTIFICATION was sent
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - RFC 9234 strict mode — reject a session at OPEN when only one side advertises the
   Role capability. The RFC makes this optional and non-default (absence on either

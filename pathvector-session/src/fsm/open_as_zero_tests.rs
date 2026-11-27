@@ -31,6 +31,7 @@ fn config() -> FsmConfig {
         // No expected peer AS: the AS 0 rule may not depend on it.
         peer_as: None,
         confederation_member: false,
+        send_hold_time: crate::fsm::SendHoldTime::default(),
     }
 }
 

@@ -28,6 +28,10 @@ Every step that waits on the daemon — a bulk send, a gRPC call, settling — h
 a deadline of `--timeout-secs` (300 by default). A daemon that stops reading or
 answering aborts the run with that step named.
 
+`event_send_blocked` is how long events waited for the daemon's event loop,
+one sample per blocked episode. Since issue #102 the session task is not parked
+meanwhile: it stops reading that peer but keeps running timers and writes.
+
 ## Scenarios
 
 | Name | What it does |

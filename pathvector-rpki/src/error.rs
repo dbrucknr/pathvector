@@ -3,22 +3,31 @@ use std::time::Duration;
 use crate::pdu::RtrVersion;
 
 /// Errors produced by the RTR PDU codec.
+///
+/// The client answers a received PDU that fails to decode with an RFC 8210 §12
+/// Error Report and drops the session — except an Error Report, which is never
+/// answered (§5.11). Once a protocol version is agreed, a PDU at any other
+/// version gets code 8 whatever else is wrong with it (§7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PduError {
     /// The byte slice is shorter than required to read the next field.
     Truncated { needed: usize, available: usize },
-    /// The PDU type byte does not match any known RTR PDU type.
+    /// The PDU type byte does not match any known RTR PDU type. Error Report
+    /// code 5 ("Unsupported PDU Type").
     UnknownPduType(u8),
     /// The protocol version byte is neither 0 (RFC 6810) nor 1 (RFC 8210).
+    /// Error Report code 4 ("Unsupported Protocol Version") during version
+    /// negotiation, 8 after it; a Serial Notify is ignored during it (§7).
     UnknownVersion(u8),
     /// The PDU's declared length field does not match the expected length
     /// for its type (and, for v0/v1-variable PDUs like End of Data, version).
+    /// Error Report code 0 ("Corrupt Data").
     InvalidLength { pdu_type: u8, len: u32 },
     /// An Error Report PDU's text field is not valid UTF-8.
     Utf8(std::str::Utf8Error),
     /// A Prefix PDU's lengths are outside what RFC 8210 §§5.1, 5.6 and 5.7
-    /// permit (RFC 6810 §5 for version 0). The client answers with an Error
-    /// Report, code 0 ("Corrupt Data"), and drops the session.
+    /// permit (RFC 6810 §5 for version 0). Error Report code 0 ("Corrupt
+    /// Data").
     InvalidPrefix(VrpError),
 }
 

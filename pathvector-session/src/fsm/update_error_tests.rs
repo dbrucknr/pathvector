@@ -39,6 +39,7 @@ fn config() -> FsmConfig {
         peer_as: Some(65002),
         confederation_member: false,
         public_as: 65001,
+        send_hold_time: crate::fsm::SendHoldTime::default(),
     }
 }
 
@@ -392,6 +393,8 @@ fn rfc4271_8_2_2_established_session_reset_sends_exact_update_error_and_reconnec
     assert_eq!(
         out,
         vec![
+            // RFC 9687 §4.3: stopped on any transition out of Established.
+            FsmOutput::StopSendHoldTimer,
             FsmOutput::StopHoldTimer,
             FsmOutput::StopKeepaliveTimer,
             FsmOutput::SendMessage(BgpMessage::Notification(notif)),
@@ -413,6 +416,8 @@ fn rfc7606_5_2_missing_nlri_escalates_to_malformed_attribute_list_reset() {
     assert_eq!(
         out,
         vec![
+            // RFC 9687 §4.3: stopped on any transition out of Established.
+            FsmOutput::StopSendHoldTimer,
             FsmOutput::StopHoldTimer,
             FsmOutput::StopKeepaliveTimer,
             FsmOutput::SendMessage(BgpMessage::Notification(NotificationMessage {

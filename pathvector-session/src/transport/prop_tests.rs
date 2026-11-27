@@ -18,6 +18,7 @@ fn arb_config() -> impl Strategy<Value = SessionConfig> {
             peer_addr: "127.0.0.1:0".parse().unwrap(),
             tcp_md5: None,
             connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
+            send_hold_time: crate::fsm::SendHoldTime::default(),
         },
     )
 }
@@ -60,7 +61,7 @@ proptest! {
                 public_as: local_as,
                 peer_addr: "127.0.0.1:0".parse().unwrap(),
                 tcp_md5: None,
-                connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
+                connect_retry_time: DEFAULT_CONNECT_RETRY_TIME, send_hold_time: crate::fsm::SendHoldTime::default(),
             });
             handle.start().await;
             handle.stop().await;

@@ -910,9 +910,25 @@ refused (8210bis would refuse them, for protocol version 2 only; note that
 draft names the code "1 (Corrupt Data)" although Corrupt Data is 0), and the
 resume serial is forgotten after a refused record.
 
-Noticed and not fixed: RFC 8210 §12 also defines codes 4 and 5 (and 0) for an
+Noticed then: RFC 8210 §12 also defines codes 4 and 5 (and 0) for an
 unsupported protocol version, an unsupported PDU type and a corrupt Length; the
-client ends the session for these without sending a report (`TODO.md` 21a).
+client ended the session for these without sending a report. Fixed in the update
+below.
+
+**Update 2026-11-25 — Error Reports for undecodable PDUs.** Clauses re-read from
+rfc-editor.org (RFC 8210 §§5.1, 5.2, 5.11, 7, 12; RFC 6810 §§5.1, 5.10, 10; no
+errata found and no RFC updates RFC 8210).
+
+| Area | What was wrong | Resolution |
+|---|---|---|
+| §12 codes 0, 4, 5 | The earlier audit counted error codes only as things *received*; nothing checked which the router has to *send*. | Each decode failure maps to a code in one function; black-box tests send raw bytes and parse the reply independently of the codec. |
+| §5.2/§7 "regardless of the Protocol Version field" | Not previously noticed: the decoder rejected an unknown version before the state machine could apply the Serial Notify exemption, so a version 2 Serial Notify during negotiation ended the session. The existing test only used versions 0 and 1. | The 12-byte notify of an unknown version is skipped while negotiating. |
+| §7 vs §12 code 4 | Code 4 reads as the code for any unknown version, but §7 gives a PDU "for a different Protocol Version" after negotiation code 8. | 4 while negotiating, 8 after; the version rule is applied before the type or Length is judged. |
+
+Design points the RFCs leave open: terminating rather than downgrading on an
+unrecognized version during negotiation (§7 allows either); forgetting the resume
+serial after codes 0 and 5, keeping it after 4, 8 and a broken Error Report.
+Still open: see `TODO.md` 21a.
 
 ---
 
@@ -1054,3 +1070,23 @@ the unfixed code first.
   zero instance is refused. Differing non-zero instances still use the first
   (see `TODO.md`).
 - A non-mappable AS only inside a confederation segment yields no AS4_PATH.
+
+---
+
+## Timer supervision (RFC 4271 §4.4/§8.2.2/§10) and RFC 9687 (2026-11-25, issue #102)
+
+**Method:** read RFC 4271 §4.4, §8.2.2, §10, RFC 9687 in full and RFC 8538
+§4, then wrote tests for each clause and ran them against the old code. The
+§8 and §10 passes above checked which events exist and what they do, not
+whether they are ever delivered while the session is busy.
+
+| Finding | Confidence | Resolution |
+|---|---|---|
+| §8.2.2 Events 9–11 were starved: the `biased;` `select!` polled commands and messages ahead of the timers (a KEEPALIVE was sent only after 5,000 of 5,000 ready UPDATEs) | Confirmed gap (reproduced) | Fixed: timers and input alternate |
+| Socket writes and event sends were awaited inline, so a non-reading peer or a stalled consumer suspended every timer and command | Confirmed gap (reproduced) | Fixed: the session loop waits in one place; writes and event delivery are polled alongside timers |
+| A failed NOTIFICATION write skipped the rest of the teardown, so `Terminated` was never delivered | Confirmed gap (reproduced) | Fixed, on `main` first by PR #167 |
+| §8.2.2 "Each time the local system sends a KEEPALIVE or UPDATE message, it restarts its KeepaliveTimer": UPDATEs did not | Confirmed gap (reproduced) | Fixed |
+| RFC 9687 (`SendHoldTimer`) not implemented at all | Confirmed gap | Implemented; see `pathvector-session/RFC.md` |
+| RFC 9687 §4.3 "Each time the local system sends a BGP message, it restarts the SendHoldTimer": the first implementation restarted it only when the whole write buffer had drained, so a peer taking one message per 100 s from a batch was closed at 480 s. The test then named for the clause used a mock that wrote its whole queue at once. The same rule left a sent KEEPALIVE or ROUTE-REFRESH suppressing the next | Confirmed gap (found in review of PR #161, reproduced) | Fixed before merge: the writer reports each message as its last byte is written |
+| §10 jitter SHOULD on KeepaliveTimer / ConnectRetryTimer | Confirmed gap (read from code) | Open, `TODO.md` |
+| Hold Timer expiry is reported as `Unclean`, so the daemon retains a GR peer's routes without the N bit, although this side sent a NOTIFICATION and RFC 8538 §4 describes retention after Hold Timer expiry for N-bit speakers | Needs investigation (read from code, not tested) | Open, `TODO.md`; unchanged here |

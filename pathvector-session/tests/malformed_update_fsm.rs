@@ -148,6 +148,7 @@ fn config(peer_addr: std::net::SocketAddr, hold_time: u16, retry: Duration) -> S
         peer_addr,
         tcp_md5: None,
         connect_retry_time: retry,
+        send_hold_time: pathvector_session::fsm::SendHoldTime::default(),
     }
 }
 

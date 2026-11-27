@@ -4,6 +4,41 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-25 (pathvector-policy: prefix matching with per-entry length windows — part of issue #84)
+
+`PrefixListCondition` answers an address-coverage question through an `IpSet`, which merges
+adjacent ranges and carries no prefix length, so it cannot express exact, or-longer or
+bounded-length matching.
+
+- **New: `PrefixMatchCondition`.** It matches when any of its entries does. Each entry is an
+  `ipnetx::prefix_match::PrefixMatch`: one prefix with its own length window (`exact`,
+  `or_longer`, or `new(prefix, min, max)`). Entries are never merged, so one entry's bounds
+  never apply to another's prefix.
+- **Entry rules come from `ipnetx`:** `prefix length <= min <= max <= address width`, with
+  host bits normalized. An empty list matches nothing.
+- **Dependency:** the workspace now requires `ipnetx` 0.3.1, which adds `prefix_match`. The
+  release is additive over 0.3.0.
+- **Unchanged:** `PrefixListCondition` keeps its whole-range union semantics.
+- **Not included:** And/Or combinators (the rest of issue #84) and any daemon configuration.
+
+---
+
+## 2026-11-25 (outbound UPDATE ordering — issue #159)
+
+### Fixes
+
+- A peer could be left with a route the daemon had withdrawn, or with replaced attributes,
+  when several decisions for one prefix were buffered before a flush: withdrawals were sent
+  first and announcements grouped by attributes, regardless of decision order. Only the
+  last announce or withdraw per prefix is now sent.
+- Session teardown, Graceful Restart, End-of-RIB catch-up and export-policy changes sent
+  their UPDATEs ahead of decisions still buffered, with the same result. They now go
+  through the peer's buffer.
+- IPv6 prefixes with equal attributes but different next hops were packed into one
+  `MP_REACH_NLRI` and advertised with the first one's next hop (RFC 4760 §3).
+
+---
+
 ## 2026-11-25 (pathvector-rib: one destination, one key — issue #71)
 
 RFC 4271 §4.3 says of the bits that pad a prefix to an octet boundary that "the value of
