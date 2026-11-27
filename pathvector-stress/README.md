@@ -10,15 +10,15 @@ gRPC API.
 
 | Metric | How |
 |---|---|
-| Convergence time | Wall clock from first `originate_routes` call to last batch returning |
+| Time to add routes | Wall clock from first `originate_routes` call to last batch returning |
 | Peak RSS | `ps -p <pid> -o rss=` sampled every 500 ms |
 | Final RSS | RSS snapshot after origination completes |
 | Error / warn count | pathvectord stderr lines containing `ERROR` / `WARN` |
 
-Three escalating phases: 10k → 100k → 500k prefixes, accumulated (500k run
-includes all routes from the previous phases).
+Six escalating phases: 10k → 100k → 250k → 500k → 750k → 900k prefixes. The table
+accumulates, and each phase's time covers only the routes that phase adds.
 
-**Withdrawal phase** — withdraws all 500k routes and reports how much RSS is
+**Withdrawal phase** — withdraws every originated route and reports how much RSS is
 reclaimed.  Normal allocator page-retention means only ~7% is returned to the
 OS immediately; this is expected and not a leak.
 
@@ -27,9 +27,9 @@ should be flat across cycles; any growth indicates a memory leak.
 
 **Stage 1b — GoBGP 1:1 comparison**
 
-Runs the same three phases against GoBGP 4.x using `AddPathStream` (GoBGP's
-client-streaming batch RPC), then prints a side-by-side table of convergence
-time and peak RSS.
+Runs the same phases against GoBGP 4.x using `AddPathStream` (GoBGP's
+client-streaming batch RPC), then prints a side-by-side table of time to
+add routes and peak RSS.
 
 ---
 
@@ -110,7 +110,7 @@ lsof -ti :59372 :59373 | xargs kill -9
 
 ## Interpreting results
 
-### Convergence time
+### Time to add routes
 
 Time from the first batch call to the last batch returning.  Both daemons use
 their native gRPC batch APIs (`originate_routes` / `AddPathStream`) so the
@@ -132,7 +132,10 @@ faster.
 
 ## Baseline results (2026-06-17, Apple M2 Max, release binary)
 
-### Convergence time
+Historical figures. The [root README](../README.md#performance) has later ones,
+including much lower pathvectord memory use.
+
+### Time to add routes
 
 | Phase | pathvectord | GoBGP 4.5.0 | Ratio (pv/go) |
 |---|---|---|---|
@@ -140,7 +143,7 @@ faster.
 | 100k | 0.21 s | 0.38 s | 0.54× |
 | 500k | 0.85 s | 1.62 s | 0.52× |
 
-pathvectord converges ~2× faster than GoBGP at all three sizes.
+pathvectord added routes ~2× faster than GoBGP in all three phases.
 
 ### Peak RSS
 

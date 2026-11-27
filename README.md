@@ -10,8 +10,9 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/dbrucknr/pathvector/graph/badge.svg)](https://codecov.io/gh/dbrucknr/pathvector)
 
-A production-quality BGP implementation in Rust. Usable as a standalone daemon or
-embedded directly into an application.
+A BGP implementation in Rust. Usable as a standalone daemon or embedded directly
+into an application. It is under active development; see
+[PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) before deploying it.
 
 ---
 
@@ -102,12 +103,15 @@ against a live `pathvectord` over a loopback BGP TCP session.
 | Metric | Result | Context |
 |---|---|---|
 | Prefixes announced | 1,133,510 | Full internet routing table |
-| Announcement time | 2.20 s | Wall-clock from first to last UPDATE sent |
-| **Announcement throughput** | **514,287 prefixes/sec** | Faster than BIRD 2.x (~100–300k/sec, written in C) |
-| Unique path-attribute sets | 168,840 | Attribute deduplication reduces UPDATE message count by ~99% |
-| **RIB convergence time** | **2.88 s** | Between BIRD (~2–5s) and GoBGP (~15–30s) |
+| Announcement time | 2.20 s | Sender-side wall-clock to write every UPDATE |
+| **Announcement throughput** | **514,287 prefixes/sec** | Rate at which the replayer wrote to the session |
+| Unique path-attribute sets | 168,840 | The replayer packs prefixes that share a set into the same UPDATE |
+| **RIB convergence time** | **2.88 s** | From the end of the announcement until the route count stops changing |
 | Routes accepted into Loc-RIB | 1,133,415 / 1,133,510 | 95 rejected: MRT records multiple peer views per prefix |
 | **Total (announce + converge)** | **5.09 s** | End-to-end benchmark time |
+
+These figures measure pathvectord only. No other daemon has been run through this
+replay, so they are not a comparison.
 
 To reproduce:
 
@@ -121,16 +125,23 @@ just mrt ./latest-bview.gz
 `just stress` runs both daemons (debug profile) on the same host with identical workloads.
 `just stress-release` runs both daemons (optimized profile) on the same host with identical workloads — use this for numbers worth recording.
 
-**Convergence time** (lower is better, `just stress-release`):
+Routes are injected through each daemon's gRPC API, not over a BGP session, and
+every route carries the same attributes. The results say nothing about wire-level
+convergence.
 
-| Table size | pathvectord | GoBGP | Ratio |
-|---|---|---|---|
-| 10k  | 0.03 s | 0.05 s | **1.7× faster** |
-| 100k | 0.16 s | 0.36 s | **2.3× faster** |
-| 250k | 0.27 s | 0.59 s | **2.2× faster** |
-| 500k | 0.46 s | 0.93 s | **2.0× faster** |
-| 750k | 0.42 s | 0.90 s | **2.1× faster** |
-| 900k | 0.27 s | 0.54 s | **2.0× faster** |
+**Time to add routes** (lower is better, `just stress-release`):
+
+Each step adds only the routes needed to reach the next table size, so compare
+times against the number of routes added, not the table size.
+
+| Table size afterwards | Routes added | pathvectord | GoBGP | Ratio |
+|---|---|---|---|---|
+| 10k  | 10k  | 0.03 s | 0.05 s | **1.7× faster** |
+| 100k | 90k  | 0.16 s | 0.36 s | **2.3× faster** |
+| 250k | 150k | 0.27 s | 0.59 s | **2.2× faster** |
+| 500k | 250k | 0.46 s | 0.93 s | **2.0× faster** |
+| 750k | 250k | 0.42 s | 0.90 s | **2.1× faster** |
+| 900k | 150k | 0.27 s | 0.54 s | **2.0× faster** |
 
 **Peak RSS** (lower is better, `just stress-release`):
 
@@ -145,10 +156,9 @@ RSS (resident set size) is the physical RAM the process actually occupies at a g
 | 750k | 313.5 MB | 691.0 MB | **2.2× less** |
 | 900k | 334.2 MB | 823.6 MB | **2.5× less** |
 
-Per-route cost at 900k: 0.37 KB (pathvectord) vs 0.91 KB (GoBGP). The RSS plateau
-between 750k and 900k reflects attribute interning — real internet routes share a
-small set of AS paths and community sets, so marginal cost per route falls as the
-table grows.
+Per-route cost at 900k: 0.37 KB (pathvectord) vs 0.91 KB (GoBGP). Because every
+synthetic route has identical attributes, this is a best case for attribute
+interning; a real table will cost more per route.
 
 The numbers above are from `just stress-release`. To reproduce:
 
@@ -194,7 +204,8 @@ and allocator choice matters less.
 
 ## Crate family
 
-Each layer is a separate published crate. A library user can take only the pieces they need.
+Each layer is a separate crate, so a library user can take only the pieces they need.
+None of them is on crates.io yet.
 
 | Crate | Description | Start here if you want to… |
 |---|---|---|

@@ -94,19 +94,22 @@ Waiting for RIB convergence (snapshot polling)...
 
 - **Announcement time** — wall-clock from the first UPDATE to the last. Limited by TCP
   throughput; pathvectord accepts updates as fast as the socket buffer allows.
-- **RIB convergence** — from first UPDATE until the RIB is stable. This is the number
-  that matters for production: it tells you how long a restarting daemon needs before its
-  routing decisions are reliable again.
+- **RIB convergence** — from the end of the announcement until the route count has been
+  stable for `--idle-ms`, so it includes that quiet window. **Total** adds the
+  announcement time.
 - **Accepted vs sent** — the small rejection rate (~0.01%) is expected. The MRT snapshot
   records multiple peer perspectives per prefix; only the best-path winner enters Loc-RIB.
 
 ### Benchmark context (Apple M2 Max)
 
+An earlier run, kept for reference. The [root README](../README.md#performance)
+has later figures.
+
 | Metric | Result | Context |
 |---|---|---|
-| Announcement throughput | **343,920 prefixes/sec** | On par with BIRD 2.x (~100–300k/sec) |
-| RIB convergence | **3.70 s** | Between BIRD (~2–5s, written in C) and GoBGP (~15–30s) |
-| Total | **7.00 s** | Includes announcement + convergence |
+| Announcement throughput | **343,920 prefixes/sec** | Sender-side write rate |
+| RIB convergence | **3.70 s** | Measured after the announcement finished |
+| Total | **7.00 s** | Announcement + convergence |
 
 ---
 
@@ -121,7 +124,7 @@ Options:
   --my-as <AS>              Our BGP AS number [default: 65001]
   --router-id <IP>          Our BGP router-ID [default: 10.0.0.1]
   --grpc <URL>              pathvectord gRPC address [default: http://127.0.0.1:51200]
-  --idle-ms <MS>            Snapshot polling interval in milliseconds [default: 1000]
+  --idle-ms <MS>            Quiet window that declares convergence, in ms [default: 200]
   --timeout-secs <SECS>     Hard timeout before aborting [default: 120]
 ```
 
