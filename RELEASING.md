@@ -42,7 +42,7 @@ Pushing a `v*.*.*` tag triggers two jobs in `.github/workflows/publish.yml`:
 
 1. **Verify CI is green on main** — check `github.com/dbrucknr/pathvector/actions` before tagging. The release workflow does not wait for CI; a broken tag is harder to undo than a skipped one.
 
-2. **Update `CHANGELOG.md`** — add a section for the new version. Keep the existing format (date + bullet items).
+2. **Collect the changelog fragments** — run `./scripts/collect-changelog.sh`, which moves the entries in `changelog.d/` into `CHANGELOG.md`. Add a section for the new version if it needs one, keeping the existing format (date + bullet items), and merge the result before tagging.
 
 3. **Choose a version number** — pathvector follows [SemVer](https://semver.org/):
    - `PATCH` (`v0.1.1`) — bug fixes, no API changes

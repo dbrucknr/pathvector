@@ -4,6 +4,331 @@ All completed implementation items, extracted from TODO.md and organized by comp
 
 ---
 
+## 2026-11-27 (pathvectord: removing a peer tears it down once)
+
+Removing an Established peer ran the session teardown twice: on its `Terminated` and again on its
+`Retired`. The routes were withdrawn correctly, but the second run walked every best route in the
+Loc-RIB again under the state write lock, and `WatchRoutes` subscribers received route events for
+untouched prefixes both times.
+
+- `Retired` now skips the teardown if `Terminated` already ran it for this removal.
+- It still runs the teardown if no `Terminated` was handled while the peer was being removed (not
+  Established, between sessions with Graceful Restart routes retained, or a session task that
+  died), and if the session became Established again after that `Terminated`.
+- `Retired` is still the only event that completes a removal.
+
+The time saved has not been measured.
+
+---
+
+## 2026-11-27 (peers added at runtime get the RPKI reject-Invalid policy, #194)
+
+With `[daemon.rpki]` and `reject_invalid = true` (the default), a peer added with `AddPeer` had
+no RFC 6811 reject-Invalid import term, so RPKI-Invalid routes from it were accepted into the
+Loc-RIB. Nothing was logged, and a later ROA change did not repair it, because re-evaluation
+reused the same policy. Removing and re-adding a configured peer dropped the term too.
+
+The term was appended once, at startup, to the peers that existed then, while `AddPeer` built
+import policy separately.
+
+**The fix**
+
+- Startup and `AddPeer` now build a peer's IPv4 and IPv6 import policy in one function.
+- The daemon remembers that reject-Invalid is on, so a peer added later gets the same terms as
+  one present at startup. With `reject_invalid = false` neither gets the term.
+
+**Operator note:** after upgrading, Invalid routes from runtime-added peers are rejected. Peers
+that were persisted and loaded again at a restart already had the term.
+
+---
+
+## 2026-11-27 (pathvectord: an export-default change keeps the session's `NEXT_HOP` — issue #179)
+
+`SetExportDefault` re-advertised IPv4 routes to eBGP and `next_hop_self` peers with the router ID
+as `NEXT_HOP`, even when the default did not change. A peer that cannot reach the router ID on
+that link could not use the routes. RFC 4271 §5.1.3: for an external peer, by default "the BGP
+speaker SHOULD use the IP address of the interface that the speaker uses to establish the BGP
+connection to peer X".
+
+It now uses the session's local address, as the table dump and incremental propagation do, falling
+back to the router ID only when the session has no local IPv4 address. A call that leaves the
+default unchanged sends nothing for routes already advertised with that address. IPv6 was not
+affected.
+
+Tests: `daemon/policy.rs` (eBGP, and iBGP with `next_hop_self`).
+
+---
+
+## 2026-11-26 — README claims match what was measured
+
+- Removed the BIRD and GoBGP figures next to the MRT replay results; no run of
+  either daemon through that replay backs them.
+- Relabelled the stress-test timings: each is the time to add that phase's routes
+  over gRPC, not to converge a table of that size.
+- Described MRT announcement time and throughput as UPDATE construction plus
+  transmission, since the timer covers both.
+- Removed the "~99% fewer UPDATE messages" claim, and corrected when MRT
+  convergence timing starts and the `--idle-ms` default.
+- Dropped "production-quality" and "published crate" from the root README.
+
+---
+
+## 2026-11-26 (pathvectord: `daemon/mod.rs` split into smaller modules)
+
+A structural change with no intended change in behaviour. `daemon/mod.rs` had grown to about
+21,700 lines, most of them inline tests.
+
+- The inline test modules moved to `daemon/tests/`, grouped by topic. Test function names are
+  unchanged; their module paths are not (`daemon::stall_tests` is now `daemon::tests::stall`).
+- Production code moved to `bootstrap`, `command`, `peering`, `state`, `rib_snapshot`,
+  `rpki_feed` and `event_loop`. The module docs in `daemon/mod.rs` say which layer each is in.
+- Log events from the moved code carry the new module path as their target. A filter on
+  `pathvectord::daemon` still matches them.
+
+---
+
+## 2026-11-25 (session timers survive load and backpressure; RFC 9687 Send Hold Timer)
+
+Issue [#102](https://github.com/dbrucknr/pathvector/issues/102). The session loop's `biased;`
+`select!` polled commands and inbound messages ahead of the timers, and awaited socket writes and
+event-channel sends inline. Reproduced before the fix:
+
+- a KEEPALIVE that was due was sent only after all 5,000 ready UPDATEs had been processed, and the
+  HoldTimer only after all 20,000 ready ROUTE-REFRESH messages;
+- a ConnectRetry waited behind 10,000 ready commands;
+- with the peer not reading, the HoldTimer never fired and `Stop` had no effect;
+- with the event consumer stalled, no KEEPALIVE was sent, `Stop` had no effect and a dead peer was
+  not detected.
+
+**The fix**
+
+- The session task waits in one place. Overdue timers and ready input alternate, so neither starves
+  the other (`transport/schedule.rs`, no I/O).
+- Writes are buffered and flushed alongside everything else, in batches of about 8 KiB
+  (`transport/link.rs`).
+- Events that do not fit the channel are held in order and the peer is not read meanwhile
+  (`transport/outbox.rs`).
+- An overdue HoldTimer first reads up to 16 messages that have already arrived, so a session that
+  was behind does not declare a talking peer dead.
+
+**RFC 9687 (Send Hold Timer, updates RFC 4271)** was not implemented. A peer that kept sending
+KEEPALIVEs behind a closed TCP window kept the session up for ever. It is now implemented, enabled
+by default at the greater of 8 minutes and twice the negotiated hold time, and configurable per
+session with the validated `SendHoldTime`. It restarts for each message written, including each one
+of a batch the peer is taking slowly; part of a message does not count (`transport/sink.rs`).
+
+**Behaviour changes**
+
+- Sessions close with NOTIFICATION code 8 and `TerminationReason::SendHoldTimerExpired` when nothing
+  can be sent for the `SendHoldTime`. The daemon reports it as `reason="send_hold_timer_expired"` and
+  retains routes for Graceful Restart only if the RFC 8538 N bit was exchanged.
+- A session whose events are never consumed is reset with Cease / Out of Resources once 64 events
+  are held.
+- Sending an UPDATE now restarts the KeepaliveTimer (RFC 4271 §8.2.2).
+- A NOTIFICATION that cannot be written no longer loses the `Terminated` event. This was also fixed
+  on `main` first, by [#167](https://github.com/dbrucknr/pathvector/pull/167); its tests are kept,
+  ported to the split transport ports.
+- Dropping a session handle now ends its task. It used to spin on the closed command channel.
+- UPDATEs and ROUTE-REFRESH are sent only in Established, as the API documented.
+- `pathvector_session_event_send_blocked_seconds` now measures how long events waited, per blocked
+  episode; the session is no longer parked for that time.
+
+**Breaking API changes (`pathvector-session`)**
+
+- `BgpTransport` is now `into_split()` into a `BgpReader` and a `BgpWriter` (`queue` without waiting,
+  cancel-safe `flush` that resolves as messages complete, with a `MessagesWritten` count).
+- `SessionConfig` and `FsmConfig` have a new `send_hold_time` field.
+- New variants: `FsmInput::SendHoldTimerExpired`, `FsmOutput::{Start,Stop}SendHoldTimer`,
+  `NotificationError::SendHoldTimerExpired`, `TerminationReason::SendHoldTimerExpired`.
+
+New metrics: `pathvector_session_send_hold_expired_total`,
+`pathvector_session_event_backlog_resets_total`.
+
+**Measurements**
+
+Taken before the per-message flush reporting above was added, and not repeated.
+
+`pathvector-loadtest`, one loader with a 1,133,510-prefix RIPE RIS table plus a 9 s control peer,
+loopback, release build, Apple M2 Max; base is the commit this change sits on. One loader only, so
+this is not PR-1's two-full-table-peer run.
+
+| | Base | This change |
+|---|---|---|
+| Initial convergence, median of 19 runs (range) | 5.81 s (5.67–6.08) | 5.75 s (5.36–5.89) |
+| Reconvergence, median of 9 runs (range) | 5.99 s (5.92–6.11) | 5.94 s (5.90–7.19, one outlier) |
+| Peer teardown, median of 9 runs | 2.07 s | 2.09 s |
+| Control peer longest silence in convergence (hold 9 s) | ≤ 3.01 s | ≤ 3.01 s |
+| `event_send_blocked` total in convergence, median of 18 alternated runs (range) | 640 ms (364–915) | 634 ms (395–973) |
+
+Base and branch runs were alternated except for six a side in the first two rows. `keepalive_lateness` is unchanged in kind. It grows only while `watch_routes` snapshots run: with the
+harness temporarily set to a 9 s loader hold time and 60 s churn phases (5 alternated runs a side,
+about 20 KEEPALIVEs per session per run), the loader and control sessions were late by nearly the
+same total within each run on both sides (base 1.35–2.57 s, this change 0.20–2.85 s). That points at
+daemon-wide stalls, not at either session loop; the cause was not isolated. The `event_send_blocked`
+metric now samples a blocked episode rather than one parked send.
+
+The failures this change fixes (a stalled consumer, a non-reading peer, input that never pauses) do
+not arise in these loopback runs, so they are shown by tests, not by these numbers.
+
+---
+
+## 2026-11-25 (pathvectord: route-reflector non-client split-horizon on every send path)
+
+On a route reflector, a route from a non-client iBGP peer goes to clients only (RFC 4456 §6).
+Only incremental propagation and the opening table dump applied that rule (issue #168):
+
+- Session loss, Graceful Restart stale marking, End-of-RIB prune, deadline expiry and
+  export-policy changes reflected one non-client's route to another.
+- A non-client holding a client's route was sent no withdrawal when a non-client's path took over
+  as best, and kept the old route. RFC 4271 §9.1.3: "the previously advertised route in that
+  Adj-RIB-Out MUST be withdrawn from service".
+- The rule looked up the source's live session, so a peer connecting while a non-client's routes
+  were retained for Graceful Restart was sent them.
+- The rule was skipped when the source peer was reached over IPv6.
+
+The rule now lives in `propagate_prefix` / `propagate_prefix_v6`, which every send path goes
+through, and an excluded route yields a withdrawal if it was advertised before. It reads the
+source's peer type from the route itself, so it still holds once the session is gone.
+
+Tests: `daemon/rr_split_horizon_tests.rs`. IPv6 session loss without Graceful Restart still sends
+nothing (issue #160), so the IPv6 teardown cases use the flush of a family not covered by the
+Graceful Restart capability.
+
+---
+
+## 2026-11-25 (pathvectord: a route reflector no longer resets the session on an iBGP withdrawal)
+
+A route reflector added `ORIGINATOR_ID` and `CLUSTER_LIST` to each UPDATE it *received* from an
+iBGP peer. A withdraw-only UPDATE then looked like one with attributes but no reachable NLRI, so
+the RFC 7606 §5.2 check found ORIGIN missing and reset the session (issue #177). Both address
+families were affected, so the session dropped the first time an iBGP neighbour withdrew anything.
+
+- Fixed at the cause (issue #135): the two attributes are now added when a route is reflected
+  (iBGP-learned, advertised to an iBGP peer), as RFC 4456 §8 describes, and received routes are
+  stored as received (RFC 4271 §3.2). Inbound loop detection is unchanged.
+- Adj-RIB-In and Loc-RIB no longer show attributes this speaker added. Best-path selection now
+  compares the received `CLUSTER_LIST` length (RFC 4456 §9), so a reflector no longer penalizes
+  `Internal` routes against `ConfedMember` ones.
+- The fallback that used this speaker's own BGP Identifier as `ORIGINATOR_ID` is gone. A route
+  whose source's identifier is unknown (not reachable on an Established session) is not reflected.
+- API change in `pathvector-rib`: `AdjRibOut::new_reflecting` now takes the reflector's
+  `CLUSTER_ID`, and `AdjRibOut::cluster_id` returns it.
+- Tests: `daemon/rr_reflection_tests.rs`, including one through `run_event_loop`. The test of the
+  removed fallback was deleted.
+
+---
+
+## 2026-11-25 (pathvector-rpki: Error Reports for undecodable RTR PDUs)
+
+An unknown PDU type, an unknown protocol version or a wrong Length ended the RTR session
+without telling the cache why. Each is now answered as RFC 8210 §§7 and 12 require before
+the connection is closed.
+
+| Received | Error Report | Resume serial |
+|---|---|---|
+| Unknown PDU type | 5 "Unsupported PDU Type" | forgotten: next query is a Reset Query |
+| Wrong Length | 0 "Corrupt Data" | forgotten |
+| Unknown version during negotiation | 4 "Unsupported Protocol Version" | kept |
+| Unknown version after negotiation | 8 "Unexpected Protocol Version" | kept |
+| Malformed PDU of the other version after negotiation | 8 | kept |
+| Any broken Error Report | none (§5.11) | kept |
+
+The installed VRPs are kept in every case, and nothing of a failed transfer is published.
+
+- **Behaviour change:** after an unknown type or wrong Length the client used to resume
+  with a Serial Query; it now sends a Reset Query, as it already did for a forbidden prefix
+  tuple, since the same serial would draw the same change set.
+- **Behaviour change:** a malformed prefix at the *other* protocol version in an agreed
+  session is now code 8 and keeps the serial (it was code 0).
+- **Also fixed:** a Serial Notify of an unknown version during negotiation ended the
+  session. §7 says to ignore it "regardless of the Protocol Version field".
+- An unknown type or version is now refused once its declared Length has arrived (at most
+  64 KiB), so the report can echo the whole PDU; before, the header alone ended the session.
+- The v1 to v0 fallback is unchanged. The decode path for valid PDUs is unchanged.
+- Proof: nine black-box tests over raw wire bytes, v0 and v1, in negotiation,
+  mid-transfer and idle, all failing before; guard tests for "never answer an Error
+  Report" and for the fallback; a property test of the same §5.11 rule.
+
+---
+
+## 2026-11-25 (`RemovePeer` ends the session and always completes)
+
+Found by reading the code during issue #102, then reproduced over loopback before the fix:
+
+- removing an Established peer left its session task and forwarding task running: the forwarding
+  task owns the handle, which holds a command sender, so the session never saw its command channel
+  close;
+- removing a peer that was not Established (never connected, in OpenSent, or between sessions)
+  never completed. Such a session reports no `Terminated`, so the peer stayed configured and every
+  later `AddPeer` for it was refused.
+
+A third problem, found while making the change and shown by a test: if a Graceful Restart peer's
+connection failed just before `RemovePeer`, that termination opened a restart window for the peer
+being removed. Its routes stayed in the Loc-RIB with nothing left to withdraw them.
+
+**The fix**
+
+- `SessionCommand::Retire` stops a session and ends its task, whoever still holds a sender. The task
+  first delivers the NOTIFICATION and every pending event, then `SessionEvent::Retired`.
+- `RemovePeer` sends it after the stop. `Retired`, being the session's last event, is the only one
+  that completes a removal, from any state, including a peer held down after a max-prefix CEASE.
+- Until then the address stays taken and `AddPeer` for it is ignored, so no event of the removed
+  session can be mistaken for one of a later session. A repeated `RemovePeer` does nothing more.
+- `Terminated` for a peer being removed still withdraws its routes at once, and opens no restart
+  window.
+- A session task that dies emits no `Retired`, so its forwarding task adds one, behind every event
+  the session did emit.
+
+**API change:** `SessionCommand` has a new `Retire` variant and `SessionEvent` a new `Retired`
+variant.
+
+---
+
+## 2026-11-25 (pathvectord: IPv6 announcements are split at the maximum message size — issue #178)
+
+IPv6 prefixes with equal attributes and next hop were all packed into one `MP_REACH_NLRI`. At
+about 570 /48s that passed 4096 octets (RFC 4271 §4.1), and a large enough group also passed
+the 65535 of RFC 8654.
+
+- `flush_updates_v6` splits each group into as many UPDATEs as the peer's negotiated limit
+  needs, repeating the attributes and next hop in each.
+- An IPv6 route that does not fit even on its own is no longer sent (RFC 4271 §9.2). Its prefix
+  is withdrawn instead, so the peer does not keep an earlier version (RFC 8654 §4), and a
+  warning is logged. Adj-RIB-Out still lists it, and attributes are not discarded to make it
+  fit (RFC 8654 §4, SHOULD).
+- Tests: `outbound::v6_size_tests`, `coalesced_ipv6_announcements_stay_within_max_len`.
+
+---
+
+## 2026-11-25 (Session loss now withdraws and replaces IPv6 routes at other peers — issue #160)
+
+### Fixes
+
+- When a session ended outside Graceful Restart helper mode (TCP failure, hold timer,
+  NOTIFICATION, `RemovePeer`), the lost peer's IPv6 routes left the Loc-RIB and FIB but no
+  UPDATE was sent: other peers kept the unreachable prefixes and never learned the
+  replacement path. RFC 4271 §3.1 / §8.2.2 delete those routes and §9.2 requires
+  advertising the result. IPv6-capable peers now get `MP_UNREACH_NLRI` or the new best
+  route.
+- `WatchRoutes` subscribers were not told about IPv6 changes on any teardown path: session
+  loss, the Graceful Restart flush, stale marking, deadline expiry and the End-of-RIB prune.
+  They now are.
+- Not covered: IPv6 changes from a received UPDATE, a next-hop change or an import-policy
+  change still emit no `WatchRoutes` event (issue #169). Local origination and withdrawal do.
+
+---
+
+## 2026-11-25 (docs: one changelog file per PR)
+
+Every PR inserted its entry at the top of `CHANGELOG.md`, so each merge to `main` put other open
+PRs into conflict and resolving it re-ran CI. Replaying 42 recent sync merges, 24 conflicted in
+`CHANGELOG.md` and nowhere else.
+
+- PRs now add `changelog.d/YYYY-MM-DD-slug.md` and leave `CHANGELOG.md` alone.
+- `scripts/collect-changelog.sh` folds the fragments into `CHANGELOG.md`, newest first.
+
+---
+
 ## 2026-11-25 (pathvector-policy: prefix matching with per-entry length windows — part of issue #84)
 
 `PrefixListCondition` answers an address-coverage question through an `IpSet`, which merges
