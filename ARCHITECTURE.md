@@ -63,7 +63,7 @@ SessionEvent::RouteUpdate(msg)         pathvector-session/src/transport/mod.rs
   │  via SessionHandle::next_event()
   │
   ▼
-per-peer forwarding task (pathvectord) pathvectord/src/daemon.rs  run()
+per-peer forwarding task (pathvectord) pathvectord/src/daemon/bootstrap.rs  build_daemon()
   │  tokio::spawn per configured peer
   │  event_tx.send((peer_addr, event))
   │
@@ -71,7 +71,7 @@ per-peer forwarding task (pathvectord) pathvectord/src/daemon.rs  run()
 event_rx.recv()  ←──────────────────── single mpsc channel; all peers multiplex in
   │
   ▼
-DaemonState::on_route_update()         pathvectord/src/daemon.rs
+DaemonState::on_route_update()         pathvectord/src/daemon/route.rs
   │
   ▼
 handle_update(peer_id, msg, ...)
