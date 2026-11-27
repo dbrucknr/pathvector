@@ -87,6 +87,14 @@ impl Outbox {
         self.record_unblocked();
     }
 
+    /// Wait until nothing is held, because the consumer took it or went away.
+    pub(super) async fn drain(&mut self) {
+        while self.is_blocked() {
+            let permit = self.sender().reserve_owned().await;
+            self.deliver(permit);
+        }
+    }
+
     /// Records `pathvector_session_event_send_blocked_seconds{peer}`: how long
     /// events waited for the consumer. One sample per episode, from the first
     /// event that found the channel full until the backlog was empty again.

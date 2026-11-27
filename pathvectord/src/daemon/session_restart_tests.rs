@@ -59,14 +59,14 @@ const QUIET: Duration = Duration::from_millis(1500);
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The remote end of one TCP connection from the session under test.
-struct PeerConn {
+pub(super) struct PeerConn {
     reader: FramedRead<OwnedReadHalf, BgpCodec>,
     writer: FramedWrite<OwnedWriteHalf, BgpCodec>,
 }
 
 impl PeerConn {
     /// Completes the OPEN/KEEPALIVE exchange on a connection the session dialled.
-    async fn handshake(stream: TcpStream) -> Self {
+    pub(super) async fn handshake(stream: TcpStream) -> Self {
         let (r, w) = stream.into_split();
         let mut conn = Self {
             reader: FramedRead::new(r, BgpCodec::new()),
@@ -86,7 +86,7 @@ impl PeerConn {
         conn
     }
 
-    async fn recv(&mut self) -> BgpMessage {
+    pub(super) async fn recv(&mut self) -> BgpMessage {
         tokio::time::timeout(TIMEOUT, self.reader.next())
             .await
             .expect("timed out waiting for a message from the session")
@@ -99,7 +99,7 @@ impl PeerConn {
     }
 
     /// The next NOTIFICATION, skipping anything else the session sends.
-    async fn notification(&mut self) -> NotificationMessage {
+    pub(super) async fn notification(&mut self) -> NotificationMessage {
         loop {
             if let BgpMessage::Notification(n) = self.recv().await {
                 return n;

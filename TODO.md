@@ -2394,7 +2394,8 @@ What remains as optional future work:
 - `pathvectord` has no `send_hold_time` setting; sessions use the RFC 9687 default. RFC 9687 §6 allows a per-peer value, and `SendHoldTime::from_secs` already validates one
 - RFC 9687 has not been exercised against GoBGP, FRR or BIRD
 - The `SendHoldTimer` counts from the last message the socket accepted in full, so an idle session behind a closed window is only detected once the kernel send buffer fills. `TCP_NOTSENT_LOWAT` or `TCP_USER_TIMEOUT` would tighten this
-- A removed peer's session task never ends: the daemon's forwarding task owns the handle and waits on `next_event`, so the session never sees its command channel close (read from the code during issue #102, not tested)
+- `RemovePeer` without a shutdown message sends Cease "Administrative Shutdown". RFC 4486 §4 says a speaker de-configuring a peer SHOULD send "Peer De-configured"; RFC 9003 allows a shutdown message only with "Administrative Shutdown" or "Administrative Reset", so a configured message needs its own decision
+- A session task that dies (a panic) while its peer is not being removed leaves the peer registered, with its routes, until `RemovePeer`. Nothing runs the termination handling or starts a new session
 - Needs investigation: Hold Timer expiry is reported as `TerminationReason::Unclean`, so GR retention applies without the RFC 8538 N bit even though a NOTIFICATION was sent
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - RFC 9234 strict mode — reject a session at OPEN when only one side advertises the

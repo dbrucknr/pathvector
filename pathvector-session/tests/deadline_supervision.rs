@@ -410,10 +410,43 @@ async fn permanent_consumer_stall_ends_in_a_bounded_overload_reset() {
         match next_event(&mut handle).await {
             SessionEvent::RouteUpdate(_) => events += 1,
             SessionEvent::Terminated(_) => break,
-            other @ SessionEvent::Established(_) => panic!("unexpected {other:?}"),
+            other @ (SessionEvent::Established(_) | SessionEvent::Retired) => {
+                panic!("unexpected {other:?}")
+            }
         }
     }
     assert!(events < 300, "{events} events were buffered");
+}
+
+/// Retiring a session whose consumer is behind loses nothing: the task waits
+/// until every held event, the `Terminated` and the `Retired` are taken.
+#[tokio::test(start_paused = true)]
+async fn retiring_behind_a_full_backlog_delivers_every_event() {
+    let (mut handle, peer) = established(config(9)).await;
+    // Fills the 64-entry channel, so that the rest are held.
+    for n in 0..65 {
+        peer.push(update_msg(n));
+    }
+    settle().await;
+    let commands = handle.stop_sender();
+    commands.send(SessionCommand::Retire).await.unwrap();
+    settle().await;
+    assert!(commands.is_closed(), "the session did not act on Retire");
+
+    for n in 0..65 {
+        assert!(
+            matches!(next_event(&mut handle).await, SessionEvent::RouteUpdate(u) if u == update(n))
+        );
+    }
+    assert!(matches!(
+        next_event(&mut handle).await,
+        SessionEvent::Terminated(TerminationReason::OperatorStop)
+    ));
+    assert!(matches!(
+        next_event(&mut handle).await,
+        SessionEvent::Retired
+    ));
+    assert!(handle.next_event().await.is_none());
 }
 
 /// A connection that closes while the backlog is full is a TCP failure
