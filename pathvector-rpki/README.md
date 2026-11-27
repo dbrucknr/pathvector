@@ -222,8 +222,9 @@ table would care about. See `src/table.rs` for the algorithm.
 incremental (Serial Query) one — and become visible only when a validated End of Data
 arrives. At that moment the VRPs, the resume serial, `status()` and the `subscribe()`
 notification change *together*. A transfer that fails (connection loss, malformed PDU,
-protocol violation) leaves the previous generation, its serial and its notifications
-untouched, and the reconnect resumes from exactly that generation. See `src/cache.rs`.
+protocol violation) leaves the previous generation and its notifications untouched. The
+reconnect normally resumes from that generation's serial; the table below lists the
+failures after which it asks for everything instead. See `src/cache.rs`.
 Cost, measured on an M2 Max: staging a 500 000-VRP load takes 51 ms and installing it is a
 pointer swap under the table locks (≈ 0.3 µs; the replaced 500 000-VRP tables are freed afterwards, outside the locks, in ≈ 20 ms); applying a 20 000-record delta holds the
 locks for ≈ 1.9 ms. The price is memory — old and new tables coexist during a full load.
@@ -239,6 +240,12 @@ locks for ≈ 1.9 ms. The price is memory — old and new tables coexist during 
 | v0 answer to a v1 resume (§5.1: separate sessions) | no continuation; reconnect at once and resynchronise from scratch at v0 |
 | Serial Notify during version negotiation | ignored, whatever its version (§7) |
 | Prefix PDU with Prefix Length or Max Length past the family, or Max Length below Prefix Length (§§5.1, 5.6, 5.7) | Error Report 0 "Corrupt Data" carrying the PDU, drop the session; nothing of that transfer is published, the completed generation is kept, and the next query is a Reset Query |
+| Wrong Length: under 8 bytes, over 64 KiB, or wrong for the PDU type | Error Report 0 "Corrupt Data", drop the session; VRPs kept, next query is a Reset Query |
+| Unknown PDU type (§12) | Error Report 5 "Unsupported PDU Type", drop the session; VRPs kept, next query is a Reset Query |
+| Unrecognized protocol version during version negotiation (§7) | Error Report 4 "Unsupported Protocol Version", drop the session; data and serial are left alone |
+| Unrecognized protocol version after negotiation, or a malformed PDU of the other version (§7) | Error Report 8, drop the session; data and serial are left alone |
+| Serial Notify of an unrecognized version during negotiation (§7) | ignored, the session continues |
+| Any broken Error Report (bad lengths, bad UTF-8, unknown version) | **no** Error Report (§5.11), drop the session; data and serial are left alone |
 
 **Which records are accepted.** A Prefix PDU decodes straight into a `Vrp<A>`
 (`src/vrp.rs`), whose only constructor requires `prefix_len <= max_len <=` the family
@@ -278,9 +285,9 @@ call it.
 
 **Not (yet) handled** — tracked separately: duplicate-announcement
 and unknown-withdrawal errors (#92), application-level query/connect deadlines and
-retaining the advertised retry interval across reconnects (#93), Error Reports for other
-malformed input (an unknown PDU type or protocol version, or a wrong Length, ends the
-session without one — see `TODO.md`), and a single cache only.
+retaining the advertised retry interval across reconnects (#93), an Error Report for a
+well-formed PDU that arrives where it is not allowed, a few wrong Lengths the decoder
+still accepts (see `TODO.md` 21a), and a single cache only.
 RTR over plain TCP assumes a trusted network (RFC 8210 §9).
 
 ---

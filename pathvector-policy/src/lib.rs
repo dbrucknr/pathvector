@@ -6,6 +6,7 @@ mod route;
 pub mod action;
 pub mod condition;
 pub mod otc;
+pub mod prefix_match;
 pub mod rpki;
 pub mod term;
 
@@ -26,6 +27,9 @@ pub use condition::{
     Condition, LargeCommunityCondition, LocalPrefCondition, MedCondition, Not, OriginCondition,
     PrefixListCondition,
 };
+
+// Prefix entries with per-entry length windows
+pub use prefix_match::PrefixMatchCondition;
 
 // RPKI Route Origin Validation
 pub use rpki::RoaValidityCondition;

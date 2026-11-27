@@ -106,14 +106,15 @@ Shipped 2026-08-04 (`feature/rfc5065-confederation-member-support`), closing the
 **Owns:** Route struct carries `originator_id` and `cluster_list`; `AdjRibOut::new_reflecting`
 bypasses iBGP split-horizon so the daemon's propagation loop can implement correct RR semantics.  
 **Boundary:** Attribute encoding (wire format) is in `pathvector-session`. Config (`is_rr_client`,
-`cluster_id`), inbound attribute processing, and RR split-horizon enforcement are in `pathvectord`.  
+`cluster_id`), inbound loop detection, adding the attributes on reflection, and RR split-horizon
+enforcement are in `pathvectord`.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc4456
 
 | Requirement | File | Status | Verified by |
 |---|---|---|---|
 | ORIGINATOR_ID (type 9) stored on Route; carried through LocRib | `src/route.rs` | ✅ | `test_rr_originator_id_and_cluster_list_set_on_reflected_route` (in pathvectord) |
 | CLUSTER_LIST (type 10) stored on Route; carried through LocRib | `src/route.rs` | ✅ | `test_rr_originator_id_and_cluster_list_set_on_reflected_route` (in pathvectord) |
-| AdjRibOut bypass mode for RR topologies (reflects flag) | `src/adj_rib_out.rs` | ✅ | (exercised by daemon RR tests) |
+| AdjRibOut bypass mode for RR topologies (carries the reflector's `CLUSTER_ID`) | `src/adj_rib_out.rs` | ✅ | `test_new_reflecting_bypasses_ibgp_split_horizon` |
 | §9 SHOULD: "If a route carries the ORIGINATOR_ID attribute, then in Step f) the ORIGINATOR_ID SHOULD be treated as the BGP Identifier of the BGP speaker that has advertised the route" | `src/route.rs` (`EffectiveRouterId::for_route`), `src/best_path.rs` (`TieBreakKey`) | ✅ | `reflection_tests::{rfc4456_originator_id_replaces_reflector_bgp_identifier_in_step_f, mixed_direct_and_reflected_compare_peer_id_against_originator_id, originator_id_supplies_the_identifier_when_peer_bgp_id_is_unknown, prop_reflected_tie_break_matches_rfc_reference}`, `route::tests::effective_router_id_substitutes_originator_id_when_carried`; daemon: `rr_tie_break_tests::reflected_routes_are_selected_by_originator_id_not_reflector_id` |
 | §9 SHOULD: insert "prefer a route with the shorter CLUSTER_LIST length" between (f) and (g); "The CLUSTER_LIST length is zero if a route does not carry the CLUSTER_LIST attribute" | `src/route.rs` (`Route::cluster_list_len`), `src/best_path.rs` | ✅ | `reflection_tests::{rfc4456_shorter_cluster_list_wins_when_originator_ids_tie, rfc4456_cluster_list_length_is_compared_before_peer_address, rfc4456_absent_cluster_list_counts_as_length_zero, rfc4456_step_f_is_decided_before_cluster_list_length, prop_tie_breakers_are_a_strict_total_order}`; daemon: `rr_tie_break_tests::shorter_cluster_list_is_selected_before_peer_address` |
 

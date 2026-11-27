@@ -1797,11 +1797,23 @@ the crate).
 **#89 and #91 fixed 2026-11-25** (see CHANGELOG): framing is now `frame.rs` +
 `transport.rs`, and prefix records are `Vrp<A>` values. Left open from that work:
 
-- Error Reports for other malformed input. `Violation::malformed` reports only a
-  forbidden prefix tuple; an unknown PDU type (RFC 8210 §12 code 5), unsupported
-  protocol version (code 4) or wrong Length (code 0) still drops the session silently.
-  The decoder already hands over the offending bytes; the care needed is in never
-  reporting a malformed Error Report (§5.11) and not disturbing the v1→v0 fallback.
+- ~~Error Reports for other malformed input~~ — **done 2026-11-25** (see `changelog.d/2026-11-25-rpki-rtr-error-reports.md`):
+  unknown PDU type (code 5), unrecognized version (4 while negotiating, 8 after) and
+  wrong Length (0) are reported; Error Reports never are.
+- Found while doing that, not fixed:
+  - A PDU that decodes but is not allowed where it arrives (a Serial or Reset Query
+    from the cache, a Prefix before Cache Response, a Cache Reset after a Reset Query
+    or mid-transfer) drops the session with no Error Report (§12 code 0 or 3 would
+    need choosing).
+  - Wrong Lengths still accepted: a Router Key shorter than its §5.10 layout (anything
+    from 8 bytes), and bytes after an Error Report's text — with code 2 the session
+    even continues.
+  - A version 0 Router Key is ignored; RFC 6810 defines no type 9, so it should be
+    code 5.
+  - A fixed-size PDU declaring too long a Length is refused only once that many bytes
+    arrive (at most 64 KiB; nothing bounds the wait until #93).
+  - Not tested: closing with unread input (a refused record early in a large load) can
+    make TCP send a reset that destroys the Error Report before the cache reads it.
 - `RtrHandle::validate_v4`/`validate_v6` take a bare `(address, prefix_len)`, so a
   caller can still ask about a `/33`. A typed prefix argument would need a
   `pathvector-policy` change.

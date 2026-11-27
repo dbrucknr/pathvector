@@ -492,8 +492,8 @@ impl DaemonState {
             .get(&peer_ip)
             .copied()
             .unwrap_or(PeerType::External);
-        let is_rr = !self.rib.rr_clients.is_empty();
-        let (new_aro, new_aro_v6) = make_adj_ribs_out_pair(expired_peer, cfg_pt, is_rr);
+        let (new_aro, new_aro_v6) =
+            make_adj_ribs_out_pair(expired_peer, cfg_pt, self.rib.reflector_cluster_id());
         if let Some(aro) = self.adj_ribs_out.get_mut(&peer_ip) {
             *aro = new_aro;
         }

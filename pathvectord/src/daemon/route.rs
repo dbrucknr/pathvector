@@ -21,7 +21,7 @@ impl DaemonState {
     pub(crate) fn on_route_update(
         &mut self,
         peer_ip: IpAddr,
-        mut msg: UpdateMessage,
+        msg: UpdateMessage,
     ) -> Option<NotificationMessage> {
         tracing::debug!(
             peer = %peer_ip,
@@ -97,15 +97,13 @@ impl DaemonState {
         // since the peer's OPEN is required before any UPDATE arrives).
         let peer_bgp_id = self.rib.peer_bgp_ids.get(&peer_ip).copied();
 
-        // Route reflection inbound processing (RFC 4456 §8).
+        // Route reflection loop detection (RFC 4456 §8), on receipt.
         //
-        // When acting as an RR and the source peer is iBGP (client or
-        // non-client), we must:
-        //   1. Perform loop detection on the ORIGINAL wire message.
-        //   2. Inject ORIGINATOR_ID (if absent) and prepend CLUSTER_LIST.
-        //
-        // Loop detection must happen before injection so that cluster_id is
-        // not detected in a CLUSTER_LIST that we just prepended ourselves.
+        // This is the only inbound step. The received UPDATE is not edited:
+        // ORIGINATOR_ID and CLUSTER_LIST are added when a route is reflected
+        // (`outbound::add_reflection_attributes`), so the Adj-RIB-In holds
+        // what the peer sent (RFC 4271 §3.2) and the RFC 7606 checks judge
+        // only the peer's attributes.
         let is_rr = !self.rib.rr_clients.is_empty();
         if is_rr && peer_type == PeerType::Internal {
             let cluster_id = self.rib.cluster_id;
@@ -137,33 +135,6 @@ impl DaemonState {
                     "RR loop: cluster_id in CLUSTER_LIST — discarding UPDATE (RFC 4456)"
                 );
                 return None;
-            }
-
-            // RFC 4456 §8: set ORIGINATOR_ID to the peer's BGP ID if absent.
-            if !msg
-                .attributes
-                .iter()
-                .any(|a| matches!(a, PathAttribute::OriginatorId(_)))
-            {
-                let bgp_id = self
-                    .rib
-                    .peer_bgp_ids
-                    .get(&peer_ip)
-                    .copied()
-                    .unwrap_or(self.rib.local_bgp_id);
-                msg.attributes.push(PathAttribute::OriginatorId(bgp_id));
-            }
-
-            // RFC 4456 §8: prepend our cluster_id to CLUSTER_LIST.
-            if let Some(PathAttribute::ClusterList(list)) = msg
-                .attributes
-                .iter_mut()
-                .find(|a| matches!(a, PathAttribute::ClusterList(_)))
-            {
-                list.insert(0, cluster_id);
-            } else {
-                msg.attributes
-                    .push(PathAttribute::ClusterList(vec![cluster_id]));
             }
         }
 
@@ -1590,7 +1561,7 @@ pub(super) fn process_update(
 
         // RFC 4456 §9: best-path step (f) and the CLUSTER_LIST step read
         // these from the stored route, so they are stored exactly as
-        // received (after the RR ingress handling above).
+        // received.
         if let Some(id) = originator_id {
             builder = builder.originator_id(id);
         }

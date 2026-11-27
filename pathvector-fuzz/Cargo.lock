@@ -162,9 +162,9 @@ dependencies = [
 
 [[package]]
 name = "ipnetx"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50d6743467d5a35b780780bee8efdc46478ca2892f5563db20342a93d8c93dd3"
+checksum = "ae80fa62df12b1ac0623f7e50136cccba1e7e90edf36f0ebee7bd6227744bcfd"
 
 [[package]]
 name = "jobserver"
@@ -317,6 +317,7 @@ dependencies = [
  "futures",
  "pathvector-sys",
  "pathvector-types",
+ "socket2",
  "tokio",
  "tokio-util",
  "tracing",
@@ -331,6 +332,7 @@ dependencies = [
  "netlink-packet-core",
  "netlink-packet-route",
  "rtnetlink",
+ "smallvec",
  "tokio",
 ]
 
@@ -419,6 +421,12 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "smallvec"
+version = "1.16.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
 
 [[package]]
 name = "socket2"
