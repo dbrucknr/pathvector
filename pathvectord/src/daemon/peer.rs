@@ -591,15 +591,19 @@ impl DaemonState {
         // RFC 4724 §4.2 + RFC 8538 §4 — decide whether to enter GR helper mode.
         //
         // Enter GR when:
-        // - Unclean termination (TCP failure / hold-timer expiry): always eligible.
-        // - Peer sent a NOTIFICATION (RFC 8538): eligible if BOTH sides negotiated
-        //   the N-bit AND the notification is NOT CEASE/HardReset (subcode 9).
-        //   Hard Reset always triggers an immediate flush regardless of N-bit.
+        // - Unclean termination (no NOTIFICATION either way): always eligible.
+        //   RFC 4724 §4 keeps the normal BGP procedures for a TCP session
+        //   that terminates "due to the sending or receiving of a BGP
+        //   NOTIFICATION message".
+        // - A NOTIFICATION was received, or this side generated one (Hold
+        //   Timer expiry, an error it detected, an automatic reset): eligible
+        //   if BOTH sides negotiated the N-bit AND the notification is NOT
+        //   CEASE/HardReset (subcode 9). RFC 8538 §4: "The BGP speaker
+        //   generating the BGP NOTIFICATION message MUST also follow the rules
+        //   for the Receiving Speaker."
         // - Send Hold Timer Expired (RFC 9687): this side generated the
-        //   NOTIFICATION, so eligible only if BOTH sides negotiated the N-bit
-        //   (RFC 8538 §4: "The BGP speaker generating the BGP NOTIFICATION
-        //   message MUST also follow the rules for the Receiving Speaker").
-        // - OperatorStop: never eligible — we initiated the teardown.
+        //   NOTIFICATION, so eligible if both sides negotiated the N-bit.
+        // - OperatorStop: never eligible — the peer is being kept down.
         //
         // Additional guards: peer must have advertised a non-zero restart_time,
         // and must not be pending removal.
@@ -622,7 +626,7 @@ impl DaemonState {
         let n_bit_exchanged =
             we_have_n_bit && self.gr.notification_capable_peers.contains(&peer_ip);
         let notification_gr_eligible = match &reason {
-            TerminationReason::Notification(n) => {
+            TerminationReason::Notification(n) | TerminationReason::NotificationSent(n) => {
                 use pathvector_session::message::{CeaseError, NotificationError};
                 let is_hard_reset =
                     matches!(&n.error, NotificationError::Cease(CeaseError::HardReset));

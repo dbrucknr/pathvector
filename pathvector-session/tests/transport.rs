@@ -1361,10 +1361,13 @@ async fn test_raw_unrecognized_well_known_attribute_sends_real_notification_byte
         .expect("session exited without emitting an event");
     assert!(
         matches!(
-            event,
-            SessionEvent::Terminated(TerminationReason::OperatorStop)
+            &event,
+            SessionEvent::Terminated(TerminationReason::NotificationSent(n))
+                if n.error == NotificationError::UpdateMessage(
+                    pathvector_session::message::UpdateMsgError::UnrecognizedWellKnownAttribute
+                )
         ),
-        "expected Terminated(OperatorStop) after sending the session-reset NOTIFICATION, \
+        "expected Terminated(NotificationSent) after sending the session-reset NOTIFICATION, \
          got {event:?}"
     );
 

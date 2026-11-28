@@ -212,6 +212,28 @@ fn notification_without_peer_n_bit_flushes() {
     );
 }
 
+/// RFC 8538 §5: a Hard Reset asks for "a full session reset", whichever side
+/// sends it, so one this side sent flushes even with the N bit exchanged.
+/// (A caller can send one through `SessionCommand::AutomaticStop`.)
+#[test]
+fn sent_hard_reset_flushes_with_n_bit() {
+    let mut state = make_state();
+    establish(&mut state, &[gr_cap_with_n_bit(120)]);
+    state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
+
+    state.on_terminated(
+        IpAddr::V4(PEER_IP),
+        TerminationReason::NotificationSent(NotificationMessage {
+            error: NotificationError::Cease(CeaseError::HardReset),
+            data: vec![],
+        }),
+        false,
+    );
+
+    assert!(state.adj_ribs_in[&IpAddr::V4(PEER_IP)].is_empty());
+    assert!(!state.gr.deadlines.contains_key(&IpAddr::V4(PEER_IP)));
+}
+
 /// RFC 9687 Send Hold Timer expiry is a NOTIFICATION this side generates.
 /// RFC 8538 §4: "The BGP speaker generating the BGP NOTIFICATION message
 /// MUST also follow the rules for the Receiving Speaker" — with the N bit

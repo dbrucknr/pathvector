@@ -125,6 +125,9 @@ mod rr_split_horizon_tests;
 // Issue #159: UPDATEs sent to a peer, applied in order, match its Adj-RIB-Out.
 #[cfg(test)]
 mod outbound_order_tests;
+// Issue #203: which session losses retain routes, by RFC 8538 "N" bit.
+#[cfg(test)]
+mod gr_notification_tests;
 // Sessions the daemon resets on its own authority must reconnect.
 #[cfg(test)]
 mod session_restart_tests;
