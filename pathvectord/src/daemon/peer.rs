@@ -669,6 +669,9 @@ impl DaemonState {
         self.mrai_v6.remove_peer(peer_ip);
         self.pending_decisions.remove(&peer_ip);
         self.pending_decisions_v6.remove(&peer_ip);
+        // What was awaiting this session's End-of-RIB; the next one starts over.
+        self.gr.stale_nlri.remove(&peer_ip);
+        self.gr.stale_nlri_v6.remove(&peer_ip);
 
         if enter_gr {
             // RFC 4724 §4.2 — only retain routes for families the peer
@@ -690,6 +693,15 @@ impl DaemonState {
             }
             if !gr_v6 {
                 self.flush_family_v6(peer_ip);
+            }
+
+            // RFC 4724 §4.2, as replaced by RFC 8538 §4.1: "If the "N" bit has
+            // not been exchanged with the peer, then to deal with possible
+            // consecutive restarts, a route (from the peer) previously marked
+            // as stale MUST be deleted." Before this loss is marked, so only
+            // routes left stale by an earlier one qualify.
+            if !n_bit_exchanged {
+                self.delete_still_stale_routes(peer_ip, gr_v4, gr_v6);
             }
 
             // GR helper path — retain covered routes; arm deadline timer.
