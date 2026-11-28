@@ -489,16 +489,17 @@ handling) genuinely matches the RFC text on a fresh read.
 | Clause | Confidence | Notes | What would close this out |
 |---|---|---|---|
 | On (undetected) TCP termination + new incoming connection from a GR-capable peer: MUST treat as termination of the old session, close old, keep new, **no NOTIFICATION sent** | See the §5 finding below — this is the FSM-level mechanism for this clause, and it's missing | — | See §5 below |
-| On detected TCP termination for a GR-capable peer: retain routes for all previously-negotiated families, mark stale; delete any *already*-stale routes from a prior restart (handles consecutive restarts) | Confirmed correct | `unclean_termination_of_gr_peer_retains_routes`, per-family `gr_v4`/`gr_v6` check in `on_terminated` (per `pathvectord/RFC.md`) | Existing test suite |
+| On detected TCP termination for a GR-capable peer: retain routes for all previously-negotiated families, mark stale; delete any *already*-stale routes from a prior restart (handles consecutive restarts; RFC 8538 §4.1: only without the N bit) | ~~Confirmed correct~~ **Confirmed gap, fixed 2026-11-27 (issue #181)** | Retention and marking were implemented; deletion never was. The cited test refreshed nothing and asserted the route survived a second loss without the N bit, which the clause prohibits | `daemon::gr_consecutive_restart_tests` |
 | Our own R-bit MUST NOT be set unless we ourselves have restarted | Confirmed correct | Covered by the R-bit lifetime logic already verified under §3/§4.1 | — |
 | If session doesn't re-establish within peer's advertised Restart Time, MUST delete all stale routes from that peer | Confirmed correct | `gr_deadline_expiry_flushes_stale_routes`, e2e `gr_phase2_routes_held_during_restart_window_then_flushed_on_expiry` | Existing test suite |
-| On re-establishment: if F-bit not set for a family, or family absent from the new capability, or GR capability absent entirely ⇒ MUST immediately remove all stale routes for that family | Confirmed correct (cross-referenced) | Per-family retention logic (`gr_v4`/`gr_v6` checks) already tested; this pass didn't re-derive the exact F-bit-check branch line-by-line but the described behavior matches the existing test names and the `pathvectord/RFC.md` narrative | Would benefit from an explicit test naming the F-bit-false-on-reconnect case specifically, if one doesn't already exist under a different name |
+| On re-establishment: if F-bit not set for a family, or family absent from the new capability, or GR capability absent entirely ⇒ MUST immediately remove all stale routes for that family | ~~Confirmed correct (cross-referenced)~~ **Confirmed gap, open** (2026-11-27) | `on_established` decides from the families of the *previous* session's capability and never reads the F bit or the new capability. Reproduced with a temporary test: re-establishing without GR left the stale route installed | See `TODO.md` |
 | MUST send EOR after completing initial update (including the no-routes case) | Confirmed correct | Already covered under §2 | — |
 | MUST replace stale routes with new updates as they arrive; MUST immediately remove any still-stale routes once peer's EOR is received | Confirmed correct | `eor_prunes_stale_routes_not_refreshed_by_peer`, `gr_phase2_eor_prunes_stale_routes_not_refreshed_by_peer` (e2e) | Existing test suite |
-| MAY support a configurable upper-bound timer on stale-route retention (independent of Restart Time) | Confirmed correct | This is the GR-deadline timer already covered above — same mechanism serves both the Restart-Time-based deletion and this general upper bound | — |
+| MAY support a configurable upper-bound timer on stale-route retention (independent of Restart Time) — **RFC 8538 §4.1 makes this MUST** | ~~Confirmed correct~~ **Confirmed gap, open** (2026-11-27) | The Restart Time deadline is removed at re-establishment, so a peer that comes back and never sends End-of-RIB keeps its stale routes. The Restart Time is not the "stale timer" | See `TODO.md` |
 
-**§4.2 summary:** 8 clauses reviewed, all confirmed correct — genuinely one
-of the stronger, more thoroughly-tested corners of this codebase.
+**§4.2 summary:** 8 clauses reviewed. This pass recorded all as confirmed
+correct; three of those verdicts were wrong (see the rows struck through above
+and the 2026-11-27 pass below).
 
 > **Correction (2026-11-24, issues #81/#82):** "all confirmed correct" held for
 > the clauses as tested, but two things the §4.2 text implies were wrong in the
@@ -522,10 +523,37 @@ of the stronger, more thoroughly-tested corners of this codebase.
 >    left the peer's Loc-RIB entries, FIB routes and advertisements in place until
 >    the Restart Time expired. Fixed (`flush_family_v4/v6`).
 >
-> Still open from this pass: RFC 8538 §4.1 says that when the N-bit has been
-> exchanged a route "previously marked as stale" is **not** deleted on a
-> consecutive restart; this daemon re-marks all retained routes and does not
-> distinguish, which is the safe direction but is not tracked by a test.
+> A third item was noted here as the RFC 8538 §4.1 consecutive-restart rule not
+> being distinguished. The deletion itself was missing; see the 2026-11-27 pass.
+
+---
+
+## RFC 4724 §4 / RFC 8538 §4 — session loss and consecutive restarts (2026-11-27, issues #203 and #181)
+
+**Method:** fetched RFC 4724 and RFC 8538 and read §4, §4.2 and RFC 8538 §2–§5. RFC 4724's only
+update is RFC 8538; RFC 8538 has none. RFC 4724's one verified erratum (7915) concerns its
+"Updates" metadata. Each path was reproduced by a failing test before the fix.
+
+The clauses:
+
+* RFC 4724 §4: "the normal BGP procedures MUST be followed when the TCP session terminates due to
+  the sending or receiving of a BGP NOTIFICATION message."
+* RFC 8538 §4: with the "N" bit, on receiving a NOTIFICATION other than a Hard Reset the speaker
+  "MUST follow the rules for the Receiving Speaker"; "The BGP speaker generating the BGP
+  NOTIFICATION message MUST also follow the rules for the Receiving Speaker."; after a HOLDTIME
+  expiry it "should generate the relevant BGP NOTIFICATION message" but "subsequently MUST follow
+  the rules for the Receiving Speaker".
+* RFC 8538 §4.1, replacing RFC 4724 §4.2: "If the "N" bit has not been exchanged with the peer,
+  then to deal with possible consecutive restarts, a route (from the peer) previously marked as
+  stale MUST be deleted."
+
+| Finding | Confidence | Resolution |
+|---|---|---|
+| Hold Timer expiry, message header errors and FSM errors in Established were reported as `Unclean`, so routes were retained without the N bit | Confirmed gap (reproduced) | Fixed: `TerminationReason::NotificationSent` |
+| The converse: UPDATE-error resets (RFC 7606 session reset) and `AutomaticStop` were reported as `OperatorStop`, so routes were flushed with the N bit. An earlier fix and its tests had chosen this deliberately, from RFC 4271 alone | Confirmed gap (reproduced) | Fixed: same variant |
+| Still-stale routes were never deleted on a consecutive restart | Confirmed gap (reproduced) | Fixed: `delete_still_stale_routes` |
+| Operator stop, peer removal and the maximum-prefix Cease flush but do not send a Hard Reset, although §4 then applies the Receiving Speaker rules to us | Confirmed gap (read from code) | Open, `TODO.md` |
+| §4.2 re-establishment removal (F bit, family or capability absent) and the §4.1 stale timer | Confirmed gaps | Open, `TODO.md`; see the §4.2 table above |
 
 ---
 
@@ -554,7 +582,7 @@ community's *meaning* ("discard this prefix"), not from the §3.3 conditions on 
 |---|---|---|---|
 | Idle state: resource initialization excludes whatever's needed to retain routes per §4.2 | Confirmed correct — by architecture | Route retention (`gr.rs`'s stale-tracking) lives entirely in `pathvectord`, independent of `pathvector-session`'s FSM state — Idle-state FSM resource cleanup in `pathvector-session` has no interaction with route retention at all, satisfying this by construction/separation of concerns | — |
 | NOTIFICATION or TcpConnectionFails when GR **not** negotiated: normal immediate flush (unchanged from base RFC 4271) | Confirmed correct | This is the pre-existing, non-GR default behavior, already covered generally | — |
-| **TcpConnectionFails specifically (not NOTIFICATION) when GR **was** negotiated: retain routes per §4.2 rather than deleting them outright** | Confirmed correct | This exact distinction (unclean/TCP-failure → retain for GR peers; NOTIFICATION/clean → flush immediately) is precisely what `unclean_termination_of_gr_peer_retains_routes` and `clean_termination_flushes_immediately` (RFC 8538-adjacent) already test and implement | Existing test suite |
+| **TcpConnectionFails specifically (not NOTIFICATION) when GR **was** negotiated: retain routes per §4.2 rather than deleting them outright** | ~~Confirmed correct~~ Receiving side only; a NOTIFICATION *sent* retained routes until 2026-11-27 (issue #203) | This exact distinction (unclean/TCP-failure → retain for GR peers; NOTIFICATION/clean → flush immediately) is precisely what `unclean_termination_of_gr_peer_retains_routes` and `clean_termination_flushes_immediately` (RFC 8538-adjacent) already test and implement | Existing test suite |
 | **Established state, new incoming connection succeeds (Event 16/17) while GR **was** negotiated (≥1 AFI/SAFI): MUST retain routes per §4.2, release other resources, drop the *old* established connection, initialize fresh resources, reset ConnectRetryCounter, start ConnectRetryTimer, move to Connect state — i.e. treat the new connection as evidence of peer restart, NOT as an ordinary RFC 4271 §6.8 collision to reject** | **Confirmed gap — significant, directly connects to the RFC 4271 §6.8 audit above.** **Fixed 2026-07-16 — see TODO.md #17** (`fix/rfc4271-collision-resolution`, merged; route-retention proof added via e2e test). | `handle_incoming_connection`'s `State::Established` arm (`pathvector-session/src/transport/mod.rs:666-673`, already quoted in the RFC 4271 §6.8 section above) unconditionally rejects any new incoming connection while Established — `tracing::warn!(...); drop(stream); None` — with **no check for whether GR capability was negotiated with this peer at all**. This is exactly backwards for the scenario RFC 4724 §5 is designed to handle: a peer that restarted, whose old TCP connection died without us noticing (still "Established" from our point of view), reconnecting to re-establish the session. Per RFC 4271 §6.8's plain-vanilla rule, rejecting a new connection while Established is correct — but RFC 4724 explicitly *overrides* that rule for GR-negotiated sessions specifically. Since this project doesn't check GR-negotiated status at all in this code path, it always applies the non-GR default, meaning **a legitimately-restarting GR-capable peer trying to reconnect while we still (incorrectly) believe the old session is Established would have its reconnection attempt silently rejected**, likely forcing it to wait out our side's own Hold Timer expiry before we notice anything is wrong — defeating a meaningful part of the point of graceful restart (fast, clean recovery from a peer restart). Added a new row to `pathvectord/RFC.md`'s Connection Collision Coordination table for this. | A test: establish a session with GR negotiated, simulate the "old TCP connection appears alive to us but the peer has actually restarted and opens a new connection" scenario (mirroring the existing `test_collision_in_open_confirm_peer_bgp_id_higher_rejects_incoming`-style harness but in `State::Established` with GR capability recorded), asserting the new connection is adopted (routes retained per §4.2, old connection dropped, state moves to Connect) rather than rejected. This is a meaningfully-sized fix — needs the `State::Established` arm to check GR-negotiated status and branch accordingly, plus wiring the retain/reset behavior described in the RFC's replacement FSM text. |
 
 **§5 summary:** 4 clauses reviewed — 3 confirmed correct, 1 confirmed gap
@@ -1089,4 +1117,4 @@ whether they are ever delivered while the session is busy.
 | RFC 9687 (`SendHoldTimer`) not implemented at all | Confirmed gap | Implemented; see `pathvector-session/RFC.md` |
 | RFC 9687 §4.3 "Each time the local system sends a BGP message, it restarts the SendHoldTimer": the first implementation restarted it only when the whole write buffer had drained, so a peer taking one message per 100 s from a batch was closed at 480 s. The test then named for the clause used a mock that wrote its whole queue at once. The same rule left a sent KEEPALIVE or ROUTE-REFRESH suppressing the next | Confirmed gap (found in review of PR #161, reproduced) | Fixed before merge: the writer reports each message as its last byte is written |
 | §10 jitter SHOULD on KeepaliveTimer / ConnectRetryTimer | Confirmed gap (read from code) | Open, `TODO.md` |
-| Hold Timer expiry is reported as `Unclean`, so the daemon retains a GR peer's routes without the N bit, although this side sent a NOTIFICATION and RFC 8538 §4 describes retention after Hold Timer expiry for N-bit speakers | Needs investigation (read from code, not tested) | Open, `TODO.md`; unchanged here |
+| Hold Timer expiry is reported as `Unclean`, so the daemon retains a GR peer's routes without the N bit, although this side sent a NOTIFICATION and RFC 8538 §4 describes retention after Hold Timer expiry for N-bit speakers | Needs investigation (read from code, not tested) | Confirmed and fixed 2026-11-27 (issue #203), below |

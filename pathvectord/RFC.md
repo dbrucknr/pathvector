@@ -307,7 +307,10 @@ per-family retention decision, deadline timer, and EOR-triggered prune.
 | e2e: GoBGP holds routes during our restart window (blackhole use case) | `pathvector-e2e/tests/session.rs` | ✅ | `gr_helper_gobgp_holds_routes_during_restart_window` |
 | e2e: peer GR restart_time visible via management API | `pathvector-e2e/tests/session.rs` | ✅ | `gr_capability_negotiated_peer_gr_restart_time_reflects_config` |
 | §4.2 MUST: unclean termination of GR-capable peer retains routes in AdjRibIn/LocRib | `src/daemon.rs` | ✅ | `unclean_termination_of_gr_peer_retains_routes` |
-| §4.2 MUST: NOTIFICATION-driven termination flushes immediately when RFC 8538 not in effect | `src/daemon.rs` | ✅ | `clean_termination_flushes_immediately` (see also RFC 8538 below) |
+| §4 MUST: normal BGP procedures (flush) when the TCP session terminates "due to the sending or receiving of a BGP NOTIFICATION message", unless RFC 8538 is in effect — **sending side fixed 2026-11-27 (issue #203)**: Hold Timer expiry, header errors and FSM errors had retained routes without the N bit | `pathvector-session/src/transport/mod.rs`, `src/daemon/peer.rs` | ✅ | `daemon::gr_notification_tests` (real session over loopback, both N-bit states), `clean_termination_flushes_immediately` |
+| §4.2 MUST: a TCP session that ends with no NOTIFICATION retains the routes | `pathvector-session/src/transport/mod.rs`, `src/daemon/peer.rs` | ✅ | `daemon::gr_notification_tests::tcp_failure_retains_with_and_without_the_n_bit` |
+| §4.2 MUST (narrowed by RFC 8538 §4.1 to sessions without the N bit): "a route (from the peer) previously marked as stale MUST be deleted" on a consecutive restart, IPv4 and IPv6, from Adj-RIB-In, Loc-RIB, FIB, blackhole book and peers — **fixed 2026-11-27 (issue #181)** | `src/daemon/peer.rs`, `src/daemon/gr.rs` (`delete_still_stale_routes`) | ✅ | `daemon::gr_consecutive_restart_tests` |
+| §4.2 MUST: on re-establishment, remove stale routes at once for a family whose F bit is clear or which is absent from the new GR capability, or if there is no GR capability | `src/daemon/peer.rs` — `on_established` | ❌ | Not implemented; see `TODO.md` |
 | §4.2 MUST: non-GR peer routes always flushed on unclean termination | `src/daemon.rs` | ✅ | `non_gr_peer_always_flushes_on_unclean_termination` |
 | §4.2 MUST: per-family GR — only families listed in peer OPEN are retained | `src/daemon.rs` | ✅ | per-family `gr_v4`/`gr_v6` check in `on_terminated` |
 | §4.2 MUST: routes not re-announced before peer EOR are pruned; re-announced routes kept | `src/daemon.rs` | ✅ | `eor_prunes_stale_routes_not_refreshed_by_peer` |
@@ -336,10 +339,11 @@ for GR peers is also implemented — see `RFC_AUDIT.md`'s RFC 4724 section.
 
 ## RFC 8538 — Enhancements to BGP Graceful Restart
 
-**Owns:** N-bit advertisement in the `GracefulRestart` capability; inspection of received
-NOTIFICATIONs on termination to decide between immediate flush and GR window.  
-**Boundary:** `TerminationReason::Notification` is produced by `pathvector-session`;
-`on_terminated` in `pathvectord` applies the RFC 8538 decision logic.  
+**Owns:** N-bit advertisement in the `GracefulRestart` capability; inspection of the
+NOTIFICATION that ended a session, in either direction, to decide between immediate flush and
+GR window.  
+**Boundary:** `TerminationReason::{Notification, NotificationSent}` are produced by
+`pathvector-session`; `on_terminated` in `pathvectord` applies the RFC 8538 decision logic.  
 **Datatracker:** https://datatracker.ietf.org/doc/html/rfc8538
 
 | Requirement | File | Status | Verified by |
@@ -354,7 +358,11 @@ NOTIFICATIONs on termination to decide between immediate flush and GR window.
 | §4 CEASE/HardReset (subcode 9) MUST trigger immediate flush even with N-bit | `src/daemon/peer.rs` — `on_terminated` | ✅ | `notification_hard_reset_always_flushes`, e2e: `gr_phase2_rfc8538_hard_reset_bypasses_gr_window` |
 | §4 NOTIFICATION from peer without N-bit → flush immediately (RFC 4724 §4.2 preserved) | `src/daemon/peer.rs` — `on_terminated` | ✅ | `notification_without_peer_n_bit_flushes` |
 | §4 WE must have N-bit for notification mode to engage; otherwise flush immediately | `src/daemon/peer.rs` — `on_terminated` | ✅ | `notification_flushes_when_local_daemon_has_no_gr` |
-| `OperatorStop` (local-initiated teardown) always flushes immediately, regardless of N-bit | `src/daemon/peer.rs` — `on_terminated` | ✅ | `operator_stop_always_flushes` |
+| §4 "generating": Hold Timer expiry, header / FSM / UPDATE errors and automatic resets open a GR window with the N bit and flush without it — **fixed 2026-11-27 (issue #203)** | `pathvector-session/src/transport/mod.rs` (`local_reason`), `src/daemon/peer.rs` | ✅ | `daemon::gr_notification_tests::{hold_timer_expiry,message_header_error,unexpected_message,update_error_reset,automatic_reset}_retains_only_with_the_n_bit` |
+| §4 "generating", for a stop that keeps the session down (operator stop, peer removal, maximum prefixes): routes are flushed, but the NOTIFICATION sent is not a Hard Reset (§3.1, §5.1), so with the N bit the flush is not what §4 requires and the peer retains our routes | `pathvector-session/src/fsm/mod.rs` | ❌ | Open, `TODO.md`. `operator_stop_flushes_with_and_without_the_n_bit` pins the flush |
+| §4 a Hard Reset this side sent flushes even with the N bit | `src/daemon/peer.rs` | ✅ | `sent_hard_reset_flushes_with_n_bit` |
+| §4.1 consecutive restarts: with the N bit, still-stale routes are retained | `src/daemon/peer.rs` | ✅ | `daemon::gr_consecutive_restart_tests::second_loss_with_n_bit_retains_still_stale_routes` |
+| §4.1 MUST support a configurable "stale timer" bounding stale-route retention | — | ❌ | Only the Restart Time runs, and it stops at re-establishment; see `TODO.md` |
 | §4 "The BGP speaker generating the BGP NOTIFICATION message MUST also follow the rules for the Receiving Speaker": an RFC 9687 Send Hold Timer expiry opens a GR window only when the N bit was exchanged | `src/daemon/peer.rs` — `on_terminated` | ✅ | `send_hold_expiry_with_n_bit_enters_gr_window`, `send_hold_expiry_without_n_bit_flushes` |
 
 **Note on e2e peers:** GoBGP 4.6.0 sends `CEASE/Hard Reset` (subcode 9) on all shutdowns
