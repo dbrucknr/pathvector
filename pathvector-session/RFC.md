@@ -352,6 +352,7 @@ The FSM restart behavior is deferred.
 | Capability forwarded to `SessionInfo` for upper layers | `src/fsm/mod.rs` | ✅ | `test_session_info_carries_graceful_restart` |
 | Stale timer: retain routes for restart-time seconds during restart | — | ✅ | Owned by `pathvectord` (GR deadline timer in event loop) — see `pathvectord/RFC.md` |
 | `TerminationReason` (Clean / Unclean) emitted on session close; upper layer uses it to decide GR eligibility | `src/transport/mod.rs` | ✅ | `test_termination_reason_notification_is_clean`, `test_termination_reason_tcp_failed_is_unclean`, `test_termination_reason_manual_stop_is_clean` |
+| RFC 4724 §4 / RFC 8538 §4: the reason says whether a NOTIFICATION ended the session, in which direction, and carries it (`Notification`, `NotificationSent`), including one this side generated but could not write; `Unclean` means none in either direction | `src/transport/mod.rs` (`local_reason`) | ✅ | `header_error_is_reported_as_a_sent_notification`, `unexpected_message_is_reported_as_a_sent_notification`, `closed_connection_is_reported_as_unclean`, `failed_notification_write_on_{hold_expiry,automatic_stop}_still_terminates_and_reconnects` |
 | EOR (End-of-RIB) marker: empty UPDATE sent after RIB dump | — | ✅ | Owned by `pathvectord` — see `pathvectord/RFC.md` |
 
 **Deferred:** §3 SHOULD: suppress GR capability when peer's restart_time = 0 (logged as warning in `pathvectord`; deferred).

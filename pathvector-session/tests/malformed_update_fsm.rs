@@ -362,9 +362,9 @@ async fn established_treat_as_withdraw_withdraws_route_and_session_stays_up() {
 }
 
 /// RFC 4271 §8.2.2 Established Event 28 + §6.3: NOTIFICATION with the exact
-/// Update error and Data, TCP dropped, `Terminated(OperatorStop)` (locally
-/// detected — routes flushed, not retained as stale), and — the peer remains
-/// configured — an automatic reconnect: a fresh OPEN arrives on a *new*
+/// Update error and Data, TCP dropped, `Terminated(NotificationSent)` carrying
+/// it (RFC 4724 §4: routes flushed, unless the RFC 8538 N bit was exchanged),
+/// and — the peer remains configured — an automatic reconnect: a fresh OPEN arrives on a *new*
 /// connection after the ConnectRetryTimer.
 #[tokio::test]
 async fn established_session_reset_sends_exact_notification_then_reconnects() {
@@ -392,10 +392,11 @@ async fn established_session_reset_sends_exact_notification_then_reconnects() {
     let ev = next_event(&mut handle, Duration::from_secs(5)).await;
     assert!(
         matches!(
-            ev,
-            Some(SessionEvent::Terminated(TerminationReason::OperatorStop))
+            &ev,
+            Some(SessionEvent::Terminated(TerminationReason::NotificationSent(sent)))
+                if *sent == n
         ),
-        "expected Terminated(OperatorStop), got {ev:?}"
+        "expected Terminated(NotificationSent), got {ev:?}"
     );
 
     // Reconnect: the same listener sees a new connection and a new OPEN.

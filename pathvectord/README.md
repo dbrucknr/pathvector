@@ -224,7 +224,7 @@ INFO pathvectord: Prometheus metrics listening on http://0.0.0.0:9179/metrics
 | `pathvectord_bgp_adj_rib_out_prefixes` | Gauge | `peer` | Routes currently advertised to this peer (Adj-RIB-Out size) |
 | `pathvectord_bgp_loc_rib_prefixes` | Gauge | `afi` | Best-path routes in Loc-RIB (`afi=ipv4` or `afi=ipv6`) |
 | `pathvectord_bgp_sessions_established_total` | Counter | `peer` | Number of times this peer reached Established |
-| `pathvectord_bgp_sessions_terminated_total` | Counter | `peer`, `reason` | Session terminations by cause: `unclean`, `notification`, `operator_stop`, `send_hold_timer_expired` (RFC 9687: nothing could be sent to the peer) |
+| `pathvectord_bgp_sessions_terminated_total` | Counter | `peer`, `reason` | Session terminations by cause: `unclean` (the TCP session ended with no NOTIFICATION either way), `notification` (the peer sent one), `notification_sent` (this speaker sent one and the session will retry: Hold Timer expiry, a detected error, an automatic reset), `operator_stop`, `send_hold_timer_expired` (RFC 9687: nothing could be sent to the peer) |
 | `pathvectord_bgp_updates_received_total` | Counter | `peer` | BGP UPDATE messages received from this peer |
 | `pathvectord_bgp_updates_sent_total` | Counter | `peer` | BGP UPDATE messages sent to this peer |
 | `pathvectord_bgp_originated_routes` | Gauge | `afi` | Routes this daemon self-originates (bypasses import policy; `afi=ipv4` or `afi=ipv6`) |
@@ -1036,8 +1036,24 @@ INFO removing stale BGP routes v4=42 v6=0
 > **Note:** stale kernel-route cleanup on startup and the GracefulRestart helper role
 > work together. During the restart window, the kernel routes continue forwarding traffic
 > (`forwarding_preserved = true`). When pathvectord starts, it cleans them up only after
-> new sessions are established and routes are re-installed. Stale-route retention for
-> *peer* restarts (RFC 4724 §4.2 speaker role) is not yet implemented.
+> new sessions are established and routes are re-installed.
+
+### When a peer's session is lost
+
+For a peer that advertised a non-zero restart time, pathvectord keeps that peer's routes,
+marked stale, until the peer's End-of-RIB or its restart time. Whether it does depends on how
+the session ended and on the RFC 8538 "N" bit, which pathvectord advertises whenever
+`graceful_restart_time > 0`:
+
+| How the session ended | Both sides set N | Otherwise |
+|---|---|---|
+| TCP failure, no NOTIFICATION either way | retained | retained |
+| NOTIFICATION sent or received, including Hold Timer expiry and detected errors | retained | flushed |
+| Hard Reset sent or received | flushed | flushed |
+| Operator stop, peer removal, maximum prefixes | flushed | flushed |
+
+Without N, a peer lost again before its End-of-RIB also loses the routes it had not
+re-announced since the previous loss.
 
 ---
 

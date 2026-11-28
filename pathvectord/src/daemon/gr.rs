@@ -99,6 +99,15 @@ pub(super) fn sorted_nlris<A: pathvector_types::IpAddress>(
     nlris
 }
 
+/// The prefixes in `adj_rib_in` that are still marked stale.
+fn still_stale<A: pathvector_types::IpAddress>(adj_rib_in: &AdjRibIn<A>) -> HashSet<Nlri<A>> {
+    adj_rib_in
+        .routes()
+        .filter(|(_, route)| route.staleness.is_stale())
+        .map(|(nlri, _)| *nlri)
+        .collect()
+}
+
 impl DaemonState {
     /// Marks `peer_ip`'s retained routes stale and re-imports them through the
     /// same pipeline an arriving UPDATE uses (RFC 4724 §4.2).
@@ -286,10 +295,32 @@ impl DaemonState {
         }
     }
 
+    /// Deletes `peer_ip`'s routes that are still marked stale in the given
+    /// families, leaving those it has refreshed.
+    ///
+    /// RFC 4724 §4.2, as replaced by RFC 8538 §4.1, requires this on a
+    /// consecutive restart when the "N" bit has not been exchanged. Call it
+    /// before [`mark_stale_and_repropagate`](Self::mark_stale_and_repropagate)
+    /// marks the survivors.
+    pub(super) fn delete_still_stale_routes(&mut self, peer_ip: IpAddr, do_v4: bool, do_v6: bool) {
+        if do_v4 {
+            let stale = self.adj_ribs_in.get(&peer_ip).map(still_stale);
+            if let Some(stale) = stale.filter(|s| !s.is_empty()) {
+                self.prune_stale_nlri(peer_ip, &stale);
+            }
+        }
+        if do_v6 {
+            let stale = self.adj_ribs_in_v6.get(&peer_ip).map(still_stale);
+            if let Some(stale) = stale.filter(|s| !s.is_empty()) {
+                self.prune_stale_nlri_v6(peer_ip, &stale);
+            }
+        }
+    }
+
     /// Withdraw a set of NLRIs held as stale during a peer's GR window.
     ///
     /// Called either on EOR receipt (peer re-established and re-advertised its
-    /// full table) or on GR deadline expiry (peer did not re-establish in time).
+    /// full table) or by [`delete_still_stale_routes`](Self::delete_still_stale_routes).
     /// Withdraws each NLRI from AdjRibIn and LocRib, then propagates the
     /// resulting best-path changes to all established peers.
     pub(super) fn prune_stale_nlri(&mut self, peer_ip: IpAddr, stale: &HashSet<Nlri<Ipv4Addr>>) {

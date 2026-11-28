@@ -271,9 +271,10 @@ fn gr_deadline_expiry_flushes_stale_routes() {
     );
 }
 
-/// RFC 4724 §4.2 — if a peer disconnects uncleanly *again* while its GR
-/// window is already open, the deadline must be reset to `now + restart_time`
-/// and routes must continue to be held.  They must not be double-flushed.
+/// RFC 4724 §4.2 — a peer that is lost again before its End-of-RIB gets a new
+/// restart window, and a route it refreshed in between is still retained. (What
+/// happens to routes it did not refresh depends on the RFC 8538 N bit: see
+/// `gr_consecutive_restart_tests`.)
 #[test]
 fn gr_re_termination_during_window_resets_deadline_and_holds_routes() {
     let (mut state, _rxs) = make_state_gr(&[(PEER_IP, PEER_AS)]);
@@ -288,8 +289,9 @@ fn gr_re_termination_during_window_resets_deadline_and_holds_routes() {
         .get(&IpAddr::V4(PEER_IP))
         .expect("deadline must be set after first unclean disconnect");
 
-    // Re-establish, then disconnect again without re-announcing anything.
+    // Re-establish, refresh the route, then disconnect again before the EOR.
     establish_with_gr(&mut state, 30);
+    state.on_route_update(IpAddr::V4(PEER_IP), announce(&["10.0.0.0/8"]));
     state.on_terminated(IpAddr::V4(PEER_IP), TerminationReason::Unclean, true);
     let second_deadline = *state
         .gr

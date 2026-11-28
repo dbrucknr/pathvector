@@ -335,11 +335,15 @@ pub enum SessionCommand {
 ///
 /// Used by the daemon to decide whether to retain stale routes from the peer
 /// during the peer's Graceful Restart window (RFC 4724 §4.2, RFC 8538).
+///
+/// RFC 4724 §4: "the normal BGP procedures MUST be followed when the TCP
+/// session terminates due to the sending or receiving of a BGP NOTIFICATION
+/// message." RFC 8538 §4 lets speakers that exchanged the "N" bit retain
+/// routes then too, unless the NOTIFICATION is a Hard Reset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminationReason {
-    /// TCP failure or hold-timer expiry — no NOTIFICATION was received from
-    /// the peer before the session dropped.  RFC 4724 §4.2: the helper MAY
-    /// retain stale routes from a GR-capable peer for up to `restart_time`.
+    /// The TCP session ended and this side neither received nor generated a
+    /// NOTIFICATION. RFC 4724 §4.2 retention applies to a GR-capable peer.
     Unclean,
     /// The peer sent a NOTIFICATION.
     ///
@@ -348,8 +352,17 @@ pub enum TerminationReason {
     /// unless the notification is `CEASE`/`HardReset` (subcode 9).  The daemon
     /// inspects the carried message to make that determination.
     Notification(crate::message::NotificationMessage),
-    /// The session was torn down by this side, whether by the operator or by
-    /// the local system's own logic.  Always flushes routes immediately.
+    /// This side detected a condition, generated this NOTIFICATION and reset
+    /// the session: Hold Timer expiry, a message header, UPDATE or Finite
+    /// State Machine error, or [`SessionCommand::AutomaticStop`].
+    ///
+    /// Reported whether or not the NOTIFICATION could be written. RFC 8538 §4:
+    /// "The BGP speaker generating the BGP NOTIFICATION message MUST also
+    /// follow the rules for the Receiving Speaker."
+    NotificationSent(crate::message::NotificationMessage),
+    /// The caller stopped the session to keep it down:
+    /// [`SessionCommand::Stop`], [`SessionCommand::Notification`] or
+    /// [`SessionCommand::Retire`].  Always flushes routes immediately.
     OperatorStop,
     /// The RFC 9687 `SendHoldTimer` expired: nothing could be sent to the peer.
     ///
@@ -572,9 +585,12 @@ struct Session<T: BgpTransport> {
     collision_candidate_open_timeout: Duration,
     // Outbound UPDATE messages queued by the daemon.
     update_rx: mpsc::Receiver<UpdateMessage>,
-    // Reason for the most recent (or current) session termination.  Set just
-    // before calling fsm.process() so execute() can carry it in the event.
+    // Reason for the most recent (or current) session termination.  Set before
+    // execute() so it can carry it in the event.
     termination_reason: TerminationReason,
+    // The NOTIFICATION `handle_primary_message` generated for the input it
+    // returned. The FSM sees only the `TcpFailed` that follows.
+    header_error: Option<NotificationMessage>,
     // Set once the task is to end, after the stop that goes with it.
     exit: Option<Exit>,
 }
@@ -633,6 +649,7 @@ impl<T: BgpTransport> Session<T> {
             collision_candidate_open_timeout: COLLISION_CANDIDATE_OPEN_TIMEOUT,
             update_rx,
             termination_reason: TerminationReason::Unclean,
+            header_error: None,
             exit: None,
         };
         let handle = SpawnedSessionHandle {
@@ -649,29 +666,22 @@ impl<T: BgpTransport> Session<T> {
             // Track why the session is terminating so SessionEvent::Terminated
             // carries the right reason.  Only relevant when Established; the
             // FSM only emits SessionTerminated from that state.
-            if self.fsm.is_established() {
-                self.termination_reason = match &input {
-                    // Peer sent a NOTIFICATION — carry it so the daemon can
-                    // apply RFC 8538 logic (HardReset vs. non-HardReset).
-                    FsmInput::MessageReceived(BgpMessage::Notification(n)) => {
-                        TerminationReason::Notification(n.clone())
-                    }
-                    // We initiated the teardown; always flush immediately.
-                    FsmInput::ManualStop
-                    | FsmInput::NotificationToSend(_)
-                    | FsmInput::AutomaticStop(_) => TerminationReason::OperatorStop,
-                    // RFC 7606 session-reset recovery of a malformed UPDATE
-                    // is the same kind of locally *detected* protocol error
-                    // (RFC 4271 §8.2.2 Event 28): clean reason, immediate
-                    // flush. A recovered (treat-as-withdraw / discard)
-                    // UPDATE does not terminate the session at all.
-                    FsmInput::MalformedUpdate(r) if r.is_session_reset() => {
-                        TerminationReason::OperatorStop
-                    }
-                    FsmInput::SendHoldTimerExpired => TerminationReason::SendHoldTimerExpired,
-                    _ => TerminationReason::Unclean,
-                };
-            }
+            let established = self.fsm.is_established();
+            let header_error = self.header_error.take();
+            let reason_from_input = established.then(|| match &input {
+                // Peer sent a NOTIFICATION — carry it so the daemon can
+                // apply RFC 8538 logic (HardReset vs. non-HardReset).
+                FsmInput::MessageReceived(BgpMessage::Notification(n)) => {
+                    Some(TerminationReason::Notification(n.clone()))
+                }
+                // The caller keeps the session down; always flush.
+                FsmInput::ManualStop | FsmInput::NotificationToSend(_) => {
+                    Some(TerminationReason::OperatorStop)
+                }
+                FsmInput::SendHoldTimerExpired => Some(TerminationReason::SendHoldTimerExpired),
+                // Depends on what this side sends in response.
+                _ => None,
+            });
             // A teardown this side chose — `ManualStop`, `NotificationToSend`,
             // or an `AutomaticStop` that applies (it is ignored outside
             // Established) — must close any staged/pending collision
@@ -700,9 +710,15 @@ impl<T: BgpTransport> Session<T> {
             // delay dropping the connection.
             self.abort_on_close = matches!(input, FsmInput::SendHoldTimerExpired);
             let outputs = self.fsm.process(input);
+            // Set before `execute`, which puts it in the event.
+            if let Some(reason) = reason_from_input {
+                self.termination_reason =
+                    reason.unwrap_or_else(|| local_reason(header_error, &outputs));
+            }
             if !self.execute(outputs) {
                 // A TCP send failed; feed TcpFailed back into the FSM.
-                // Reason stays Unclean — we never received a Notification.
+                // The reason already set stands: a NOTIFICATION this side
+                // generated still counts when it could not be written.
                 let recovery = self.fsm.process(FsmInput::TcpFailed);
                 let _ = self.execute(recovery);
             }
@@ -1662,7 +1678,8 @@ impl<T: BgpTransport> Session<T> {
             Some(Ok(m)) => FsmInput::MessageReceived(m),
             Some(Err(e)) => {
                 tracing::warn!(peer = %self.config.peer_addr, error = %e, "codec error on received message");
-                if let Some(notif) = header_error_notification(&e)
+                self.header_error = header_error_notification(&e);
+                if let Some(notif) = self.header_error.clone()
                     && self.send_message(BgpMessage::Notification(notif))
                 {
                     self.close_connection();
@@ -1708,6 +1725,26 @@ impl<T: BgpTransport> Session<T> {
             t.abort();
         }
     }
+}
+
+/// The reason for a teardown nobody asked for, from the NOTIFICATION this side
+/// generates for it: the one already sent for a header error, or the one among
+/// the FSM's `outputs`.
+fn local_reason(
+    header_error: Option<NotificationMessage>,
+    outputs: &[FsmOutput],
+) -> TerminationReason {
+    header_error
+        .or_else(|| {
+            outputs.iter().find_map(|output| match output {
+                FsmOutput::SendMessage(BgpMessage::Notification(n)) => Some(n.clone()),
+                _ => None,
+            })
+        })
+        .map_or(
+            TerminationReason::Unclean,
+            TerminationReason::NotificationSent,
+        )
 }
 
 /// Map an RFC 4271 message-header or OPEN-body framing error to the
@@ -2430,10 +2467,14 @@ mod tests {
             .await
             .unwrap();
 
-        let reason = expect_terminated(&mut handle, Duration::from_secs(1)).await;
-        assert!(
-            matches!(reason, TerminationReason::OperatorStop),
-            "{reason:?}"
+        // RFC 8538 §4 turns on this side "generating" the NOTIFICATION, which
+        // it did whether or not the write succeeded.
+        assert_eq!(
+            expect_terminated(&mut handle, Duration::from_secs(1)).await,
+            TerminationReason::NotificationSent(NotificationMessage {
+                error: NotificationError::Cease(CeaseError::OutOfResources),
+                data: vec![],
+            })
         );
         next_peer(&mut peers).await;
     }
@@ -2447,9 +2488,70 @@ mod tests {
         complete_handshake(&mut handle, &mut peer, peer_open()).await;
 
         // The peer says nothing more, so the 3 s hold timer expires.
-        let reason = expect_terminated(&mut handle, Duration::from_secs(5)).await;
-        assert!(matches!(reason, TerminationReason::Unclean), "{reason:?}");
+        assert_eq!(
+            expect_terminated(&mut handle, Duration::from_secs(5)).await,
+            TerminationReason::NotificationSent(NotificationMessage {
+                error: NotificationError::HoldTimerExpired,
+                data: vec![],
+            })
+        );
         next_peer(&mut peers).await;
+    }
+
+    /// RFC 4271 §6.1: a message header error is answered with a NOTIFICATION,
+    /// so the loss is one this side's NOTIFICATION caused (RFC 4724 §4), not a
+    /// bare TCP failure — although the FSM only hears `TcpFailed`.
+    #[tokio::test]
+    async fn header_error_is_reported_as_a_sent_notification() {
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+        drive_to_established(&mut handle, &mut peer).await;
+
+        peer.recv_tx
+            .send(Err(FramingError::Codec(CodecError::InvalidMarker)))
+            .unwrap();
+
+        assert_eq!(
+            expect_terminated(&mut handle, Duration::from_secs(1)).await,
+            TerminationReason::NotificationSent(NotificationMessage {
+                error: NotificationError::MessageHeader(MsgHeaderError::ConnectionNotSynchronized),
+                data: vec![],
+            })
+        );
+    }
+
+    /// RFC 4271 §6.6 / RFC 6608: an unexpected message in Established draws a
+    /// Finite State Machine Error NOTIFICATION.
+    #[tokio::test]
+    async fn unexpected_message_is_reported_as_a_sent_notification() {
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+        drive_to_established(&mut handle, &mut peer).await;
+
+        peer.recv_tx.send(Ok(peer_open())).unwrap();
+
+        assert_eq!(
+            expect_terminated(&mut handle, Duration::from_secs(1)).await,
+            TerminationReason::NotificationSent(NotificationMessage {
+                error: NotificationError::FsmErrorEstablished,
+                data: vec![1],
+            })
+        );
+    }
+
+    /// RFC 4724 §4.2: a TCP session that ends with no NOTIFICATION.
+    #[tokio::test]
+    async fn closed_connection_is_reported_as_unclean() {
+        let (mock, mut peer) = MockTransport::pair();
+        let mut handle = spawn_with(test_config(), mock);
+        drive_to_established(&mut handle, &mut peer).await;
+
+        drop(peer.recv_tx);
+
+        assert_eq!(
+            expect_terminated(&mut handle, Duration::from_secs(1)).await,
+            TerminationReason::Unclean
+        );
     }
 
     /// RFC 4271 §8.2.2 Established, Event 2 (`ManualStop`), and the same stop
@@ -2604,11 +2706,9 @@ mod tests {
     ///
     /// Also asserts the specific `TerminationReason`, not just that some
     /// `Terminated` event fires: this is a locally-initiated protocol-error
-    /// teardown, so it must be `OperatorStop` (immediate route flush), not
-    /// `Unclean` — the daemon's `on_terminated` treats `Unclean` as grounds
-    /// to enter RFC 4724 GR helper mode and retain the peer's routes as
-    /// stale, which is wrong when we ourselves decided to close the session
-    /// over a clear protocol violation.
+    /// teardown, so it is reported with the NOTIFICATION this side sent, not as
+    /// `Unclean`: RFC 4724 §4 keeps the normal BGP procedures for it, unless
+    /// the RFC 8538 N bit was exchanged.
     #[tokio::test]
     async fn test_rfc7606_session_reset_sends_notification_and_terminates() {
         let (mock, mut peer) = MockTransport::pair();
@@ -2656,12 +2756,11 @@ mod tests {
             .expect("session exited without emitting an event");
         assert!(
             matches!(
-                event,
-                SessionEvent::Terminated(TerminationReason::OperatorStop)
+                &event,
+                SessionEvent::Terminated(TerminationReason::NotificationSent(n))
+                    if n.error == NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList)
             ),
-            "expected Terminated(OperatorStop) — a locally-initiated protocol-error \
-             teardown must not be recorded as Unclean, which would make the daemon \
-             wrongly enter RFC 4724 GR helper mode for this peer — got {event:?}"
+            "expected Terminated(NotificationSent(MalformedAttributeList)), got {event:?}"
         );
     }
 
@@ -2723,10 +2822,11 @@ mod tests {
             .expect("session exited without emitting an event");
         assert!(
             matches!(
-                event,
-                SessionEvent::Terminated(TerminationReason::OperatorStop)
+                &event,
+                SessionEvent::Terminated(TerminationReason::NotificationSent(n))
+                    if n.error == NotificationError::UpdateMessage(UpdateMsgError::UnrecognizedWellKnownAttribute)
             ),
-            "expected Terminated(OperatorStop), got {event:?}"
+            "expected Terminated(NotificationSent(UnrecognizedWellKnownAttribute)), got {event:?}"
         );
     }
 
@@ -2796,10 +2896,11 @@ mod tests {
             .expect("session exited without emitting an event");
         assert!(
             matches!(
-                event,
-                SessionEvent::Terminated(TerminationReason::OperatorStop)
+                &event,
+                SessionEvent::Terminated(TerminationReason::NotificationSent(n))
+                    if n.error == NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList)
             ),
-            "expected Terminated(OperatorStop), got {event:?}"
+            "expected Terminated(NotificationSent(MalformedAttributeList)), got {event:?}"
         );
     }
 
@@ -2861,10 +2962,11 @@ mod tests {
             .expect("session exited without emitting an event");
         assert!(
             matches!(
-                event,
-                SessionEvent::Terminated(TerminationReason::OperatorStop)
+                &event,
+                SessionEvent::Terminated(TerminationReason::NotificationSent(n))
+                    if n.error == NotificationError::UpdateMessage(UpdateMsgError::MalformedAttributeList)
             ),
-            "expected Terminated(OperatorStop), got {event:?}"
+            "expected Terminated(NotificationSent(MalformedAttributeList)), got {event:?}"
         );
     }
 

@@ -2396,7 +2396,6 @@ What remains as optional future work:
 - The `SendHoldTimer` counts from the last message the socket accepted in full, so an idle session behind a closed window is only detected once the kernel send buffer fills. `TCP_NOTSENT_LOWAT` or `TCP_USER_TIMEOUT` would tighten this
 - `RemovePeer` without a shutdown message sends Cease "Administrative Shutdown". RFC 4486 §4 says a speaker de-configuring a peer SHOULD send "Peer De-configured"; RFC 9003 allows a shutdown message only with "Administrative Shutdown" or "Administrative Reset", so a configured message needs its own decision
 - A session task that dies (a panic) while its peer is not being removed leaves the peer registered, with its routes, until `RemovePeer`. Nothing runs the termination handling or starts a new session
-- Needs investigation: Hold Timer expiry is reported as `TerminationReason::Unclean`, so GR retention applies without the RFC 8538 N bit even though a NOTIFICATION was sent
 - BGP-SEC (RFC 8205) — cryptographic path validation; further out, but worth noting alongside MD5 as the broader authentication story
 - RFC 9234 strict mode — reject a session at OPEN when only one side advertises the
   Role capability. The RFC makes this optional and non-default (absence on either
@@ -2460,6 +2459,27 @@ for programmatic callers) or should we match CLI convention for operator ergonom
 If we do coerce: the fix is a small fallback in `parse_nlri` / `parse_nlri_v6` in
 `pathvectord/src/grpc.rs` — try CIDR parse first, fall back to bare `IpAddr` + `/32` or
 `/128`. The proto field comment and client docs would need to reflect the relaxed rule.
+
+### Graceful Restart — session loss and re-establishment (2026-11-27, issues #203/#181)
+
+- *Send Hard Reset (RFC 8538 §3.1, §5.1).* Operator stop, peer removal and the maximum-prefix
+  Cease flush the peer's routes but send a plain Cease. With the N bit exchanged that NOTIFICATION
+  is "Graceful": the peer retains our routes, and §4 requires us to follow the Receiving Speaker
+  rules too. Send Cease / Hard Reset encapsulating the original code (§5.1 suggests it for
+  subcodes 1–4; "Administrative Reset" is the operator's choice) when N was exchanged.
+- *Stale routes survive re-establishment (RFC 4724 §4.2 MUST).* `on_established` does not remove
+  them when the new OPEN has no GR capability, omits the family or clears its F bit. Reproduced
+  with a temporary test (no GR capability).
+- *No stale timer (RFC 8538 §4.1 MUST).* Nothing bounds retention after re-establishment if
+  End-of-RIB never comes, or across repeated restarts with the N bit.
+- *A handshake that fails during the restart window flushes the retained routes.* The FSM emits
+  `SessionTerminated` from `OpenConfirm` too, with the previous session's reason, and
+  `on_terminated` then finds no GR capability and flushes. The daemon half is reproduced with a
+  temporary test; the session half is read from `fsm/mod.rs`.
+- *A received NOTIFICATION can be missed.* If a write fails before the NOTIFICATION is read, the
+  reason is `Unclean` (read from the `select!` order in `transport/mod.rs`, not reproduced).
+  Likewise a NOTIFICATION too short to decode.
+- *e2e.* The sent-NOTIFICATION paths and the consecutive restart have no GoBGP / FRR / BIRD test.
 
 ### Graceful Restart — known gaps (2026-06-22)
 
@@ -2535,9 +2555,6 @@ export-policy-aware, gated on `ipv6_capable_peers`.
   route when the last blackhole is withdrawn (unit-tested against `RecordingFib` only).
 - *RFC 7999 §3.2 SHOULD NO_EXPORT/NO_ADVERTISE:* moot while a blackhole is never exported; revisit
   if blackholes are ever redistributed to iBGP peers as routes.
-- *RFC 8538 §4.1 consecutive restarts:* with the N-bit exchanged, a route "previously marked as
-  stale" must not be deleted on a consecutive restart. Stale marking here is idempotent
-  (re-marks everything retained) but there is no test pinning the N-bit case.
 
 - **`ListRoutes` gRPC response hits 4 MB tonic limit at ~26k routes** — confirmed by stress test (2026-06-17). The default tonic `max_decoding_message_size` is 4 MB; a response with 100k routes (~150 bytes each) exceeds this. Cursor pagination already exists (`page_size`/`page_token`); callers MUST use it for large tables. Remaining gap: add a `CountRoutes` RPC so callers can check table size before deciding whether to paginate or use `WatchRoutes` for a streaming snapshot.
 
